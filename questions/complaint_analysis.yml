@@ -1,0 +1,103 @@
+id: complaint_analysis
+version: 1
+params:
+  required: [month]
+  optional: [group_by, top_n, include_somewhat]
+defaults:
+  group_by: [Portfolio_std]
+  top_n: 12
+  include_somewhat: false
+
+kpi_calls:
+  - id: mom                # KPI 5 — Month-over-Month overview
+    func: kpi.kpi_mom.mom_overview
+    args:
+      month: $month
+      group_by: $group_by
+      include_somewhat: $include_somewhat
+      min_responses: 5
+
+  - id: top_contrib        # KPI 6 — Top contributors to change
+    func: kpi.kpi_top_contributors.top_contributors
+    args:
+      month: $month
+      group_by: $group_by
+      focus: complaints_per_1000
+      mode: delta
+      top_n: $top_n
+
+  - id: reason_mix         # KPI 2 — Reason mix %
+    func: kpi.kpi_reason_mix.reason_mix_percent
+    args:
+      month: $month
+      group_by: $group_by
+      top_n: 8
+      include_unknown: true
+
+  - id: heatmap            # KPI 8 — Reason × Dimension heatmap table
+    func: kpi.kpi_heatmap.complaint_heatmap
+    args:
+      month: $month
+      rows_dim: $group_by
+      normalize: row
+      compare_prev: true
+      min_count: 2
+
+  - id: drilldown          # KPI 7 — Free-text subreason drill
+    func: kpi.kpi_reason_drilldown.reason_drilldown
+    args:
+      month: $month
+      group_by: $group_by
+      target_category: Delay
+      top_n: 15
+      min_count: 3
+
+layout:
+  blocks:
+    - type: metric_cards
+      title: "Headline metrics — {{ month }}"
+      source: mom
+      fields:
+        - { label: "Complaints/1k", key: Complaints_per_1000, delta: Complaints_per_1000_delta, format: rate1 }
+        - { label: "Complaints",   key: Complaints,           delta: Complaints_delta,           format: int }
+        - { label: "Unique cases", key: Unique_Cases,         delta: Unique_Cases_delta,         format: int }
+        - { label: "NPS",          key: NPS,                  delta: NPS_delta,                  format: nps }
+
+    - type: table
+      name: "top_contributors"
+      title: "Top contributors to rate change (MoM)"
+      source: top_contrib
+      columns: ["$group_by[0]", "Complaints_per_1000", "Rate_Delta", "Weighted_Rate_Delta", "Unique_Cases"]
+
+    - type: chart
+      name: "drivers_bar"
+      chart: bar
+      title: "Top drivers (Rate Δ)"
+      source: top_contrib
+      x: "$group_by[0]"
+      y: "Rate_Delta"
+      sort: desc
+
+    - type: table
+      name: "reason_mix"
+      title: "Reason mix %"
+      source: reason_mix
+      columns: ["$group_by[0]", "Reason", "Count", "Percent"]
+
+    - type: table
+      name: "reasons_heatmap"
+      title: "Reasons × {{ group_by[0] }} (Row %), MoM Δ"
+      source: heatmap
+
+    - type: table
+      name: "delay_drilldown"
+      title: "Delay — top subreasons"
+      source: drilldown
+      columns: ["$group_by[0]", "SubReason", "Count", "Percent_within_group", "Percent_within_category"]
+
+narrative:
+  template: |
+    Complaints per 1k is {{ headline.rate }} ({{ headline.rate_delta | signed }} vs {{ prev_month }}).
+    Total complaints: {{ headline.complaints }} ({{ headline.complaints_delta | signed }}).
+    Unique cases: {{ headline.cases }} ({{ headline.cases_delta | signed }}).
+    NPS: {{ headline.nps }} ({{ headline.nps_delta | signed }}).
