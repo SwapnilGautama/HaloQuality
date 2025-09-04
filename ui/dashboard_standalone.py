@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 # ---- std libs / deps ----
 import io
 import glob
+import re
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -25,21 +26,36 @@ DATA_DIR = ROOT / "data"
 CASES_DIR = DATA_DIR / "cases"
 DEFAULT_GROUP_BY = ["Portfolio_std"]
 
+# --- session state init (separate widget vs. logical keys) ---
+if "halo_prompt" not in st.session_state:
+    st.session_state["halo_prompt"] = ""      # logical prompt state
+if "prompt_input" not in st.session_state:
+    st.session_state["prompt_input"] = st.session_state["halo_prompt"]
+
+def set_prompt(v: str):
+    """Programmatically set the prompt textbox and logical state."""
+    st.session_state["halo_prompt"] = v
+    st.session_state["prompt_input"] = v
+    st.rerun()
+
 # -------------------- Helpers --------------------
 def _to_month_str(dt):
     try:
-        if pd.isna(dt): return None
+        if pd.isna(dt):
+            return None
         d = pd.to_datetime(dt, errors="coerce", dayfirst=True)
-        if pd.isna(d): return None
+        if pd.isna(d):
+            return None
         return d.to_period("M").strftime("%Y-%m")
     except Exception:
         return None
 
 def _std_portfolio(s):
-    if pd.isna(s): return s
+    if pd.isna(s):
+        return s
     t = str(s).strip()
     low = t.lower()
-    low = low.replace("leatherhead - baes", "baes leatherhead").replace("baes-leatherhead","baes leatherhead")
+    low = low.replace("leatherhead - baes", "baes leatherhead").replace("baes-leatherhead", "baes leatherhead")
     low = low.replace("north west", "northwest")
     return low.title()
 
@@ -99,7 +115,7 @@ def load_cases_auto():
     out = pd.concat(frames, ignore_index=True)
     out = out.dropna(subset=["Case ID"])
     out["Case ID"] = out["Case ID"].astype(str)
-    out = out.drop_duplicates(subset=["month","Case ID"], keep="first")
+    out = out.drop_duplicates(subset=["month", "Case ID"], keep="first")
     return out, files
 
 @st.cache_data(show_spinner=False)
@@ -113,7 +129,8 @@ def load_survey_auto():
     mcol = None
     for c in df.columns:
         if "month" in c.lower():
-            mcol = c; break
+            mcol = c
+            break
     if mcol:
         df["month"] = df[mcol].apply(_to_month_str)
     return df, str(f)
@@ -122,11 +139,11 @@ def df_from_table(block: dict) -> pd.DataFrame:
     return pd.DataFrame(block.get("data", {}).get("rows", []))
 
 def download_button(df: pd.DataFrame, label: str, fname: str):
-    if df is None or df.empty: return
+    if df is None or df.empty:
+        return
     buf = io.StringIO()
     df.to_csv(buf, index=False)
-    st.download_button(label=label, data=buf.getvalue(),
-                       file_name=fname, mime="text/csv")
+    st.download_button(label=label, data=buf.getvalue(), file_name=fname, mime="text/csv")
 
 def find_table(payload: dict, name: str):
     for t in payload.get("tables", []):
@@ -147,7 +164,8 @@ def latest_month_from(df: pd.DataFrame) -> str | None:
     if df is None or df.empty or "month" not in df.columns:
         return None
     vals = df["month"].dropna().astype(str).tolist()
-    if not vals: return None
+    if not vals:
+        return None
     return max(vals)
 
 # -------------------- Page header (Halo-like hero) --------------------
@@ -170,7 +188,7 @@ st.markdown(
     "We auto-load your latest files from the **data/** folder."
 )
 
-# -------------------- Auto data load (no sidebar paths) --------------------
+# -------------------- Auto data load (no permanent sidebar paths) --------------------
 complaints_df, complaints_path = load_complaints_auto()
 cases_df, case_files = load_cases_auto()
 survey_df, survey_path = load_survey_auto()
@@ -185,12 +203,18 @@ c3.metric("Survey rows", len(survey_df))
 with st.expander("Data sources (auto-detected)", expanded=False):
     st.write(f"**Complaints:** {complaints_path or '— not found —'}")
     if case_files:
-        st.write("**Cases (directory):** data/cases/  \n" + "<br/>".join(f"- {Path(f).name}" for f in case_files), unsafe_allow_html=True)
+        st.write(
+            "**Cases (directory):** data/cases/  \n"
+            + "<br/>".join(f"- {Path(f).name}" for f in case_files),
+            unsafe_allow_html=True,
+        )
     else:
         st.write("**Cases (directory):** — not found — (expected: data/cases/*.xlsx)")
     st.write(f"**Survey (optional):** {survey_path or '— not found —'}")
     if st.button("↻ Reload data"):
-        load_complaints_auto.clear(); load_cases_auto.clear(); load_survey_auto.clear()
+        load_complaints_auto.clear()
+        load_cases_auto.clear()
+        load_survey_auto.clear()
         st.experimental_rerun()
 
 # Determine default/latest month from available data
@@ -200,31 +224,43 @@ latest_month = latest_month_from(complaints_df) or latest_month_from(cases_df) o
 st.markdown("##### Start by typing your business question:")
 user_q = st.text_input(
     "Ask:",
+    value=st.session_state.get("prompt_input", ""),
     placeholder="e.g., Show Complaints Analysis for the latest month",
     label_visibility="collapsed",
-    key="halo_prompt"
+    key="prompt_input",
 )
 
 # Suggestion chips
-colchips = st.container()
-with colchips:
-    cc1, cc2, cc3, cc4 = st.columns([1,1,1,1])
-    with cc1:
-        if st.button("Complaints analysis (latest)", key="chip1", help="Runs complaint_analysis for the latest month", use_container_width=True):
-            user_q = "complaints analysis latest"
-            st.session_state["halo_prompt"] = user_q
-    with cc2:
-        if st.button("Top drivers of change", key="chip2", use_container_width=True):
-            user_q = "drivers of change"
-            st.session_state["halo_prompt"] = user_q
-    with cc3:
-        if st.button("Reasons heatmap by portfolio", key="chip3", use_container_width=True):
-            user_q = "reasons heatmap"
-            st.session_state["halo_prompt"] = user_q
-    with cc4:
-        if st.button("Portfolio comparison", key="chip4", use_container_width=True):
-            user_q = "portfolio comparison"
-            st.session_state["halo_prompt"] = user_q
+cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
+with cc1:
+    st.button(
+        "Complaints analysis (latest)",
+        key="chip1",
+        help="Runs complaint_analysis for the latest month",
+        use_container_width=True,
+        on_click=lambda: set_prompt("complaints analysis latest"),
+    )
+with cc2:
+    st.button(
+        "Top drivers of change",
+        key="chip2",
+        use_container_width=True,
+        on_click=lambda: set_prompt("drivers of change"),
+    )
+with cc3:
+    st.button(
+        "Reasons heatmap by portfolio",
+        key="chip3",
+        use_container_width=True,
+        on_click=lambda: set_prompt("reasons heatmap"),
+    )
+with cc4:
+    st.button(
+        "Portfolio comparison",
+        key="chip4",
+        use_container_width=True,
+        on_click=lambda: set_prompt("portfolio comparison"),
+    )
 
 # Lightweight intent routing (we currently have one question spec)
 def route_intent(q: str):
@@ -232,32 +268,38 @@ def route_intent(q: str):
     qid = "complaint_analysis"  # default
     month = latest_month
     group_by = list(DEFAULT_GROUP_BY)
-    # minimal parsing
+
     if "portfolio" in q and "heatmap" in q:
         group_by = ["Portfolio_std"]
     elif "portfolio" in q:
         group_by = ["Portfolio_std"]
-    if "last" in q or "latest" in q or "current" in q:
+    if any(w in q for w in ["last", "latest", "current"]):
         month = latest_month
-    # allow explicit YYYY-MM mention
-    import re
+
     m = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", q)
     if m:
         month = f"{m.group(1)}-{m.group(2)}"
     return qid, month, group_by
 
-qid, month_chosen, gb = route_intent(user_q)
+qid, month_chosen, gb = route_intent(st.session_state.get("prompt_input", ""))
 
 # Optional advanced controls (collapsed)
 with st.expander("Advanced (month & group_by)"):
-    # Offer month choices from data
-    months_available = sorted(set(
-        [*complaints_df.get("month", pd.Series(dtype=str)).dropna().astype(str).tolist(),
-         *cases_df.get("month", pd.Series(dtype=str)).dropna().astype(str).tolist()]
-    ))
+    months_available = sorted(
+        set(
+            [
+                *complaints_df.get("month", pd.Series(dtype=str)).dropna().astype(str).tolist(),
+                *cases_df.get("month", pd.Series(dtype=str)).dropna().astype(str).tolist(),
+            ]
+        )
+    )
     if month_chosen not in months_available and months_available:
         month_chosen = months_available[-1]
-    month_chosen = st.selectbox("Month", options=months_available or [month_chosen], index=(months_available.index(month_chosen) if months_available and month_chosen in months_available else 0))
+    if months_available:
+        idx = months_available.index(month_chosen) if month_chosen in months_available else len(months_available) - 1
+        month_chosen = st.selectbox("Month", options=months_available, index=idx)
+    else:
+        st.caption("No months detected in data; using default.")
     gb_csv = st.text_input("group_by (CSV)", value=",".join(gb))
     gb = [c.strip() for c in gb_csv.split(",") if c.strip()]
     st.caption("You can leave this collapsed; defaults are fine.")
@@ -309,7 +351,7 @@ def render_payload(payload: dict):
     heat_t = find_table(payload, "reasons_heatmap")
     if heat_t:
         df_heat = df_from_table(heat_t)
-        metric_cols = {"Reason","Count","Value","Prev_Count","Prev_Value","Delta","Row_Total","Col_Total","Grand_Total"}
+        metric_cols = {"Reason", "Count", "Value", "Prev_Count", "Prev_Value", "Delta", "Row_Total", "Col_Total", "Grand_Total"}
         row_cols = [c for c in df_heat.columns if c not in metric_cols]
         if "Reason" in df_heat.columns and "Value" in df_heat.columns and row_cols:
             idx = row_cols[0]
@@ -322,7 +364,8 @@ def render_payload(payload: dict):
 
 if run_clicked:
     try:
-        if not list_questions():
+        qlist = list_questions()
+        if not qlist:
             st.error("No questions registered.")
         else:
             spec_path = get_spec_path(qid)
@@ -332,8 +375,8 @@ if run_clicked:
                 store_data={
                     "complaints_df": complaints_df,
                     "cases_df": cases_df,
-                    "survey_df": survey_df
-                }
+                    "survey_df": survey_df,
+                },
             )
             render_payload(payload)
     except Exception as e:
