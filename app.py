@@ -439,6 +439,62 @@ def kpi_heatmap(
         "min_count": min_count,
         "rows": df.to_dict(orient="records")
     }
+
+
+# KPI 9: Site/Portfolio Watchlist
+from kpi.kpi_watchlist import watchlist_alerts
+
+class WatchlistResponse(BaseModel):
+    month: str
+    prev_month: str
+    group_by: List[str]
+    include_somewhat: bool
+    min_responses: int
+    thresholds: Dict[str, float]
+    rows: List[Dict[str, Any]]
+
+@app.get("/kpi/watchlist", response_model=WatchlistResponse)
+def kpi_watchlist(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    group_by: str = Query("Portfolio_std", description="Comma-separated columns to group by"),
+    include_somewhat: bool = Query(False, description="For experience metrics, include 'Somewhat agree' as agree"),
+    min_responses: int = Query(5, ge=1, le=10000, description="Minimum survey responses per group"),
+    rate_level_thresh: float = Query(200.0, description="Trigger when Complaints/1k ≥ threshold"),
+    rate_delta_thresh: float = Query(20.0, description="Trigger when Complaints/1k rises by ≥ threshold MoM"),
+    nps_drop_thresh: float = Query(10.0, description="Trigger when NPS delta ≤ -threshold"),
+    clarity_drop_thresh: float = Query(5.0, description="Trigger when Clarity delta ≤ -threshold pp"),
+    timescale_drop_thresh: float = Query(5.0, description="Trigger when Timescale delta ≤ -threshold pp"),
+    handling_drop_thresh: float = Query(5.0, description="Trigger when Handling delta ≤ -threshold pp"),
+    z_thresh: float = Query(2.0, description="Outlier detection when |z| ≥ threshold across groups")
+):
+    group_cols = [c.strip() for c in group_by.split(",") if c.strip()]
+
+    df, prev_m, thresholds = watchlist_alerts(
+        complaints_df=store.complaints,
+        cases_df=store.cases,
+        survey_df=store.survey,
+        month=month,
+        group_by=group_cols,
+        include_somewhat=include_somewhat,
+        min_responses=min_responses,
+        rate_level_thresh=rate_level_thresh,
+        rate_delta_thresh=rate_delta_thresh,
+        nps_drop_thresh=nps_drop_thresh,
+        clarity_drop_thresh=clarity_drop_thresh,
+        timescale_drop_thresh=timescale_drop_thresh,
+        handling_drop_thresh=handling_drop_thresh,
+        z_thresh=z_thresh
+    )
+
+    return {
+        "month": month,
+        "prev_month": prev_m,
+        "group_by": group_cols,
+        "include_somewhat": include_somewhat,
+        "min_responses": min_responses,
+        "thresholds": thresholds,
+        "rows": df.to_dict(orient="records")
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
