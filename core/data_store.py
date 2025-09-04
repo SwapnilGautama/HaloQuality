@@ -34,3 +34,17 @@ def available_months(*dfs: pd.DataFrame) -> list[str]:
             months.update(d["month"].dropna().astype(str).tolist())
     return sorted(months)
 
+# ---------- NEW: common-month helpers ----------
+def _to_month_set(df: pd.DataFrame) -> set[str]:
+    if df is None or df.empty or "month" not in df.columns: return set()
+    return set(df["month"].dropna().astype(str).tolist())
+
+def common_months(*dfs: pd.DataFrame) -> list[str]:
+    sets = [ _to_month_set(d) for d in dfs if _to_month_set(d) ]
+    if not sets: return []
+    common = set.intersection(*sets) if len(sets) > 1 else sets[0]
+    return sorted(common)
+
+def latest_common_month(*dfs: pd.DataFrame) -> str | None:
+    cm = common_months(*dfs)
+    return cm[-1] if cm else None
