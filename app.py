@@ -1,4 +1,4 @@
-# app.py — Halo Quality KPI API (directory-aware loader for monthly case files)
+# app.py — Halo Quality KPI API (v0.3.0) with Reason Mix% KPI
 
 import os
 import glob
@@ -23,9 +23,7 @@ DEFAULT_SURVEY_XLSX = os.getenv(
     f"{DEFAULT_DATA_DIR}/Overall raw data - June 2025.xlsx"
 )
 
-# Cases (denominator) now supports a DIRECTORY of monthly files
-# If CASES_DIR exists, the app will load ALL .xlsx inside it.
-# Fallbacks (in order): cases_path param -> CASES_DIR -> CASES_XLSX (single file)
+# Cases (denominator) supports a DIRECTORY of monthly files
 DEFAULT_CASES_DIR = os.getenv("CASES_DIR", f"{DEFAULT_DATA_DIR}/cases")
 DEFAULT_CASES_XLSX = os.getenv(
     "CASES_XLSX",
@@ -135,7 +133,6 @@ class DataStore:
         cases = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Report_Date", "Case ID", "month", "Portfolio_std"])
         # Drop empties and dedupe by month+Case ID so a case is counted once per month
         cases = cases.dropna(subset=["Case ID"])
-        # To be safe, cast Case ID to string before dedupe (mixed types across files)
         cases["Case ID"] = cases["Case ID"].astype(str)
         cases = cases.drop_duplicates(subset=["month", "Case ID"], keep="first")
         self.cases = cases
@@ -151,12 +148,18 @@ class DataStore:
 
 store = DataStore()
 
-app = FastAPI(title="Halo Quality KPI API", version="0.2.0")
+app = FastAPI(title="Halo Quality KPI API", version="0.3.0")
 
 # -------------------- Models --------------------
 class ComplaintsPer1000Response(BaseModel):
     month: str
     group_by: List[str]
+    rows: List[Dict[str, Any]]
+
+class ReasonMixResponse(BaseModel):
+    month: str
+    group_by: List[str]
+    reason_field: str
     rows: List[Dict[str, Any]]
 
 # -------------------- Routes --------------------
@@ -208,6 +211,42 @@ def kpi_complaints_per_1000(
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"month": month, "group_by": group_cols, "rows": df.to_dict(orient="records")}
+
+# KPI 2: Reason Mix % (free-text aware)
+from kpis.kpi_reason_mix import reason_mix_percent
+
+@app.get("/kpi/reason_mix", response_model=ReasonMixResponse)
+def kpi_reason_mix(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    group_by: str = Query("Portfolio_std", description="Comma-separated columns to group by, e.g. 'Portfolio_std'"),
+    source_cols: str = Query(
+        "Complaint Reason - Why is the member complaining ? ,Current Activity Reason,Root Cause,Process Category",
+        description="Comma-separated list of columns to inspect (first non-empty wins)"
+    ),
+    top_n: int = Query(10, ge=1, le=50, description="Top reasons per group (by percent)"),
+    include_unknown: bool = Query(True, description="Include 'Unknown' bucket")
+):
+    group_cols = [c.strip() for c in group_by.split(",") if c.strip()]
+    reason_sources = [c.strip() for c in source_cols.split(",") if c.strip()]
+
+    try:
+        df, used_field = reason_mix_percent(
+            complaints_df=store.complaints,
+            month=month,
+            group_by=group_cols,
+            source_cols=reason_sources,
+            top_n=top_n,
+            include_unknown=include_unknown
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "month": month,
+        "group_by": group_cols,
+        "reason_field": used_field,
+        "rows": df.to_dict(orient="records")
+    }
 
 if __name__ == "__main__":
     import uvicorn
