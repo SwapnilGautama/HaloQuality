@@ -1,5 +1,4 @@
-# app.py — Halo Quality KPI API (v0.3.0) with Reason Mix% KPI
-
+# app.py — Halo Quality KPI API (v0.3.1) with Reason Mix% and NPS
 import os
 import glob
 from pathlib import Path
@@ -148,7 +147,7 @@ class DataStore:
 
 store = DataStore()
 
-app = FastAPI(title="Halo Quality KPI API", version="0.3.0")
+app = FastAPI(title="Halo Quality KPI API", version="0.3.1")
 
 # -------------------- Models --------------------
 class ComplaintsPer1000Response(BaseModel):
@@ -162,6 +161,11 @@ class ReasonMixResponse(BaseModel):
     reason_field: str
     rows: List[Dict[str, Any]]
 
+class NPSResponse(BaseModel):
+    month: str
+    group_by: List[str]
+    rows: List[Dict[str, Any]]
+
 # -------------------- Routes --------------------
 @app.get("/health")
 def health():
@@ -169,7 +173,8 @@ def health():
         "status": "ok",
         "complaints_rows": int(len(store.complaints)),
         "cases_rows": int(len(store.cases)),
-        "cases_months": sorted([m for m in store.cases["month"].dropna().unique().tolist()]) if not store.cases.empty else []
+        "cases_months": sorted([m for m in store.cases["month"].dropna().unique().tolist()]) if not store.cases.empty else [],
+        "survey_rows": int(len(store.survey))
     }
 
 @app.post("/reload")
@@ -186,7 +191,7 @@ def reload(
     return {"status": "reloaded"}
 
 # KPI 1: Complaints per 1000 (denominator = unique Case ID count)
-from kpis.kpi_complaints_per_1000 import complaints_per_1000
+from kpi.kpi_complaints_per_1000 import complaints_per_1000
 
 @app.get("/kpi/complaints_per_1000", response_model=ComplaintsPer1000Response)
 def kpi_complaints_per_1000(
@@ -213,14 +218,14 @@ def kpi_complaints_per_1000(
     return {"month": month, "group_by": group_cols, "rows": df.to_dict(orient="records")}
 
 # KPI 2: Reason Mix % (free-text aware)
-from kpis.kpi_reason_mix import reason_mix_percent
+from kpi.kpi_reason_mix import reason_mix_percent
 
 @app.get("/kpi/reason_mix", response_model=ReasonMixResponse)
 def kpi_reason_mix(
     month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
     group_by: str = Query("Portfolio_std", description="Comma-separated columns to group by, e.g. 'Portfolio_std'"),
     source_cols: str = Query(
-        "Complaint Reason - Why is the member complaining ? ,Current Activity Reason,Root Cause,Process Category",
+        "Complaint Reason - Why is the member complaining ? ,Current Activity Reason,Root Cause,Process Category,Event Type",
         description="Comma-separated list of columns to inspect (first non-empty wins)"
     ),
     top_n: int = Query(10, ge=1, le=50, description="Top reasons per group (by percent)"),
@@ -247,6 +252,32 @@ def kpi_reason_mix(
         "reason_field": used_field,
         "rows": df.to_dict(orient="records")
     }
+
+# KPI 3: NPS by group
+from kpi.kpi_nps import nps_by_group
+
+@app.get("/kpi/nps", response_model=NPSResponse)
+def kpi_nps(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    group_by: str = Query("Portfolio_std", description="Comma-separated columns to group by, e.g. 'Portfolio_std,Scheme Name'"),
+    min_responses: int = Query(5, ge=1, le=10000, description="Minimum responses required to show a group's NPS")
+):
+    if store.survey.empty:
+        raise HTTPException(status_code=400, detail="Survey file is not loaded or empty. Set SURVEY_XLSX or /reload with survey_path.")
+
+    group_cols = [c.strip() for c in group_by.split(",") if c.strip()]
+
+    try:
+        df = nps_by_group(
+            survey_df=store.survey,
+            month=month,
+            group_by=group_cols,
+            min_responses=min_responses
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"month": month, "group_by": group_cols, "rows": df.to_dict(orient="records")}
 
 if __name__ == "__main__":
     import uvicorn
