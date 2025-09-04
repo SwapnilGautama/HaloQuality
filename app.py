@@ -382,6 +382,63 @@ def kpi_reason_drilldown(
         "min_count": min_count,
         "rows": df.to_dict(orient="records")
     }
+
+
+# KPI 8: Complaint Heatmap (Reason × Dimension)
+from kpi.kpi_heatmap import complaint_heatmap
+
+class HeatmapResponse(BaseModel):
+    month: str
+    prev_month: str
+    rows_dim: List[str]
+    normalize: str
+    include_unknown: bool
+    compare_prev: bool
+    top_n_rows: int
+    min_count: int
+    rows: List[Dict[str, Any]]
+
+@app.get("/kpi/heatmap", response_model=HeatmapResponse)
+def kpi_heatmap(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    rows_dim: str = Query("Portfolio_std", description="Comma-separated dimension(s) for rows, e.g., 'Portfolio_std' or 'Portfolio_std,Scheme Name'"),
+    source_cols: str = Query("Complaint Reason - Why is the member complaining ? ,Current Activity Reason,Root Cause,Process Category,Event Type",
+                             description="CSV list of fields to inspect; first non-empty wins"),
+    normalize: str = Query("row", description="none | row | col | overall"),
+    include_unknown: bool = Query(False, description="Include 'Unknown' reason category"),
+    top_n_rows: int = Query(50, ge=1, le=500, description="Keep top-N rows by overall volume"),
+    min_count: int = Query(1, ge=1, le=10000, description="Minimum cell count to include"),
+    compare_prev: bool = Query(False, description="If true, include previous month values and deltas")
+):
+    rows = [c.strip() for c in rows_dim.split(",") if c.strip()]
+    sources = [c.strip() for c in source_cols.split(",") if c.strip()]
+
+    try:
+        df, prev_m = complaint_heatmap(
+            complaints_df=store.complaints,
+            month=month,
+            rows_dim=rows,
+            source_cols=sources,
+            normalize=normalize,
+            include_unknown=include_unknown,
+            top_n_rows=top_n_rows,
+            min_count=min_count,
+            compare_prev=compare_prev
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "month": month,
+        "prev_month": prev_m,
+        "rows_dim": rows,
+        "normalize": normalize,
+        "include_unknown": include_unknown,
+        "compare_prev": compare_prev,
+        "top_n_rows": top_n_rows,
+        "min_count": min_count,
+        "rows": df.to_dict(orient="records")
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
