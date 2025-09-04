@@ -236,6 +236,47 @@ def kpi_experience_scores(month: str = Query(..., description="YYYY-MM (e.g., 20
                    "Handling": field_map.get("Handling", "Handle_Issue")}
     return {"month": month, "group_by": group_cols, "used_fields": used_fields, "include_somewhat": include_somewhat, "rows": df.to_dict(orient="records")}
 
+
+
+# KPI 5: Month-over-Month overview
+from kpi.kpi_mom import mom_overview
+
+class MoMResponse(BaseModel):
+    month: str
+    prev_month: str
+    group_by: List[str]
+    include_somewhat: bool
+    min_responses: int
+    rows: List[Dict[str, Any]]
+
+@app.get("/kpi/mom", response_model=MoMResponse)
+def kpi_mom(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    group_by: str = Query("Portfolio_std", description="Comma-separated columns to group by"),
+    include_somewhat: bool = Query(False, description="For experience metrics, include 'Somewhat agree' as agree"),
+    min_responses: int = Query(5, ge=1, le=10000, description="Minimum survey responses per group")
+):
+    group_cols = [c.strip() for c in group_by.split(",") if c.strip()]
+
+    df, prev_m = mom_overview(
+        complaints_df=store.complaints,
+        cases_df=store.cases,
+        survey_df=store.survey,
+        month=month,
+        group_by=group_cols,
+        include_somewhat=include_somewhat,
+        min_responses=min_responses,
+        fields_map=None  # use defaults; caller can add fields param later if needed
+    )
+
+    return {
+        "month": month,
+        "prev_month": prev_m,
+        "group_by": group_cols,
+        "include_somewhat": include_somewhat,
+        "min_responses": min_responses,
+        "rows": df.to_dict(orient="records")
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
