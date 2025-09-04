@@ -495,6 +495,59 @@ def kpi_watchlist(
         "thresholds": thresholds,
         "rows": df.to_dict(orient="records")
     }
+
+
+# KPI 10: SLA Breach Rate
+from kpi.kpi_sla_breach import sla_breach_rate
+
+class SLABreachResponse(BaseModel):
+    month: str
+    dataset: str
+    group_by: List[str]
+    used: Dict[str, str]
+    target: str
+    mode: str
+    min_cases: int
+    rows: List[Dict[str, Any]]
+
+@app.get("/kpi/sla_breach", response_model=SLABreachResponse)
+def kpi_sla_breach(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    dataset: str = Query("cases", description="Which dataset to use: 'cases' or 'complaints'"),
+    group_by: str = Query("Portfolio_std", description="Comma-separated columns to group by"),
+    start_col: Optional[str] = Query(None, description="Start datetime column name (optional; will guess if omitted)"),
+    end_col: Optional[str] = Query(None, description="End/closed datetime column name (optional; will guess if omitted)"),
+    target: str = Query("5d", description="SLA target, e.g., '48h' or '5d'"),
+    mode: str = Query("business_days", description="calendar_hours | calendar_days | business_days"),
+    min_cases: int = Query(5, ge=1, le=10000, description="Minimum measured cases required per group")
+):
+    df = store.cases if dataset.lower() == "cases" else store.complaints
+
+    group_cols = [c.strip() for c in group_by.split(",") if c.strip()]
+    try:
+        out_df, used = sla_breach_rate(
+            df=df,
+            month=month,
+            group_by=group_cols,
+            start_col=start_col,
+            end_col=end_col,
+            target=target,
+            mode=mode,
+            min_cases=min_cases
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "month": month,
+        "dataset": dataset,
+        "group_by": group_cols,
+        "used": used,
+        "target": target,
+        "mode": mode,
+        "min_cases": min_cases,
+        "rows": out_df.to_dict(orient="records")
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
