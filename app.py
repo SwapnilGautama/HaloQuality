@@ -332,6 +332,56 @@ def kpi_top_contributors(
         "min_responses": min_responses,
         "rows": df.to_dict(orient="records")
     }
+
+
+# KPI 7: Reasons Drill-Down
+from kpi.kpi_reason_drilldown import reason_drilldown
+
+class ReasonDrilldownResponse(BaseModel):
+    month: str
+    group_by: List[str]
+    target_category: str
+    reason_field: str
+    top_n: int
+    min_count: int
+    rows: List[Dict[str, Any]]
+
+@app.get("/kpi/reason_drilldown", response_model=ReasonDrilldownResponse)
+def kpi_reason_drilldown(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    group_by: str = Query("Portfolio_std", description="Comma-separated columns to group by, e.g., 'Portfolio_std' or 'Scheme Name'"),
+    target_category: str = Query(..., description="Canonical reason category (e.g., Delay, Communication, Incorrect/Incomplete Information, System/Portal, Procedure/Policy, Scheme/Benefit, Dispute, Other)"),
+    source_cols: str = Query("Complaint Reason - Why is the member complaining ? ,Current Activity Reason,Root Cause,Process Category,Event Type", description="CSV list of fields to inspect; first non-empty wins"),
+    top_n: int = Query(20, ge=1, le=100, description="Keep top-N SubReasons by overall contribution"),
+    min_count: int = Query(3, ge=1, le=10000, description="Minimum occurrences per SubReason-row to include"),
+    include_unknown: bool = Query(False, description="Include 'Unknown' category/subreason rows")
+):
+    group_cols = [c.strip() for c in group_by.split(",") if c.strip()]
+    reason_sources = [c.strip() for c in source_cols.split(",") if c.strip()]
+
+    try:
+        df, used_field = reason_drilldown(
+            complaints_df=store.complaints,
+            month=month,
+            group_by=group_cols,
+            target_category=target_category,
+            source_cols=reason_sources,
+            top_n=top_n,
+            min_count=min_count,
+            include_unknown=include_unknown
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "month": month,
+        "group_by": group_cols,
+        "target_category": target_category,
+        "reason_field": used_field,
+        "top_n": top_n,
+        "min_count": min_count,
+        "rows": df.to_dict(orient="records")
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
