@@ -1,6 +1,6 @@
-streamlit==1.37.1
-plotly==5.22.0
-pandas==2.2.2
-numpy==1.26.4
-openpyxl==3.1.2
-pyyaml==6.0.1
+streamlit>=1.32
+pandas>=2.0
+numpy>=1.26
+openpyxl>=3.1
+plotly>=5.22
+pyarrow>=16.1
