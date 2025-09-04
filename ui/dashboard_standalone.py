@@ -68,7 +68,7 @@ def _std_portfolio(s):
     return low.title()
 
 def _latest_file(patterns):
-    "Return the most recently modified file matching any of the patterns."
+    """Return the most recently modified file matching any of the patterns."""
     candidates = []
     for pat in patterns:
         candidates += list(DATA_DIR.glob(pat))
@@ -90,14 +90,14 @@ def load_complaints_auto():
     if not f:
         return pd.DataFrame(), None
     df = pd.read_excel(f)
-    # pick the complaints received date column (expected name, else fallback by heuristic)
+    # expected date column; fallback to heuristic if missing
     date_col = "Date Complaint Received - DD/MM/YY"
     if date_col not in df.columns:
         alt = [c for c in df.columns if "date" in c.lower() and "complaint" in c.lower()]
         if alt:
             date_col = alt[0]
         else:
-            # still return df; runner guards on missing 'month'
+            # return as-is; runner will check required cols
             return df, str(f)
     df["month"] = df[date_col].apply(_to_month_str)
     df["Portfolio_std"] = df.get("Portfolio", np.nan).apply(_std_portfolio)
@@ -185,7 +185,6 @@ st.markdown(
     """
     <style>
       .halo-input input {font-size:18px; height:48px;}
-      .chips-row {margin-top:10px; margin-bottom:8px;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -230,7 +229,7 @@ with c4:
 # Lightweight intent routing
 def route_intent(q: str):
     q = (q or "").lower()
-    qid = "complaint_analysis"  # default
+    qid = "complaint_analysis"  # default and only registered for now
     month = latest_month
     group_by = list(DEFAULT_GROUP_BY)
 
@@ -246,7 +245,7 @@ def route_intent(q: str):
         month = f"{m.group(1)}-{m.group(2)}"
     return qid, month, group_by
 
-# Optional advanced (collapsed, tiny)
+# Tiny advanced override (collapsed)
 with st.expander("Advanced (optional: month & group_by)"):
     months_available = sorted(
         set(
@@ -257,7 +256,11 @@ with st.expander("Advanced (optional: month & group_by)"):
         )
     )
     adv_month = months_available[-1] if months_available else latest_month
-    month_override = st.selectbox("Month", options=months_available or [adv_month], index=(months_available.index(adv_month) if months_available and adv_month in months_available else 0))
+    month_override = st.selectbox(
+        "Month",
+        options=months_available or [adv_month],
+        index=(months_available.index(adv_month) if months_available and adv_month in months_available else 0),
+    )
     gb_csv = st.text_input("group_by (CSV)", value=",".join(DEFAULT_GROUP_BY))
     st.session_state["advanced_month"] = month_override
     st.session_state["advanced_gb"] = [c.strip() for c in gb_csv.split(",") if c.strip()]
@@ -321,4 +324,30 @@ def safe_run(prompt_text: str):
 
     # Guard: complaints data must have required cols for this question
     required_cols = ["month", "Portfolio_std"]
-    if qid == "
+    if qid == "complaint_analysis" and not _has_cols(complaints_df, required_cols):
+        st.warning(
+            "Complaints data not detected with required columns "
+            f"{required_cols}. Please add a file like **data/Complaints*.xlsx** "
+            "with a complaints date column and a Portfolio column."
+        )
+        return
+
+    try:
+        spec_path = get_spec_path(qid)
+        payload = run_question(
+            spec_path=spec_path,
+            params={"month": month_chosen, "group_by": gb},
+            store_data={
+                "complaints_df": complaints_df,
+                "cases_df": cases_df,
+                "survey_df": survey_df,
+            },
+        )
+        render_payload(payload)
+    except Exception as e:
+        st.error(f"Run failed: {e}")
+
+# Fire when Enter pressed or chip clicked
+if st.session_state.get("do_run"):
+    st.session_state["do_run"] = False
+    safe_run(st.session_state.get("halo_prompt", ""))
