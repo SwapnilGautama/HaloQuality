@@ -1,18 +1,20 @@
-import re
+# ... existing imports / helpers ...
+
+MOM_KEYWORDS = [
+    "month on month", "mom", "mo m", "trend", "trends",
+    "time series", "over time", "by month", "monthly"
+]
 
 def route(prompt: str) -> str | None:
-    """Return a question id based on the prompt; keep this fast & reliable.
-       We can upgrade to embeddings later."""
-    if not prompt: return None
-    q = prompt.lower()
-    # v1: complaints vs NPS correlation
-    if ("nps" in q or "csat" in q) and any(k in q for k in ["corr", "correlation", "relationship", "impact", "association"]):
+    p = (prompt or "").lower().strip()
+
+    # existing rule for correlation
+    if "nps" in p and "complaint" in p and "correlation" in p:
         return "corr_nps"
-    if "complaint" in q and "correlation" in q:
-        return "corr_nps"
+
+    # NEW: month-on-month view
+    if any(k in p for k in MOM_KEYWORDS) or ("complaint" in p and "month" in p):
+        return "mom_overview"
+
+    # fallback
     return None
-
-def extract_month(prompt: str, default_month: str | None) -> str | None:
-    m = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", (prompt or ""))
-    return f"{m.group(1)}-{m.group(2)}" if m else default_month
-
