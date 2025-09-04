@@ -1,4 +1,4 @@
-# ui/dashboard_standalone.py — Halo HQ (standalone Streamlit, auto data, minimal UI)
+# ui/dashboard_standalone.py — Halo HQ (standalone Streamlit, minimal UI, auto data)
 
 # --- ensure repo root is on sys.path for imports when running from ui/ ---
 import sys
@@ -28,14 +28,22 @@ DEFAULT_GROUP_BY = ["Portfolio_std"]
 
 # --- session state init (separate widget vs. logical keys) ---
 if "halo_prompt" not in st.session_state:
-    st.session_state["halo_prompt"] = ""      # logical prompt state
+    st.session_state["halo_prompt"] = ""      # logical prompt text used for routing
 if "prompt_input" not in st.session_state:
     st.session_state["prompt_input"] = st.session_state["halo_prompt"]
+if "do_run" not in st.session_state:
+    st.session_state["do_run"] = False
 
-def set_prompt(v: str):
-    """Programmatically set the prompt textbox and logical state."""
-    st.session_state["halo_prompt"] = v
+def _queue_run_from_input():
+    """Called when user presses Enter in the prompt box."""
+    st.session_state["halo_prompt"] = st.session_state.get("prompt_input", "")
+    st.session_state["do_run"] = True
+
+def _set_prompt_and_run(v: str):
+    """Used by suggestion chips."""
     st.session_state["prompt_input"] = v
+    st.session_state["halo_prompt"] = v
+    st.session_state["do_run"] = True
     st.rerun()
 
 # -------------------- Helpers --------------------
@@ -75,21 +83,22 @@ def _collect_case_files():
         files = []
     return files
 
-# -------------------- Loaders (cached) --------------------
+# -------------------- Loaders (cached, silent) --------------------
 @st.cache_data(show_spinner=False)
 def load_complaints_auto():
     f = _latest_file(["Complaints*.xlsx", "complaints*.xlsx"])
     if not f:
         return pd.DataFrame(), None
     df = pd.read_excel(f)
+    # pick the complaints received date column (expected name, else fallback by heuristic)
     date_col = "Date Complaint Received - DD/MM/YY"
     if date_col not in df.columns:
-        # try a common alternative
         alt = [c for c in df.columns if "date" in c.lower() and "complaint" in c.lower()]
         if alt:
             date_col = alt[0]
         else:
-            return pd.DataFrame(), str(f)
+            # still return df; runner guards on missing 'month'
+            return df, str(f)
     df["month"] = df[date_col].apply(_to_month_str)
     df["Portfolio_std"] = df.get("Portfolio", np.nan).apply(_std_portfolio)
     return df, str(f)
@@ -125,7 +134,7 @@ def load_survey_auto():
         return pd.DataFrame(), None
     df = pd.read_excel(f)
     df["Portfolio_std"] = df.get("Portfolio", np.nan).apply(_std_portfolio)
-    # try to infer a month column if present
+    # infer a month column if present
     mcol = None
     for c in df.columns:
         if "month" in c.lower():
@@ -168,101 +177,57 @@ def latest_month_from(df: pd.DataFrame) -> str | None:
         return None
     return max(vals)
 
-# -------------------- Page header (Halo-like hero) --------------------
+def _has_cols(df: pd.DataFrame, cols: list[str]) -> bool:
+    return df is not None and not df.empty and all(c in df.columns for c in cols)
+
+# -------------------- Minimal header (Halo-like) --------------------
 st.markdown(
     """
     <style>
-      .halo-hero {padding: 12px 0 8px;}
       .halo-input input {font-size:18px; height:48px;}
-      .chip {display:inline-block; padding:8px 12px; margin:6px 8px 0 0; border-radius:9999px;
-             border:1px solid #e5e7eb; background:#fff; cursor:pointer; font-size:14px;}
-      .chip:hover {background:#f3f4f6;}
+      .chips-row {margin-top:10px; margin-bottom:8px;}
     </style>
     """,
     unsafe_allow_html=True,
 )
-
 st.markdown("### Conversational Analytics Assistant")
-st.markdown(
-    "Welcome to **Halo** — analyze complaints and NPS with a simple prompt. "
-    "We auto-load your latest files from the **data/** folder."
-)
+st.caption("Welcome to **Halo** — we auto-load the latest files from the `data/` folder and answer your question.")
 
-# -------------------- Auto data load (no permanent sidebar paths) --------------------
-complaints_df, complaints_path = load_complaints_auto()
-cases_df, case_files = load_cases_auto()
-survey_df, survey_path = load_survey_auto()
+# Load data silently
+complaints_df, _ = load_complaints_auto()
+cases_df, _ = load_cases_auto()
+survey_df, _ = load_survey_auto()
 
-# Health row
-c1, c2, c3 = st.columns(3)
-c1.metric("Complaints rows", len(complaints_df))
-c2.metric("Cases rows (unique Case ID × month)", len(cases_df))
-c3.metric("Survey rows", len(survey_df))
-
-# Small caption showing which files were picked
-with st.expander("Data sources (auto-detected)", expanded=False):
-    st.write(f"**Complaints:** {complaints_path or '— not found —'}")
-    if case_files:
-        st.write(
-            "**Cases (directory):** data/cases/  \n"
-            + "<br/>".join(f"- {Path(f).name}" for f in case_files),
-            unsafe_allow_html=True,
-        )
-    else:
-        st.write("**Cases (directory):** — not found — (expected: data/cases/*.xlsx)")
-    st.write(f"**Survey (optional):** {survey_path or '— not found —'}")
-    if st.button("↻ Reload data"):
-        load_complaints_auto.clear()
-        load_cases_auto.clear()
-        load_survey_auto.clear()
-        st.experimental_rerun()
-
-# Determine default/latest month from available data
+# Determine default month
 latest_month = latest_month_from(complaints_df) or latest_month_from(cases_df) or "2025-06"
 
-# -------------------- Prompt box (Halo-style) --------------------
+# -------------------- Prompt box --------------------
 st.markdown("##### Start by typing your business question:")
 user_q = st.text_input(
     "Ask:",
     value=st.session_state.get("prompt_input", ""),
-    placeholder="e.g., Show Complaints Analysis for the latest month",
+    placeholder="e.g., complaints analysis latest",
     label_visibility="collapsed",
     key="prompt_input",
+    on_change=_queue_run_from_input,  # runs on Enter
 )
 
-# Suggestion chips
-cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
-with cc1:
-    st.button(
-        "Complaints analysis (latest)",
-        key="chip1",
-        help="Runs complaint_analysis for the latest month",
-        use_container_width=True,
-        on_click=lambda: set_prompt("complaints analysis latest"),
-    )
-with cc2:
-    st.button(
-        "Top drivers of change",
-        key="chip2",
-        use_container_width=True,
-        on_click=lambda: set_prompt("drivers of change"),
-    )
-with cc3:
-    st.button(
-        "Reasons heatmap by portfolio",
-        key="chip3",
-        use_container_width=True,
-        on_click=lambda: set_prompt("reasons heatmap"),
-    )
-with cc4:
-    st.button(
-        "Portfolio comparison",
-        key="chip4",
-        use_container_width=True,
-        on_click=lambda: set_prompt("portfolio comparison"),
-    )
+# Suggestion chips (trigger immediate run)
+c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+with c1:
+    st.button("Complaints analysis (latest)", use_container_width=True,
+              on_click=lambda: _set_prompt_and_run("complaints analysis latest"))
+with c2:
+    st.button("Top drivers of change", use_container_width=True,
+              on_click=lambda: _set_prompt_and_run("drivers of change"))
+with c3:
+    st.button("Reasons heatmap by portfolio", use_container_width=True,
+              on_click=lambda: _set_prompt_and_run("reasons heatmap"))
+with c4:
+    st.button("Portfolio comparison", use_container_width=True,
+              on_click=lambda: _set_prompt_and_run("portfolio comparison"))
 
-# Lightweight intent routing (we currently have one question spec)
+# Lightweight intent routing
 def route_intent(q: str):
     q = (q or "").lower()
     qid = "complaint_analysis"  # default
@@ -281,10 +246,8 @@ def route_intent(q: str):
         month = f"{m.group(1)}-{m.group(2)}"
     return qid, month, group_by
 
-qid, month_chosen, gb = route_intent(st.session_state.get("prompt_input", ""))
-
-# Optional advanced controls (collapsed)
-with st.expander("Advanced (month & group_by)"):
+# Optional advanced (collapsed, tiny)
+with st.expander("Advanced (optional: month & group_by)"):
     months_available = sorted(
         set(
             [
@@ -293,26 +256,17 @@ with st.expander("Advanced (month & group_by)"):
             ]
         )
     )
-    if month_chosen not in months_available and months_available:
-        month_chosen = months_available[-1]
-    if months_available:
-        idx = months_available.index(month_chosen) if month_chosen in months_available else len(months_available) - 1
-        month_chosen = st.selectbox("Month", options=months_available, index=idx)
-    else:
-        st.caption("No months detected in data; using default.")
-    gb_csv = st.text_input("group_by (CSV)", value=",".join(gb))
-    gb = [c.strip() for c in gb_csv.split(",") if c.strip()]
-    st.caption("You can leave this collapsed; defaults are fine.")
-
-run_clicked = st.button("Run", type="primary", use_container_width=True)
+    adv_month = months_available[-1] if months_available else latest_month
+    month_override = st.selectbox("Month", options=months_available or [adv_month], index=(months_available.index(adv_month) if months_available and adv_month in months_available else 0))
+    gb_csv = st.text_input("group_by (CSV)", value=",".join(DEFAULT_GROUP_BY))
+    st.session_state["advanced_month"] = month_override
+    st.session_state["advanced_gb"] = [c.strip() for c in gb_csv.split(",") if c.strip()]
 
 # -------------------- Execute & Render --------------------
 def render_payload(payload: dict):
-    # Insights
     st.subheader("Insights")
     st.write(payload.get("insights") or "—")
 
-    # Cards
     cards = payload.get("cards", [])
     if cards:
         data = cards[0].get("data", {})
@@ -322,7 +276,6 @@ def render_payload(payload: dict):
         c.metric("Unique Cases", data.get("cases"), delta=data.get("cases_delta"))
         d.metric("NPS", data.get("nps"), delta=data.get("nps_delta"))
 
-    # Drivers bar
     bar_spec = find_chart(payload, "drivers_bar")
     if bar_spec:
         src = bar_spec.get("dataRef")
@@ -335,7 +288,6 @@ def render_payload(payload: dict):
             fig.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(fig, use_container_width=True)
 
-    # Tables
     st.subheader("Tables")
     for t in payload.get("tables", []):
         title = t.get("title", t.get("name", "Table"))
@@ -347,7 +299,6 @@ def render_payload(payload: dict):
             st.dataframe(df_t, use_container_width=True, hide_index=True)
             download_button(df_t, f"⬇ Download: {t.get('name','table')}.csv", f"{t.get('name','table')}.csv")
 
-    # Heatmap (pretty) if present
     heat_t = find_table(payload, "reasons_heatmap")
     if heat_t:
         df_heat = df_from_table(heat_t)
@@ -362,24 +313,12 @@ def render_payload(payload: dict):
                 fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig, use_container_width=True)
 
-if run_clicked:
-    try:
-        qlist = list_questions()
-        if not qlist:
-            st.error("No questions registered.")
-        else:
-            spec_path = get_spec_path(qid)
-            payload = run_question(
-                spec_path=spec_path,
-                params={"month": month_chosen, "group_by": gb},
-                store_data={
-                    "complaints_df": complaints_df,
-                    "cases_df": cases_df,
-                    "survey_df": survey_df,
-                },
-            )
-            render_payload(payload)
-    except Exception as e:
-        st.error(f"Run failed: {e}")
-else:
-    st.info("Choose a question by typing (or click a chip) and press **Run**.")
+def safe_run(prompt_text: str):
+    qid, month_chosen, gb = route_intent(prompt_text)
+    # If user changed Advanced, prefer those
+    month_chosen = st.session_state.get("advanced_month", month_chosen) or month_chosen
+    gb = st.session_state.get("advanced_gb", gb) or gb
+
+    # Guard: complaints data must have required cols for this question
+    required_cols = ["month", "Portfolio_std"]
+    if qid == "
