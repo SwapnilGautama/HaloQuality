@@ -277,6 +277,61 @@ def kpi_mom(
         "min_responses": min_responses,
         "rows": df.to_dict(orient="records")
     }
+
+
+# KPI 6: Top Contributors (level or MoM delta)
+from kpi.kpi_top_contributors import top_contributors
+
+class TopContribResponse(BaseModel):
+    month: str
+    prev_month: str
+    group_by: List[str]
+    focus: str
+    mode: str
+    top_n: int
+    include_somewhat: bool
+    min_responses: int
+    rows: List[Dict[str, Any]]
+
+@app.get("/kpi/top_contributors", response_model=TopContribResponse)
+def kpi_top_contributors(
+    month: str = Query(..., description="YYYY-MM (e.g., 2025-06)"),
+    group_by: str = Query("Portfolio_std", description="Dimension(s) to rank contributors by, e.g., 'Portfolio_std' or 'Scheme Name'"),
+    focus: str = Query("complaints", description="Metric focus: complaints | complaints_per_1000 | nps | clarity | timescale | handling"),
+    mode: str = Query("level", description="View mode: level | delta (vs previous month)"),
+    top_n: int = Query(10, ge=1, le=100, description="How many contributors to return"),
+    include_somewhat: bool = Query(False, description="Experience-only: include 'Somewhat agree' as agree"),
+    min_responses: int = Query(5, ge=1, le=10000, description="Survey-only: minimum responses per group")
+):
+    group_cols = [c.strip() for c in group_by.split(",") if c.strip()]
+
+    try:
+        df, prev_m = top_contributors(
+            complaints_df=store.complaints,
+            cases_df=store.cases,
+            survey_df=store.survey,
+            month=month,
+            group_by=group_cols,
+            focus=focus,
+            mode=mode,
+            top_n=top_n,
+            include_somewhat=include_somewhat,
+            min_responses=min_responses
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "month": month,
+        "prev_month": prev_m,
+        "group_by": group_cols,
+        "focus": focus,
+        "mode": mode,
+        "top_n": top_n,
+        "include_somewhat": include_somewhat,
+        "min_responses": min_responses,
+        "rows": df.to_dict(orient="records")
+    }
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
