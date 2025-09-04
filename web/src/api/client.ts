@@ -1,6 +1,7 @@
 import axios from "axios";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+// Use /api by default (nginx proxy). You can still override with VITE_API_BASE.
+const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
 export const api = axios.create({
   baseURL: API_BASE,
