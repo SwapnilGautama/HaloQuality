@@ -5,6 +5,13 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
+# --- ensure repo root is on sys.path for imports when running from ui/ ---
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 
 # ---- local imports from your repo ----
 from question_engine.registry import list_questions, get_spec_path
