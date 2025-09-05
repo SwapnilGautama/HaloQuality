@@ -1,140 +1,207 @@
-# app.py — Halo Quality Chat (safe argument passing)
-
+# app.py
 from __future__ import annotations
-import sys, importlib, traceback, inspect
-from pathlib import Path
-from typing import Dict, Any
 
+import importlib
+import io
+import sys
+import traceback
+from pathlib import Path
+from typing import Any, Dict, Tuple, Optional
+
+import pandas as pd
 import streamlit as st
 
-# --- Ensure repo root is importable ---
+# --- Make sure our project root is on sys.path so "import questions.<slug>" always works
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# --- Load your data store (unchanged) ---
+# Data store (cached inside the module)
 from core.data_store import load_store
+# Tiny semantic matcher (returns (slug, args, title))
+from semantic_router import match as match_intent
 
-# --- Semantic router returns (slug, args, title) ---
-from semantic_router import route_intent
+
+# ------------------------- UI helpers -------------------------
+
+def _section_title(emoji: str, title: str):
+    st.markdown(
+        f"<div style='display:flex;align-items:center;gap:.5rem;font-size:1.4rem;'>"
+        f"<span>{emoji}</span><strong>{title}</strong></div>",
+        unsafe_allow_html=True,
+    )
 
 
-def _list_question_modules():
-    from pkgutil import iter_modules
-    import questions  # noqa
-    pkg_path = Path(questions.__file__).resolve().parent
-    return sorted([m.name for m in iter_modules([str(pkg_path)])])
+def _fmt_month(x) -> str:
+    try:
+        x = pd.to_datetime(x)
+        if pd.isna(x):
+            return "NaT"
+        return x.strftime("%b %y")
+    except Exception:
+        return "NaT"
+
+
+def _show_data_status(store: Dict[str, pd.DataFrame]):
+    st.sidebar.header("Data status")
+
+    def _rows(df: Optional[pd.DataFrame]) -> int:
+        return 0 if df is None else len(df)
+
+    cases = store.get("cases")
+    complaints = store.get("complaints")
+    fpa = store.get("fpa")
+
+    st.sidebar.write(f"Cases rows: **{_rows(cases):,}**")
+    st.sidebar.write(f"Complaints rows: **{_rows(complaints):,}**")
+    st.sidebar.write(f"FPA rows: **{_rows(fpa):,}**")
+
+    def _latest_month(df: Optional[pd.DataFrame]) -> str:
+        if df is None or df.empty:
+            return "NaT"
+        col = "month_dt" if "month_dt" in df.columns else None
+        if not col:
+            return "NaT"
+        try:
+            return _fmt_month(df[col].max())
+        except Exception:
+            return "NaT"
+
+    st.sidebar.write(
+        f"Latest Month — Cases: **{_latest_month(cases)}** | Complaints: **{_latest_month(complaints)}** | FPA: **{_latest_month(fpa)}**"
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Tip: Ask things like:")
+    for tip in [
+        "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025",
+        "show rca1 by portfolio for process Member Enquiry last 3 months",
+        "unique cases by process and portfolio Apr 2025 to Jun 2025",
+        "show the biggest drivers of case fails",
+    ]:
+        st.sidebar.markdown(f"- {tip}")
+
+
+# ------------------------- import & run question -------------------------
+
+# Legacy/alias mapping so older slugs keep working
+SLUG_ALIASES = {
+    "fpa_fail_rate": "fpa_fail_drivers",  # legacy -> new
+}
+
+def _canonicalize(slug: str) -> str:
+    s = slug.strip().lower().replace("-", "_").replace(" ", "_")
+    return SLUG_ALIASES.get(s, s)
 
 
 def _import_question_module(slug: str):
+    """
+    Import questions.<slug> robustly.
+    Tries canonical form first, then the raw slug as a fallback.
+    """
+    canonical = _canonicalize(slug)
     try:
-        return importlib.import_module(f"questions.{slug}")
+        return importlib.import_module(f"questions.{canonical}")
     except Exception:
-        available = _list_question_modules()
-        raise ImportError(
-            f"Cannot import 'questions.{slug}'. "
-            f"Available: {', '.join(available) or '(none)'}\n"
-            f"sys.path={sys.path}"
-        )
+        # fallback to raw slug if someone calls with non-canonical name
+        return importlib.import_module(f"questions.{slug}")
 
 
 def _run_question(slug: str, args: Dict[str, Any], store, user_text: str):
     """
-    Import questions.<slug> and call run(store, ...), adapting arguments to the
-    module's declared signature so older/newer question modules all work.
+    Always pass user_text to question modules for robust parsing.
     """
     mod = _import_question_module(slug)
-    if not hasattr(mod, "run"):
-        raise AttributeError(f"Module 'questions.{slug}' has no function run(...).")
-
-    # Raw parsed arguments from the semantic router
-    raw_args = dict(args or {})
-
-    # Some older code injected 'query' – normalize by removing it and mapping later
-    raw_args.pop("query", None)
-
-    # Inspect the target signature and only pass what it accepts
-    sig = inspect.signature(mod.run)
-    accepted = set(sig.parameters.keys())
-
-    safe_args: Dict[str, Any] = {k: v for k, v in raw_args.items() if k in accepted}
-
-    # Map user text into an appropriate parameter if present
-    if "user_question" in accepted and "user_question" not in safe_args:
-        safe_args["user_question"] = user_text
-    elif "query" in accepted and "query" not in safe_args:
-        safe_args["query"] = user_text
-
-    # ADAPTERS for older modules:
-    # Many legacy question modules expect a single dict "params" (or sometimes "filters").
-    # If the callee declares it and we haven't provided it, pass the full parsed args.
-    if "params" in accepted and "params" not in safe_args:
-        safe_args["params"] = dict(raw_args)  # full filter set as a dict
-
-    if "filters" in accepted and "filters" not in safe_args:
-        safe_args["filters"] = dict(raw_args)  # alias for modules that prefer 'filters'
-
-    # Optional: if a module wants 'options' or 'config', give it the same dict
-    if "options" in accepted and "options" not in safe_args:
-        safe_args["options"] = dict(raw_args)
-    if "config" in accepted and "config" not in safe_args:
-        safe_args["config"] = dict(raw_args)
-
+    safe_args = dict(args or {})
+    safe_args.setdefault("user_text", user_text or safe_args.get("query", "") or "")
     return mod.run(store, **safe_args)
 
 
-# ---------- UI ----------
+def _render_output(obj: Any):
+    """
+    Minimal renderer that handles:
+      - str messages
+      - pandas DataFrames
+      - dict with {"title": ..., "data": <DataFrame>, ...}
+    """
+    if obj is None:
+        st.info("No result.")
+        return
+
+    if isinstance(obj, str):
+        # Heuristic: show neutral info vs warnings
+        if obj.lower().startswith(("no ", "missing", "rca", "error", "sorry")):
+            st.warning(obj)
+        else:
+            st.info(obj)
+        return
+
+    if isinstance(obj, pd.DataFrame):
+        st.dataframe(obj, use_container_width=True)
+        return
+
+    if isinstance(obj, dict):
+        title = obj.get("title")
+        if title:
+            _section_title("🟡", title)
+        df = obj.get("data")
+        if isinstance(df, pd.DataFrame):
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.write(obj)
+        return
+
+    # Fallback
+    st.write(obj)
+
+
+# ------------------------- Page -------------------------
+
 st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
-
-st.sidebar.header("Data status")
-with st.sidebar:
-    try:
-        store = load_store()
-        if hasattr(store, "cases") and hasattr(store.cases, "shape"):
-            st.write(f"Cases rows: {store.cases.shape[0]:,}")
-        if hasattr(store, "complaints") and hasattr(store.complaints, "shape"):
-            st.write(f"Complaints rows: {store.complaints.shape[0]:,}")
-        if hasattr(store, "fpa") and hasattr(store.fpa, "shape"):
-            st.write(f"FPA rows: {store.fpa.shape[0]:,}")
-    except Exception as e:
-        st.error("Failed to load data store.")
-        st.exception(e)
-        st.stop()
-
 st.title("Halo Quality — Chat")
 
-# Example chips
-examples = [
-    "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025",
-    "show rca1 by portfolio for process Member Enquiry last 3 months",
-    "unique cases by process and portfolio Apr 2025 to Jun 2025",
-]
-cols = st.columns(len(examples))
-for i, phrase in enumerate(examples):
-    if cols[i].button(phrase):
-        st.session_state["__prefill__"] = phrase
+# Load the store (cached in core.data_store)
+try:
+    store = load_store()
+except Exception as e:
+    st.error("Failed to load data store.")
+    with st.expander("Traceback", expanded=False):
+        st.code("".join(traceback.format_exc()))
+    st.stop()
 
-user_text = st.chat_input("Ask a question…")
-if not user_text and st.session_state.get("__prefill__"):
-    user_text = st.session_state.pop("__prefill__")
+_show_data_status(store)
 
-if user_text:
+# Quick suggestion chips
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"):
+        st.session_state["__q"] = "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"
+with col2:
+    if st.button("show rca1 by portfolio for process Member Enquiry last 3 months"):
+        st.session_state["__q"] = "show rca1 by portfolio for process Member Enquiry last 3 months"
+with col3:
+    if st.button("unique cases by process and portfolio Apr 2025 to Jun 2025"):
+        st.session_state["__q"] = "unique cases by process and portfolio Apr 2025 to Jun 2025"
+
+st.markdown("")
+
+# Query box
+raw_query = st.chat_input("Type your question (e.g., 'complaints per 1000 by process last 3 months')") or st.session_state.pop("__q", "")
+
+if raw_query:
     with st.chat_message("user"):
-        st.write(user_text)
-
-    try:
-        slug, args, title = route_intent(user_text)
-    except Exception as e:
-        with st.chat_message("assistant"):
-            st.error(f"Failed to route the question: {e}")
-        st.stop()
+        st.write(raw_query)
 
     with st.chat_message("assistant"):
-        if title:
-            st.subheader(title)
         try:
-            _run_question(slug, args, store, user_text)
+            slug, args, title = match_intent(raw_query)
+            if title:
+                _section_title("📦", title)
+            result = _run_question(slug, args, store, user_text=raw_query)
+            _render_output(result)
         except Exception as e:
-            st.error(f"Sorry—this question failed: {e}")
-            with st.expander("Traceback"):
+            st.error(f"Sorry—this question failed: {e!s}")
+            with st.expander("Traceback", expanded=False):
                 st.code("".join(traceback.format_exc()))
+else:
+    st.info("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
