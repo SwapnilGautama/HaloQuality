@@ -38,6 +38,11 @@ def _to_datetime(s: pd.Series) -> pd.Series:
 def _strip(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
 
+def _norm_key(x: pd.Series | str) -> pd.Series | str:
+    if isinstance(x, pd.Series):
+        return x.astype(str).str.strip().str.lower()
+    return str(x).strip().lower()
+
 def load_complaints(complaints_dir: str | Path = "data/complaints") -> pd.DataFrame:
     complaints_dir = Path(complaints_dir)
     if not complaints_dir.exists():
@@ -58,17 +63,28 @@ def load_complaints(complaints_dir: str | Path = "data/complaints") -> pd.DataFr
 
         if "Report_Date" in df.columns:
             df["Report_Date"] = _to_datetime(df["Report_Date"])
-            df["report_month_ym"] = df["Report_Date"].dt.strftime("%Y-%m")
-            df["report_month_mmm"] = df["Report_Date"].dt.strftime("%b %y")
+            # Month for join (MMM YY) – mirrors cases
+            df["Month"] = df["Report_Date"].dt.strftime("%b %y")
 
         for c in ["ParentCaseType","Portfolio_std","Scheme","ReceiptMethod","ParentTeam","AptiaError","Control"]:
             if c in df.columns:
                 df[c] = _strip(df[c])
 
+        # text for RCA modeling
         for c in ["RCA_Brief","RCA_Why"]:
             if c in df.columns:
                 df[c] = df[c].fillna("").astype(str)
         df["RCA_Text"] = (df.get("RCA_Brief","") + " " + df.get("RCA_Why","")).str.strip()
+
+        # normalized join keys
+        if "ParentCaseType" in df.columns:
+            df["ProcessKey"] = _norm_key(df["ParentCaseType"])
+        else:
+            df["ProcessKey"] = pd.NA
+        if "Portfolio_std" in df.columns:
+            df["PortfolioKey"] = _norm_key(df["Portfolio_std"])
+        else:
+            df["PortfolioKey"] = pd.NA
 
         frames.append(df)
 
@@ -76,10 +92,11 @@ def load_complaints(complaints_dir: str | Path = "data/complaints") -> pd.DataFr
         return pd.DataFrame()
 
     data = pd.concat(frames, ignore_index=True)
+
     keep = [
-        "ParentCaseType","Report_Date","report_month_ym","report_month_mmm",
-        "Portfolio_std","Scheme","ReceiptMethod","ParentTeam","AptiaError","Control",
-        "RCA_Brief","RCA_Why","RCA_Text"
+        "ParentCaseType","Report_Date","Month",
+        "Portfolio_std","PortfolioKey","Scheme","ReceiptMethod","ParentTeam","AptiaError","Control",
+        "RCA_Brief","RCA_Why","RCA_Text","ProcessKey"
     ]
     keep = [c for c in keep if c in data.columns]
     return data[keep].copy()
