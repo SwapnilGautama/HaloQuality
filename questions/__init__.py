@@ -16,9 +16,9 @@ __all__ = [
     "complaint_volume_rate",
     "complaints_per_thousand",
     "corr_nps",
-    "fpa_fail_rate",
+    "fpa_fail_rate",        # shim -> fpa_fail_drivers.run
+    "fpa_fail_drivers",     # the real implementation
     "mom_overview",
     "rca1_portfolio_process",
     "unique_cases_mom",
-    # Keep list in sync as you add more files
 ]
