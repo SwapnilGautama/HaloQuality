@@ -1,226 +1,266 @@
+# questions/complaints_per_thousand.py
+# Complaints per 1,000 cases — by process (with optional portfolio & month filters)
+
+from __future__ import annotations
+import re
+from typing import Optional, Tuple, List
+
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
-from typing import Any, Dict, Optional, Iterable
 
 
-# ----------------------------- helpers ---------------------------------
+TITLE = "Complaints per 1,000 cases"
 
-DATE_CANDIDATES = [
-    "Report Date", "Create Date", "Created", "Created Date", "create_date",
-    "report_date", "create_dt", "Created_On"
+
+# ----------------------------- column candidates ------------------------------
+
+DATE_CANDIDATES_CASES = [
+    "Create Date", "Created", "Created Date", "create_date",
+    "create_dt", "Created_On", "Create_Date"
+]
+DATE_CANDIDATES_COMPLAINTS = [
+    "Report Date", "Report_Date", "Reported On", "Date", "Created", "Create Date"
 ]
 
-PROCESS_CANDIDATES = [
-    "Process Name", "Process", "Process_Name", "ProcessName", "Parent Case Type"
+PROCESS_CANDIDATES_CASES = [
+    "Process Name", "Process", "Process_Name", "ProcessName"
+]
+PROCESS_CANDIDATES_COMPLAINTS = [
+    "Parent Case Type", "Parent_Case_Type", "Process Name", "Process"
 ]
 
 PORTFOLIO_CANDIDATES = [
-    "Portfolio_std", "Portfolio", "portfolio", "Portfolio Name"
+    "Portfolio_std", "Portfolio", "portfolio", "Portfolio Name", "Portfolio_Name"
 ]
 
 CASE_ID_CANDIDATES = [
-    "Case ID", "CaseID", "case_id", "Unique Identifier (NINO Encrypted)"
+    "Case ID", "CaseID", "case_id", "Case Number", "Case No", "Case Ref",
+    "Case Reference", "Case Reference ID", "CaseNumber",
+    "Unique Identifier (NINO Encrypted)"
 ]
 
 
-def _first_existing(df: pd.DataFrame, options: Iterable[str]) -> Optional[str]:
-    for c in options:
+# ------------------------------ helpers ---------------------------------------
+
+def _first_existing(df: pd.DataFrame, opts: List[str]) -> Optional[str]:
+    for c in opts:
         if c in df.columns:
             return c
     return None
 
 
-def _ensure_month(df: pd.DataFrame, prefer: Optional[str] = None) -> pd.Series:
-    """
-    Return a 'month' Series (Timestamp normalized to month start),
-    deriving it from one of the known date columns.
-    """
-    col = prefer if (prefer and prefer in df.columns) else _first_existing(df, DATE_CANDIDATES)
-    if col is None:
-        raise KeyError("No usable date column found (looked for: %s)" % ", ".join(DATE_CANDIDATES))
-    s = pd.to_datetime(df[col], errors="coerce")
-    return s.dt.to_period("M").dt.to_timestamp()
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(s).lower()).strip("_")
 
 
-def _get_df(store: Any, key: str) -> pd.DataFrame:
-    if isinstance(store, dict):
-        return store[key]
-    if hasattr(store, key):
-        return getattr(store, key)
-    # last resort – some stores keep everything under .tables
-    if hasattr(store, "tables"):
-        return store.tables[key]
-    raise KeyError(f"Could not find '{key}' in data store")
+def _find_case_id_col(df: pd.DataFrame) -> Optional[str]:
+    # 1) exacts
+    c = _first_existing(df, CASE_ID_CANDIDATES)
+    if c:
+        return c
+    # 2) heuristic
+    for col in df.columns:
+        n = _norm(col)
+        if "case" in n and any(k in n for k in ["id", "no", "num", "number", "ref", "reference"]):
+            return col
+    # 3) fallback: high-cardinality looks like an id
+    try:
+        nun = df.nunique(dropna=True).sort_values(ascending=False)
+        for col in nun.index:
+            if nun[col] >= 0.5 * len(df):
+                return col
+    except Exception:
+        pass
+    return None
 
 
-def _coerce_list(x):
-    if x is None:
-        return None
-    if isinstance(x, (list, tuple, set)):
-        return list(x)
-    return [x]
+def _find_col(df: pd.DataFrame, primary: List[str], secondary: Optional[List[str]] = None) -> Optional[str]:
+    c = _first_existing(df, primary)
+    if c:
+        return c
+    if secondary:
+        return _first_existing(df, secondary)
+    return None
 
 
-def _month_from_arg(x: Any) -> Optional[pd.Timestamp]:
-    if x in (None, "", np.nan):
+def _parse_month_token(x) -> Optional[pd.Timestamp]:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return None
     try:
-        # allow "Jun 2025" / "2025-06"
-        dt = pd.to_datetime(str(x), errors="coerce")
-        if pd.isna(dt):
+        # accept “Jun 2025”, “2025-06”, “2025/06/01”, etc.
+        ts = pd.to_datetime(str(x), errors="coerce", dayfirst=False)
+        if pd.isna(ts):
             return None
-        return dt.to_period("M").to_timestamp()
+        # normalize to first of month
+        ts = ts.to_period("M").to_timestamp()
+        return ts
     except Exception:
         return None
 
 
-# ----------------------------- main -------------------------------------
+def _ensure_month(df: pd.DataFrame, date_candidates: List[str], out_col: str = "month") -> Tuple[pd.DataFrame, str]:
+    c = _first_existing(df, date_candidates)
+    if c is None:
+        # last resort: try any column that parses to datetime for most rows
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                c = col
+                break
+            try:
+                test = pd.to_datetime(df[col], errors="coerce")
+                if test.notna().mean() > 0.7:
+                    c = col
+                    break
+            except Exception:
+                continue
+    if c is None:
+        raise KeyError("No date column found to create a month field.")
 
-def run(store: Any, params: Optional[Dict[str, Any]] = None, **kwargs):
+    if not pd.api.types.is_datetime64_any_dtype(df[c]):
+        df = df.copy()
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+
+    df[out_col] = df[c].dt.to_period("M").dt.to_timestamp()
+    return df, out_col
+
+
+def _caption_from_filters(portfolio: Optional[str], start_m: Optional[pd.Timestamp], end_m: Optional[pd.Timestamp]) -> str:
+    parts = []
+    if portfolio:
+        parts.append(f"Portfolio: **{portfolio}**")
+    if start_m or end_m:
+        lo = start_m.strftime("%b %Y") if start_m is not None else "…"
+        hi = end_m.strftime("%b %Y")   if end_m is not None else "…"
+        parts.append(f"Months: **{lo} → {hi}**")
+    return " · ".join(parts) if parts else "All data"
+
+
+# ------------------------------ main question ---------------------------------
+
+def run(store, params=None, query: str | None = None, user_text: str | None = None):
     """
-    Compute Complaints per 1,000 cases by month/process (optionally filtered by portfolio/process/month range).
-
-    Accepts either a legacy 'params' dict or named kwargs. Supported keys:
-      - portfolio
-      - process or process_name
-      - start, end (month endpoints, e.g., '2025-06' or 'Jun 2025')
+    Render 'Complaints per 1,000 cases' by process, with optional filters.
+    Expected store attributes:
+      - store.cases (pd.DataFrame)
+      - store.complaints (pd.DataFrame)
+    Accepted params (all optional):
+      - portfolio / portfolio_std (str)
+      - month_from / start_month (str-like)
+      - month_to / end_month (str-like)
     """
-    # unify arguments
-    p = {}
-    if params:
-        p.update(params)
-    p.update(kwargs)
+    st.subheader(TITLE)
 
-    portfolio = p.get("portfolio")
-    process = p.get("process") or p.get("process_name")
-    start_m = _month_from_arg(p.get("start") or p.get("from"))
-    end_m   = _month_from_arg(p.get("end") or p.get("to"))
+    params = params or {}
 
-    # Load data
-    cases = _get_df(store, "cases").copy()
-    complaints = _get_df(store, "complaints").copy()
+    cases = getattr(store, "cases", None)
+    complaints = getattr(store, "complaints", None)
 
-    # Identify columns
-    case_id_col = _first_existing(cases, CASE_ID_CANDIDATES)
+    if cases is None or complaints is None or len(cases) == 0 or len(complaints) == 0:
+        st.warning("No overlapping data for cases and complaints.")
+        return
+
+    # --- canonical columns
+    case_id_col = _find_case_id_col(cases)
     if case_id_col is None:
         raise KeyError("Cases: missing Case ID column")
 
-    case_proc_col = _first_existing(cases, PROCESS_CANDIDATES)
-    if case_proc_col is None:
-        raise KeyError("Cases: missing Process column")
+    proc_cases = _find_col(cases, PROCESS_CANDIDATES_CASES)
+    if proc_cases is None:
+        raise KeyError("Cases: missing process column")
 
-    case_port_col = _first_existing(cases, PORTFOLIO_CANDIDATES)
-    if case_port_col is None:
-        # keep going without portfolio if truly absent
-        case_port_col = None
+    proc_comp = _find_col(complaints, PROCESS_CANDIDATES_COMPLAINTS, PROCESS_CANDIDATES_CASES)
+    if proc_comp is None:
+        raise KeyError("Complaints: missing process/parent case type column")
 
-    comp_proc_col = _first_existing(complaints, PROCESS_CANDIDATES)
-    if comp_proc_col is None:
-        # Some complaint files only have Parent Case Type; we already searched for it.
-        # If nothing matched, give a clear error.
-        raise KeyError("Complaints: missing Process / Parent Case Type column")
+    portfolio_col_cases = _find_col(cases, PORTFOLIO_CANDIDATES)
+    portfolio_col_comp  = _find_col(complaints, PORTFOLIO_CANDIDATES)
 
-    comp_port_col = _first_existing(complaints, PORTFOLIO_CANDIDATES)
-    if comp_port_col is None:
-        comp_port_col = None
+    # --- month fields
+    cases, cases_month_col = _ensure_month(cases, DATE_CANDIDATES_CASES, "month")
+    complaints, comp_month_col = _ensure_month(complaints, DATE_CANDIDATES_COMPLAINTS, "month")
 
-    # Months
-    cases["month"] = _ensure_month(cases)
-    complaints["month"] = _ensure_month(complaints)
+    # --- filters from params
+    portfolio = params.get("portfolio") or params.get("portfolio_std") or params.get("Portfolio") or params.get("Portfolio_std")
+    start_m = _parse_month_token(params.get("month_from") or params.get("start_month") or params.get("from_month"))
+    end_m   = _parse_month_token(params.get("month_to")   or params.get("end_month")   or params.get("to_month"))
 
-    # Optional filters
-    if portfolio and case_port_col:
-        cases = cases[cases[case_port_col].astype(str).str.lower() == str(portfolio).lower()]
-    if portfolio and comp_port_col:
-        complaints = complaints[complaints[comp_port_col].astype(str).str.lower() == str(portfolio).lower()]
+    # show filters caption
+    st.caption(_caption_from_filters(portfolio, start_m, end_m))
 
-    if process:
-        cases = cases[cases[case_proc_col].astype(str).str.lower() == str(process).lower()]
-        complaints = complaints[complaints[comp_proc_col].astype(str).str.lower() == str(process).lower()]
-
+    # apply month filters
     if start_m is not None:
-        cases = cases[cases["month"] >= start_m]
-        complaints = complaints[complaints["month"] >= start_m]
+        cases = cases.loc[cases[cases_month_col] >= start_m]
+        complaints = complaints.loc[complaints[comp_month_col] >= start_m]
     if end_m is not None:
-        cases = cases[cases["month"] <= end_m]
-        complaints = complaints[complaints["month"] <= end_m]
+        cases = cases.loc[cases[cases_month_col] <= end_m]
+        complaints = complaints.loc[complaints[comp_month_col] <= end_m]
 
-    # Group and aggregate
-    gb_keys = ["month", case_proc_col]
-    if case_port_col:
-        gb_keys.append(case_port_col)
+    # portfolio filter
+    if portfolio and portfolio_col_cases:
+        cases = cases.loc[cases[portfolio_col_cases].astype(str).str.casefold() == str(portfolio).casefold()]
+    if portfolio and portfolio_col_comp:
+        complaints = complaints.loc[complaints[portfolio_col_comp].astype(str).str.casefold() == str(portfolio).casefold()]
 
-    cases_agg = (
-        cases.groupby(gb_keys)[case_id_col].nunique()
-        .rename("unique_cases")
-        .reset_index()
-    )
-
-    comp_keys = ["month", comp_proc_col]
-    if comp_port_col:
-        comp_keys.append(comp_port_col)
-
-    comp_agg = (
-        complaints.groupby(comp_keys).size()
-        .rename("complaints")
-        .reset_index()
-    )
-
-    # Normalize column names to join cleanly
-    cases_agg = cases_agg.rename(columns={case_proc_col: "Process", case_port_col or "": "Portfolio"})
-    comp_agg  = comp_agg.rename(columns={comp_proc_col: "Process", comp_port_col or "": "Portfolio"})
-
-    # Some datasets won’t have portfolio; align columns for merge
-    if "Portfolio" not in cases_agg.columns:
-        cases_agg["Portfolio"] = "ALL"
-    if "Portfolio" not in comp_agg.columns:
-        comp_agg["Portfolio"] = "ALL"
-
-    # Join on month + process + portfolio
-    merged = pd.merge(
-        cases_agg, comp_agg,
-        on=["month", "Process", "Portfolio"],
-        how="outer"
-    ).fillna(0)
-
-    if merged.empty or (merged["unique_cases"] == 0).all():
-        st.info("No overlapping data after filters (or zero cases). Try widening filters.")
+    if cases.empty or complaints.empty:
+        st.info("No data after applying filters.")
         return
 
-    merged["complaints_per_1000"] = (merged["complaints"] * 1000.0) / merged["unique_cases"]
-    merged = merged.sort_values(["month", "Process", "Portfolio"])
+    # --- aggregate
+    # unique cases by process
+    cases_agg = (
+        cases
+        .dropna(subset=[proc_cases, case_id_col])
+        .groupby(proc_cases, dropna=False)[case_id_col]
+        .nunique()
+        .rename("Unique_Cases")
+        .reset_index()
+    )
 
-    # --------- UI ----------
-    title_bits = ["Complaints per 1,000 cases"]
-    if portfolio:
-        title_bits.append(f"— Portfolio: {portfolio}")
-    if process:
-        title_bits.append(f"— Process: {process}")
-    if start_m or end_m:
-        sm = start_m.strftime("%b %Y") if start_m is not None else "…"
-        em = end_m.strftime("%b %Y") if end_m is not None else "…"
-        title_bits.append(f"— {sm} to {em}")
+    # complaints by process
+    comp_agg = (
+        complaints
+        .dropna(subset=[proc_comp])
+        .groupby(proc_comp, dropna=False)
+        .size()
+        .rename("Complaints")
+        .reset_index()
+    )
+    comp_agg = comp_agg.rename(columns={proc_comp: proc_cases})  # align key
 
-    st.subheader(" ".join(title_bits))
+    # join & compute rate
+    df = pd.merge(comp_agg, cases_agg, on=proc_cases, how="outer")
+    df["Complaints"] = df["Complaints"].fillna(0).astype(int)
+    df["Unique_Cases"] = df["Unique_Cases"].fillna(0).astype(int)
+    df["Complaints_per_1000"] = np.where(
+        df["Unique_Cases"] > 0, df["Complaints"] / df["Unique_Cases"] * 1000.0, np.nan
+    )
+    df = df.sort_values("Complaints_per_1000", ascending=False)
 
-    # Line/Bar by month
-    chart_df = merged.groupby("month", as_index=False)["complaints_per_1000"].mean()
-    fig = px.bar(chart_df, x="month", y="complaints_per_1000",
-                 title="Average complaints per 1,000 cases (all processes in selection)")
-    fig.update_yaxes(title="Complaints / 1000 cases")
-    fig.update_xaxes(title="Month")
-    st.plotly_chart(fig, use_container_width=True)
+    # friendly names
+    df = df.rename(columns={proc_cases: "Process"})
 
-    # Detail table (by process/portfolio/month)
-    pretty = merged.copy()
-    pretty["month"] = pretty["month"].dt.strftime("%b %Y")
-    pretty = pretty[["month", "Portfolio", "Process", "unique_cases", "complaints", "complaints_per_1000"]]
-    pretty = pretty.rename(columns={
-        "month": "Month",
-        "unique_cases": "Unique_Cases",
-        "complaints": "Complaints",
-        "complaints_per_1000": "Complaints_per_1000"
-    })
+    # --- render
+    if df["Complaints_per_1000"].notna().any():
+        fig = px.bar(
+            df.sort_values("Complaints_per_1000", ascending=True),
+            x="Complaints_per_1000",
+            y="Process",
+            orientation="h",
+            title=None,
+        )
+        fig.update_layout(
+            height=max(360, 28 * len(df)),
+            xaxis_title="Complaints per 1,000 cases",
+            yaxis_title="Process",
+            margin=dict(l=10, r=10, t=10, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No processes have both complaints and cases in the selected window.")
+
+    # show table
+    pretty = df.copy()
+    pretty["Complaints_per_1000"] = pretty["Complaints_per_1000"].round(2)
     st.dataframe(pretty, use_container_width=True)
