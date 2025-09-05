@@ -39,25 +39,46 @@ def _import_question_module(slug: str):
 
 
 def _run_question(slug: str, args: Dict[str, Any], store, user_text: str):
+    """
+    Import questions.<slug> and call run(store, ...), adapting arguments to the
+    module's declared signature so older/newer question modules all work.
+    """
     mod = _import_question_module(slug)
     if not hasattr(mod, "run"):
         raise AttributeError(f"Module 'questions.{slug}' has no function run(...).")
 
-    # ---- Sanitize kwargs: pass only what the module accepts ----
-    raw = dict(args or {})
-    # Older code sometimes uses 'query'. Remove it; we will map user text below.
-    raw.pop("query", None)
+    # Raw parsed arguments from the semantic router
+    raw_args = dict(args or {})
 
+    # Some older code injected 'query' – normalize by removing it and mapping later
+    raw_args.pop("query", None)
+
+    # Inspect the target signature and only pass what it accepts
     sig = inspect.signature(mod.run)
     accepted = set(sig.parameters.keys())
 
-    safe_args: Dict[str, Any] = {k: v for k, v in raw.items() if k in accepted}
+    safe_args: Dict[str, Any] = {k: v for k, v in raw_args.items() if k in accepted}
 
-    # Map the user's text into whichever parameter the module supports
-    if "user_question" in accepted:
-        safe_args.setdefault("user_question", user_text)
-    elif "query" in accepted:
-        safe_args.setdefault("query", user_text)
+    # Map user text into an appropriate parameter if present
+    if "user_question" in accepted and "user_question" not in safe_args:
+        safe_args["user_question"] = user_text
+    elif "query" in accepted and "query" not in safe_args:
+        safe_args["query"] = user_text
+
+    # ADAPTERS for older modules:
+    # Many legacy question modules expect a single dict "params" (or sometimes "filters").
+    # If the callee declares it and we haven't provided it, pass the full parsed args.
+    if "params" in accepted and "params" not in safe_args:
+        safe_args["params"] = dict(raw_args)  # full filter set as a dict
+
+    if "filters" in accepted and "filters" not in safe_args:
+        safe_args["filters"] = dict(raw_args)  # alias for modules that prefer 'filters'
+
+    # Optional: if a module wants 'options' or 'config', give it the same dict
+    if "options" in accepted and "options" not in safe_args:
+        safe_args["options"] = dict(raw_args)
+    if "config" in accepted and "config" not in safe_args:
+        safe_args["config"] = dict(raw_args)
 
     return mod.run(store, **safe_args)
 
