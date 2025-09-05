@@ -1,25 +1,20 @@
-# ingestion/loader_complaints.py
+# core/loader_complaints.py
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 import re
 import pandas as pd
 
 COMPL_ALIASES: Dict[str, str] = {
-    # dates/ids
     "Report_Date": "Report_Date",
     "Report Date": "Report_Date",
     "Parent Case Type": "ParentCaseType",
-
-    # dims
     "Portfolio": "Portfolio_std",
     "Scheme": "Scheme",
     "Receipt Method": "ReceiptMethod",
     "Parent Team": "ParentTeam",
     "Aptia Error": "AptiaError",
     "Control": "Control",
-
-    # text fields for RCA
     "Brief Description - RCA done by admin": "RCA_Brief",
     "Why": "RCA_Why",
 }
@@ -44,13 +39,6 @@ def _strip(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
 
 def load_complaints(complaints_dir: str | Path = "data/complaints") -> pd.DataFrame:
-    """
-    Load & normalize all Complaints Excel files.
-    Returns a tidy DF with at least:
-      ParentCaseType, Report_Date, report_month_ym, report_month_mmm,
-      Portfolio_std, Scheme, ReceiptMethod, ParentTeam, AptiaError, Control,
-      RCA_Brief, RCA_Why, RCA_Text (concat)
-    """
     complaints_dir = Path(complaints_dir)
     if not complaints_dir.exists():
         return pd.DataFrame()
@@ -73,16 +61,14 @@ def load_complaints(complaints_dir: str | Path = "data/complaints") -> pd.DataFr
             df["report_month_ym"] = df["Report_Date"].dt.strftime("%Y-%m")
             df["report_month_mmm"] = df["Report_Date"].dt.strftime("%b %y")
 
-        for c in ["ParentCaseType", "Portfolio_std", "Scheme", "ReceiptMethod",
-                  "ParentTeam", "AptiaError", "Control"]:
+        for c in ["ParentCaseType","Portfolio_std","Scheme","ReceiptMethod","ParentTeam","AptiaError","Control"]:
             if c in df.columns:
                 df[c] = _strip(df[c])
 
-        # RCA text concat (safe)
-        for c in ["RCA_Brief", "RCA_Why"]:
+        for c in ["RCA_Brief","RCA_Why"]:
             if c in df.columns:
                 df[c] = df[c].fillna("").astype(str)
-        df["RCA_Text"] = (df.get("RCA_Brief", "") + " " + df.get("RCA_Why", "")).str.strip()
+        df["RCA_Text"] = (df.get("RCA_Brief","") + " " + df.get("RCA_Why","")).str.strip()
 
         frames.append(df)
 
@@ -90,12 +76,10 @@ def load_complaints(complaints_dir: str | Path = "data/complaints") -> pd.DataFr
         return pd.DataFrame()
 
     data = pd.concat(frames, ignore_index=True)
-
-    # basic sanity
     keep = [
-        "ParentCaseType", "Report_Date", "report_month_ym", "report_month_mmm",
-        "Portfolio_std", "Scheme", "ReceiptMethod", "ParentTeam", "AptiaError", "Control",
-        "RCA_Brief", "RCA_Why", "RCA_Text"
+        "ParentCaseType","Report_Date","report_month_ym","report_month_mmm",
+        "Portfolio_std","Scheme","ReceiptMethod","ParentTeam","AptiaError","Control",
+        "RCA_Brief","RCA_Why","RCA_Text"
     ]
     keep = [c for c in keep if c in data.columns]
     return data[keep].copy()
