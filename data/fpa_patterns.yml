@@ -1,0 +1,9 @@
+categories:
+  data_error:
+    - "(wrong data|incorrect|typo)"
+  missing_document:
+    - "missing doc(ument)?"
+  sla_delay:
+    - "(delay|late|miss(ed)? sla)"
+  process_noncompliance:
+    - "(not as per process|process deviation)"
