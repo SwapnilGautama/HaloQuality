@@ -12,7 +12,7 @@ CASE_ALIASES: Dict[str, str] = {
     "Create_Date": "Create_Date",
     "Case ID": "Case_ID",
 
-    # dims you asked to slice by
+    # dims (slice fields)
     "Event Type": "EventType",
     "Portfolio": "Portfolio_std",
     "Location": "Location",
@@ -64,16 +64,19 @@ def _strip(df: pd.DataFrame, cols: List[str]) -> None:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 
+def _norm_key(x: pd.Series | str) -> pd.Series | str:
+    if isinstance(x, pd.Series):
+        return x.astype(str).str.strip().str.lower()
+    return str(x).strip().lower()
+
 def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
     """
     Load & normalize all case files under data/cases.
     Ensures:
-      - Create_Date parsed, month_ym/month_mmm derived
+      - Create_Date parsed, Month (MMM YY) derived
       - Case_ID present & de-duplicated
-      - Dimensions standardized (EventType, Portfolio_std, Location, ClientName, Scheme,
-        TeamName, ProcessName, ProcessGroup, CurrentOutsourcingTeam, OnshoreOffshore,
-        ManualRPA, Critical, PendCase, WithinSLA, Consented, MercerConsented, VulnerableCustomer)
-      - NoOfDays kept as numeric for KPI like avg days
+      - Process/Portfolio join keys created and normalized
+      - NoOfDays numeric
     """
     cases_dir = Path(cases_dir)
     if not cases_dir.exists():
@@ -99,8 +102,8 @@ def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
         # dates
         if "Create_Date" in df.columns:
             df["Create_Date"] = _to_datetime(df["Create_Date"])
-            df["month_ym"] = df["Create_Date"].dt.strftime("%Y-%m")
-            df["month_mmm"] = df["Create_Date"].dt.strftime("%b %y")
+            # Month for join (MMM YY)
+            df["Month"] = df["Create_Date"].dt.strftime("%b %y")
 
         # normalize text dims
         _strip(df, [
@@ -113,6 +116,16 @@ def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
         # numeric NoOfDays
         if "NoOfDays" in df.columns:
             df["NoOfDays"] = pd.to_numeric(df["NoOfDays"], errors="coerce")
+
+        # normalized join keys
+        if "ProcessName" in df.columns:
+            df["ProcessKey"] = _norm_key(df["ProcessName"])
+        else:
+            df["ProcessKey"] = pd.NA
+        if "Portfolio_std" in df.columns:
+            df["PortfolioKey"] = _norm_key(df["Portfolio_std"])
+        else:
+            df["PortfolioKey"] = pd.NA
 
         frames.append(df)
 
@@ -128,11 +141,10 @@ def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
                 .drop_duplicates(subset=["Case_ID"], keep="last")
         )
 
-    # Columns we expect to use across KPIs/joins
     keep = [
-        "Case_ID","Create_Date","month_ym","month_mmm","NoOfDays",
-        "EventType","Portfolio_std","Location","ClientName","Scheme","TeamName",
-        "ProcessName","ProcessGroup","CurrentOutsourcingTeam","OnshoreOffshore",
+        "Case_ID","Create_Date","Month","NoOfDays",
+        "EventType","Portfolio_std","PortfolioKey","Location","ClientName","Scheme","TeamName",
+        "ProcessName","ProcessKey","ProcessGroup","CurrentOutsourcingTeam","OnshoreOffshore",
         "ManualRPA","Critical","PendCase","WithinSLA","Consented",
         "MercerConsented","VulnerableCustomer"
     ]
