@@ -1,244 +1,152 @@
 # core/data_store.py
-# -----------------------------------------------------------------------------
-# Centralized data loader + normalizer for Halo Quality
-# - Loads: cases, complaints, fpa (via your existing loader_* modules)
-# - Normalizes to canonical columns used by questions:
-#       month_key  -> pandas.Period[M] (joins/filters)
-#       month      -> 'Jun 2025' (display only)
-#       Portfolio_std -> canonical portfolio
-#       Case ID    -> unique case identifier in cases
-# - Optionally runs RCA and FPA labellers if present
-# - Returns a dict-like "store" with dataframes and a small info block
-# -----------------------------------------------------------------------------
+# Loads all datasets and standardizes months across tables
+# Creates two columns on every table:
+#   Month        -> pd.Timestamp at first day of month
+#   Month_label  -> "MMM YY" (e.g., "Jun 25")
 
 from __future__ import annotations
-
-from pathlib import Path
+import os
 import re
 import pandas as pd
-import streamlit as st
+from typing import List, Dict, Optional
 
-# --- import your existing loaders (already in this repo) ----------------------
-from .loader_cases import load_cases              # -> DataFrame
-from .loader_complaints import load_complaints    # -> DataFrame
-try:
-    from .loader_fpa import load_fpa              # optional
-except Exception:
-    load_fpa = None
+DATA_ROOT = "data"
 
-# --- optional labellers (run if available) -----------------------------------
-try:
-    from .rca_labeller import label_complaints_rca
-except Exception:
-    label_complaints_rca = None
+# ---------- small utils ----------
+def _canon(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
-try:
-    from .fpa_labeller import label_fpa_comments
-except Exception:
-    label_fpa_comments = None
-
-# ---------- Canonical columns used everywhere by questions / joins -----------
-CANON_MONTH        = "month_key"        # pandas.Period[M]
-CANON_MONTH_LABEL  = "month"            # 'Jun 2025' (for display)
-CANON_PORT         = "Portfolio_std"    # standardized portfolio
-CANON_CASE_ID      = "Case ID"          # unique case identifier
-
-__all__ = [
-    "load_store",
-    "normalize_cases", "normalize_complaints", "normalize_fpa",
-    "CANON_MONTH", "CANON_MONTH_LABEL", "CANON_PORT", "CANON_CASE_ID",
-]
-
-# Default dataset folders (used when loaders require a path)
-DEFAULT_DIRS = {
-    "cases": Path("data/cases"),
-    "complaints": Path("data/complaints"),
-    "fpa": Path("data/first_pass_accuracy"),
-}
-
-# -----------------------------------------------------------------------------
-
-
-def _std_text(x):
-    if pd.isna(x):
-        return x
-    x = str(x).strip()
-    x = re.sub(r"\s+", " ", x)
-    return x.title()
-
-
-def _find_first(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    for c in candidates:
-        if c in df.columns:
+def _find_first_col(df: pd.DataFrame, preferred_names: List[str]) -> Optional[str]:
+    """Find the first matching column by canonical name (case/space/underscore/dash insensitive).
+    Falls back to substring search with the first preferred name."""
+    if df is None or df.empty:
+        return None
+    canon_map = {_canon(c): c for c in df.columns}
+    for name in preferred_names:
+        key = _canon(name)
+        if key in canon_map:
+            return canon_map[key]
+    # fallback: substring search on the first pref token
+    token = _canon(preferred_names[0])
+    for c in df.columns:
+        if token in _canon(c):
             return c
     return None
 
-
-def _ensure_month_cols(df: pd.DataFrame, date_candidates: list[str]) -> pd.DataFrame:
-    """
-    Ensure df has:
-        - month_key  (Period[M]) for joins/filters
-        - month      ('Jun 2025') for display
-    """
+def _add_month(df: pd.DataFrame, date_col: str, *, dayfirst: bool = True) -> pd.DataFrame:
+    """Adds Month (Timestamp) and Month_label (MMM YY) columns based on date_col."""
     if df is None or df.empty:
         return df
-
-    date_col = _find_first(df, date_candidates)
-    if date_col is None:
-        return df
-
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df[CANON_MONTH] = df[date_col].dt.to_period("M")
-    df[CANON_MONTH_LABEL] = df[CANON_MONTH].astype(str).map(
-        lambda s: pd.Period(s, "M").strftime("%b %Y")
-    )
+    # For UK-style dates, dayfirst=True helps (DD/MM/YY in complaints)
+    dt = pd.to_datetime(df[date_col], errors="coerce", dayfirst=dayfirst)
+    m = dt.dt.to_period("M").dt.to_timestamp()
+    df["Month"] = m
+    df["Month_label"] = df["Month"].dt.strftime("%b %y")
     return df
 
-
-def _ensure_portfolio(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    if CANON_PORT not in df.columns:
-        cand = _find_first(df, ["Portfolio_std", "Portfolio", "portfolio"])
-        if cand:
-            df[CANON_PORT] = df[cand].astype(str).map(_std_text)
-        else:
-            df[CANON_PORT] = pd.NA
-    else:
-        df[CANON_PORT] = df[CANON_PORT].astype(str).map(_std_text)
-    return df
-
-
-# ------------------------- Public normalizers --------------------------------
-
-def normalize_cases(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    # Case ID
-    cid = _find_first(df, [CANON_CASE_ID, "CaseID", "Case Id", "case_id"])
-    if cid and cid != CANON_CASE_ID:
-        df = df.rename(columns={cid: CANON_CASE_ID})
-
-    # Month from Create Date (preferred)
-    df = _ensure_month_cols(df, ["Create Date", "Create_Date", "Created", "Created On"])
-
-    # Portfolio
-    df = _ensure_portfolio(df)
-
-    return df
-
-
-def normalize_complaints(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    # Month from Report Date (preferred)
-    df = _ensure_month_cols(df, ["Report Date", "Report_Date", "Date", "Reported On"])
-
-    # Portfolio
-    df = _ensure_portfolio(df)
-
-    return df
-
-
-def normalize_fpa(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    df = _ensure_month_cols(
-        df,
-        [
-            "Review Date", "Reviewed Date", "Reviewed On", "Sampling Date",
-            "Completed On", "Completed Date", "Report Date", "Date",
-        ],
-    )
-    df = _ensure_portfolio(df)
-    return df
-
-
-# ----------------------------- Safe loader calls ------------------------------
-
-def _safe_load(loader, default_path: Path):
-    """
-    Try loader() first; if it requires a 'path' positional arg, retry with default_path.
-    """
-    try:
-        # attempt no-arg call (some loaders support this)
-        return loader()
-    except TypeError as e:
-        # Typical error we saw: "missing 1 required positional argument: 'path'"
-        msg = str(e)
-        needs_path = "positional argument" in msg and "path" in msg
-        if not needs_path:
-            # re-raise any other TypeError
-            raise
-        # retry with default directory
-        return loader(default_path)
-
-
-# ----------------------------- Main loader -----------------------------------
-
-@st.cache_data(show_spinner=False)
-def load_store(cache_bust: str = "v1") -> dict:
-    """
-    Loads all datasets, applies normalization, runs optional labellers,
-    and returns a dict-like store used by the questions.
-    """
-    # 1) Load raw (compat with both arg/no-arg loaders)
-    cases = _safe_load(load_cases, DEFAULT_DIRS["cases"])
-    complaints = _safe_load(load_complaints, DEFAULT_DIRS["complaints"])
-    fpa = None
-    if callable(load_fpa):
+def _read_folder(folder: str) -> pd.DataFrame:
+    """Read all CSV/XLS/XLSX under folder and concat. Empty if folder missing."""
+    if not os.path.isdir(folder):
+        return pd.DataFrame()
+    parts = []
+    for fname in os.listdir(folder):
+        fpath = os.path.join(folder, fname)
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
         try:
-            fpa = _safe_load(load_fpa, DEFAULT_DIRS["fpa"])
-        except Exception as e:
-            st.warning(f"FPA loader failed: {e}")
-            fpa = None
+            if ext in [".csv"]:
+                parts.append(pd.read_csv(fpath))
+            elif ext in [".xls", ".xlsx", ".xlsm"]:
+                parts.append(pd.read_excel(fpath))
+        except Exception:
+            # if a single file fails, skip it but keep others
+            continue
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
 
-    # 2) Normalize
-    cases = normalize_cases(cases)
-    complaints = normalize_complaints(complaints)
-    if fpa is not None and not fpa.empty:
-        fpa = normalize_fpa(fpa)
 
-    # 3) Optional labellers
-    if callable(label_complaints_rca) and complaints is not None and not complaints.empty:
-        try:
-            complaints = label_complaints_rca(complaints)
-        except Exception as e:
-            st.warning(f"RCA labeller failed: {e}")
+# ---------- loaders (enforce your date rules) ----------
+def load_cases(path: str = os.path.join(DATA_ROOT, "cases")) -> pd.DataFrame:
+    df = _read_folder(path)
+    if df.empty:
+        return df
+    # Create Date
+    col = _find_first_col(df, ["Create Date", "Create_Date", "createdate", "create"])
+    if not col:
+        raise ValueError("Cases: required date column 'Create Date' (or close variant) not found.")
+    _add_month(df, col, dayfirst=True)
+    return df
 
-    if fpa is not None and callable(label_fpa_comments) and not fpa.empty:
-        try:
-            fpa = label_fpa_comments(fpa)
-        except Exception as e:
-            st.warning(f"FPA labeller failed: {e}")
 
-    # 4) Info block for sidebar
-    def _latest_label(df: pd.DataFrame) -> str | None:
-        if df is None or df.empty or CANON_MONTH not in df.columns:
-            return None
-        p = df[CANON_MONTH].dropna().max()
-        if pd.isna(p):
-            return None
-        return pd.Period(p, "M").strftime("%b %Y")
+def load_complaints(path: str = os.path.join(DATA_ROOT, "complaints")) -> pd.DataFrame:
+    df = _read_folder(path)
+    if df.empty:
+        return df
+    # Date Complaint Received - DD/MM/YY
+    col = _find_first_col(df, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "complaint received"])
+    if not col:
+        raise ValueError("Complaints: required date column 'Date Complaint Received - DD/MM/YY' not found.")
+    _add_month(df, col, dayfirst=True)
+    return df
 
-    info = {
-        "cases_rows": 0 if cases is None else len(cases),
-        "complaints_rows": 0 if complaints is None else len(complaints),
-        "fpa_rows": 0 if (fpa is None or fpa.empty) else len(fpa),
-        "latest": {
-            "cases": _latest_label(cases),
-            "complaints": _latest_label(complaints),
-            "fpa": _latest_label(fpa) if fpa is not None else None,
-        },
-    }
+
+def load_fpa(path: str = os.path.join(DATA_ROOT, "first_pass_accuracy")) -> pd.DataFrame:
+    df = _read_folder(path)
+    if df.empty:
+        return df
+    # Activity Date
+    col = _find_first_col(df, ["Activity Date", "activity_date"])
+    if not col:
+        raise ValueError("FPA: required date column 'Activity Date' not found.")
+    _add_month(df, col, dayfirst=True)
+    return df
+
+
+def load_checker_accuracy(path: str = os.path.join(DATA_ROOT, "checker_accuracy")) -> pd.DataFrame:
+    df = _read_folder(path)
+    if df.empty:
+        return df
+    # Date Completed OR Review Date (prefer Date Completed)
+    col = _find_first_col(df, ["Date Completed", "date completed", "Review Date", "review date"])
+    if not col:
+        raise ValueError("Checker accuracy: required date column 'Date Completed' or 'Review Date' not found.")
+    _add_month(df, col, dayfirst=True)
+    return df
+
+
+def load_surveys(path: str = os.path.join(DATA_ROOT, "surveys")) -> pd.DataFrame:
+    df = _read_folder(path)
+    if df.empty:
+        return df
+    # Month_received
+    col = _find_first_col(df, ["Month_received", "month_received", "month received"])
+    if not col:
+        raise ValueError("Surveys: required date column 'Month_received' not found.")
+    # Surveys could already be month-like; treat generically
+    _add_month(df, col, dayfirst=True)
+    return df
+
+
+# ---------- bundle loader ----------
+def load_store(
+    cases_dir: str = os.path.join(DATA_ROOT, "cases"),
+    complaints_dir: str = os.path.join(DATA_ROOT, "complaints"),
+    fpa_dir: str = os.path.join(DATA_ROOT, "first_pass_accuracy"),
+    checker_dir: str = os.path.join(DATA_ROOT, "checker_accuracy"),
+    surveys_dir: str = os.path.join(DATA_ROOT, "surveys"),
+) -> Dict[str, pd.DataFrame]:
+    cases = load_cases(cases_dir)
+    complaints = load_complaints(complaints_dir)
+    fpa = load_fpa(fpa_dir)
+    checker = load_checker_accuracy(checker_dir)
+    surveys = load_surveys(surveys_dir)
 
     return {
         "cases": cases,
         "complaints": complaints,
         "fpa": fpa,
-        "info": info,
+        "checker": checker,
+        "surveys": surveys,
     }
