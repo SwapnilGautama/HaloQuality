@@ -1,191 +1,70 @@
 # core/rca_labeller.py
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, List, Tuple
 import re
-import yaml
 import pandas as pd
+from typing import Optional
 
-# We’ll accept BOTH formats:
-# A) simple: { category: [regex, ...], ... }
-# B) nested:
-#    categories:
-#      data_error:
-#        patterns: [regex, ...]
-#        sub:
-#          miskey: [regex, ...]
-#          missing_fields: [regex, ...]
-#
-# RCA1 = top-level category; RCA2 = matched sub-category (if any)
+# very lightweight rules; you can extend these or keep your YAML approach
+RULES = [
+    # ("label", [patterns...])
+    ("Data issue", [r"wrong data", r"incorrect (?:nino|dob|name)", r"mismatch", r"duplicate"]),
+    ("Delay / SLA miss", [r"delay", r"late", r"missed sla", r"took too long"]),
+    ("Process gap", [r"no process", r"missing step", r"gap", r"not covered"]),
+    ("Training / SOP", [r"not trained", r"didn'?t know", r"sop", r"guideline"]),
+    ("System / Access", [r"system", r"access", r"d365", r"robotics", r"rpa"]),
+    ("Communication", [r"email", r"call", r"not informed", r"poor communication"]),
+]
 
-DEFAULT_PATTERNS: Dict = {
-    "categories": {
-        "data_error": {
-            "patterns": [
-                r"\bwrong data\b", r"\bincorrect\b", r"\btypo\b",
-                r"\bmis-?key(ed)?\b", r"\btranspos(e|ed)\b",
-                r"\bdata entry\b"
-            ],
-            "sub": {
-                "miskey": [r"\bmis-?key(ed)?\b", r"\btranspos(e|ed)\b"],
-                "missing_fields": [r"\bmissing\b.*\b(field|info|information|value)\b"]
-            }
-        },
-        "missing_document": {
-            "patterns": [
-                r"\bmissing doc(ument)?\b", r"\bno document\b",
-                r"\bdoc not (received|available)\b"
-            ]
-        },
-        "sla_delay": {
-            "patterns": [
-                r"\bdelay(ed)?\b", r"\blate\b", r"\bmiss(ed)? sla\b", r"\bbreach(ed)? sla\b"
-            ]
-        },
-        "process_noncompliance": {
-            "patterns": [
-                r"\bdid not follow\b", r"\bnot as per process\b",
-                r"\bprocess deviation\b", r"\bnon-?compliance\b"
-            ]
-        },
-        "system_issue": {
-            "patterns": [
-                r"\bsystem (down|error|issue)\b", r"\bportal (error|issue)\b",
-                r"\brobot(ic|ics)\b", r"\brpa\b"
-            ]
-        },
-        "client_input": {
-            "patterns": [
-                r"\bclient provided wrong\b", r"\bmember wrong\b",
-                r"\bincorrect client data\b"
-            ]
-        },
-    }
-}
+def _first_match(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = text.lower()
+    for label, pats in RULES:
+        for p in pats:
+            if re.search(p, t):
+                return label
+    return None
 
-def _load_yaml(path: Path) -> Dict:
-    if not path.exists():
-        return DEFAULT_PATTERNS
-    with open(path, "r", encoding="utf-8") as f:
-        y = yaml.safe_load(f) or {}
-    # normalise: allow simple flat mapping {cat: [regex]} too
-    if "categories" not in y:
-        y = {"categories": y}
-    cats = y.get("categories") or {}
-    norm: Dict[str, Dict] = {}
-    for cat, spec in cats.items():
-        if isinstance(spec, list):
-            norm[cat] = {"patterns": spec, "sub": {}}
-        elif isinstance(spec, dict):
-            norm[cat] = {
-                "patterns": spec.get("patterns", []) if isinstance(spec.get("patterns", []), list) else [],
-                "sub": spec.get("sub", {}) if isinstance(spec.get("sub", {}), dict) else {},
-            }
-        else:
-            norm[cat] = {"patterns": [], "sub": {}}
-    return {"categories": norm}
+def _std(text: str) -> str:
+    return (text or "").strip()
 
-def _compile(cats: Dict[str, Dict]) -> Dict[str, Dict[str, List[re.Pattern]]]:
-    comp: Dict[str, Dict[str, List[re.Pattern]]] = {}
-    for cat, spec in cats.items():
-        comp[cat] = {
-            "patterns": [re.compile(p, re.IGNORECASE) for p in spec.get("patterns", [])],
-            "sub": {sc: [re.compile(p, re.IGNORECASE) for p in pats]
-                    for sc, pats in spec.get("sub", {}).items()}
-        }
-    return comp
-
-def _match(text: str, comp) -> Tuple[str, str, List[str]]:
+def label_complaints_rca(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns: (RCA1, RCA2, all_tags)
+    Builds RCA1 and RCA2 from free text:
+      - 'Brief Description - RCA done by admin'
+      - 'Why'
+    Adds columns if missing; leaves existing values intact.
     """
-    if not isinstance(text, str) or not text.strip():
-        return "", "", []
-    all_tags: List[str] = []
-    primary = ""
-    subcat = ""
-    for cat, spec in comp.items():
-        # any top-level hit?
-        if any(r.search(text) for r in spec["patterns"]):
-            if not primary:
-                primary = cat
-            all_tags.append(cat)
-            # check subcategories
-            for sc, regs in spec["sub"].items():
-                if any(r.search(text) for r in regs):
-                    if not subcat:
-                        subcat = sc
-                    all_tags.append(f"{cat}:{sc}")
-        else:
-            # even if top-level didn't match, allow sub hit to imply top-level
-            for sc, regs in spec["sub"].items():
-                if any(r.search(text) for r in regs):
-                    if not primary:
-                        primary = cat
-                    if not subcat:
-                        subcat = sc
-                    all_tags.append(cat)
-                    all_tags.append(f"{cat}:{sc}")
-                    break
-    if not primary:
-        primary = "other"
-    return primary, subcat, sorted(set(all_tags))
-
-def _ensure_rca_text(df: pd.DataFrame) -> pd.DataFrame:
-    """Combine the admin RCA + Why into a single free-text field to label."""
-    # Accept many header variants robustly
-    candidates = [
-        "Brief Description - RCA done by admin", "Brief Description – RCA done by admin",
-        "Brief_Description_-_RCA_done_by_admin", "Admin_RCA", "RCA_Admin",
-        "Why", "Root Cause", "Root_Cause", "Why?"  # common alternates
-    ]
-    # Gather any available columns
-    cols = [c for c in candidates if c in df.columns]
-    if not cols:
-        df["RCA_text"] = ""
+    if "RCA1" in df.columns and "RCA2" in df.columns:
         return df
-    # Build text: join non-null bits with separator
-    df["RCA_text"] = (
-        df[cols]
-        .astype(str)
-        .replace({"nan": "", "None": ""})
-        .apply(lambda r: " · ".join([x for x in r if x and x.strip()]), axis=1)
-        .str.strip()
-    )
-    return df
 
-def label_complaints_rca(
-    complaints_df: pd.DataFrame,
-    patterns_file: str | Path = "data/rca_patterns.yml",
-    text_col: str = "RCA_text",
-    fail_only: bool = False  # if you only want to label rows that meet some boolean flag
-) -> pd.DataFrame:
-    """
-    Add RCA labels to Complaints using free-text fields (Admin RCA + Why).
-    Adds: RCA1 (primary), RCA2 (subcategory if matched), RCA_AllTags (joined)
-    """
-    if complaints_df is None or complaints_df.empty:
-        return complaints_df
+    src1 = "Brief Description - RCA done by admin"
+    src2 = "Why"
 
-    df = complaints_df.copy()
-    df = _ensure_rca_text(df)
+    if src1 not in df.columns and src2 not in df.columns:
+        # nothing to label, create empty cols
+        df["RCA1"] = pd.NA
+        df["RCA2"] = pd.NA
+        return df
 
-    cfg = _load_yaml(Path(patterns_file))
-    comp = _compile(cfg["categories"])
+    t1 = df.get(src1, "").astype(str)
+    t2 = df.get(src2, "").astype(str)
 
-    df["RCA1"] = ""
-    df["RCA2"] = ""
-    df["RCA_AllTags"] = ""
+    df["RCA1"] = (t1.fillna("") + " " + t2.fillna("")).map(_first_match)
+    # simple RCA2: second pass by blanking the first label term (keeps light)
+    def rca2(row):
+        combined = f"{row.get(src1,'')} {row.get(src2,'')}".lower()
+        l1 = row.get("RCA1")
+        if not combined or not l1:
+            return None
+        # remove any words from label and try again
+        cleaned = re.sub("|".join([re.escape(w) for w in l1.lower().split()]), " ", combined)
+        return _first_match(cleaned)
 
-    # Apply matcher
-    def _apply_row(txt: str):
-        rca1, rca2, all_tags = _match(txt, comp)
-        return pd.Series([rca1, rca2, ";".join(all_tags)], index=["RCA1","RCA2","RCA_AllTags"])
+    if "RCA2" not in df.columns:
+        df["RCA2"] = df.apply(rca2, axis=1)
 
-    if fail_only and "FailFlag" in df.columns:
-        mask = df["FailFlag"] == True
-        df.loc[mask, ["RCA1","RCA2","RCA_AllTags"]] = df.loc[mask, text_col].apply(_apply_row)
-    else:
-        df[["RCA1","RCA2","RCA_AllTags"]] = df[text_col].apply(_apply_row)
-
+    # tidy
+    df["RCA1"] = df["RCA1"].astype("string")
+    df["RCA2"] = df["RCA2"].astype("string")
     return df
