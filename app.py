@@ -1,200 +1,160 @@
-# chat.py
-from __future__ import annotations
-import io
-from pathlib import Path
-from typing import Dict, Tuple, List
+# app.py
+import re
+from types import SimpleNamespace
 
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import plotly.express as px
 
-# ---- Data loaders & joiners ----
-from core.loader_cases import load_cases
-from core.loader_complaints import load_complaints
-from core.loader_fpa import load_fpa
-from core.fpa_labeller import label_fpa_comments
-from core.join_cases_complaints import build_cases_complaints_join
+# --- our modules
+from core.data_store import load_store          # your existing loader (cached)
+from question_engine import run_nl               # we export run_nl in __init__.py
 
-# ---- NL question engine ----
-from question_engine import run_nl  # requires question_engine/__init__.py to expose run_nl
+st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
 
-# Optional: Plotly is used by the NL engine for charts
-# If you prefer Altair or Plotly setup tweaks, adjust question_engine/aggregate.py
+# -------------------------------
+# helpers
+# -------------------------------
+def _fmt_month(p):
+    """Render Periods or timestamps nicely."""
+    if isinstance(p, pd.Period):
+        return p.strftime("%b %y")
+    if isinstance(p, pd.Timestamp):
+        return p.strftime("%b %y")
+    return str(p)
 
-
-# ------------------------- Page & Styling -------------------------
-st.set_page_config(page_title="Halo Quality — Conversational Analytics", layout="wide")
-
-HIDE_SIDEBAR_CSS = """
-<style>
-    [data-testid="stSidebar"] { width: 300px !important; }
-    .small-muted { color:#6b7280; font-size:0.85rem; }
-    .tight-table table { font-size: 0.9rem; }
-</style>
-"""
-st.markdown(HIDE_SIDEBAR_CSS, unsafe_allow_html=True)
-
-
-# ------------------------- Helpers -------------------------
-def _folder_signature(folder: str | Path, exts: Tuple[str, ...] = (".xlsx", ".xls", ".csv")) -> Tuple[Tuple[str, float], ...]:
-    """
-    Create a deterministic signature for a folder so Streamlit caching is invalidated
-    when files are added/updated. Returns a tuple of (relative_path, mtime) entries.
-    """
-    p = Path(folder)
-    if not p.exists():
-        return tuple()
-    items: List[Tuple[str, float]] = []
-    for f in sorted(p.rglob("*")):
-        if f.is_file() and f.suffix.lower() in exts:
-            try:
-                rel = str(f.relative_to(p))
-            except Exception:
-                rel = str(f.name)
-            items.append((rel, f.stat().st_mtime))
-    return tuple(items)
-
-
-@st.cache_data(show_spinner=False)
-def load_store(_sig_cases, _sig_complaints, _sig_fpa) -> Dict[str, pd.DataFrame]:
-    """
-    Load all datasets and build derived tables. Cached by folder signatures.
-    """
-    # Core data
-    cases = load_cases("data/cases")
-    complaints = load_complaints("data/complaints")
-
-    # FPA + label failure comments
-    fpa = load_fpa("data/first_pass_accuracy")
-    if not fpa.empty:
-        fpa = label_fpa_comments(fpa, "data/fpa_patterns.yml")
-
-    # Build complaints × cases join (for Complaints_per_1000 etc.)
-    joined_summary, rca = build_cases_complaints_join(cases, complaints)
-
-    return {
-        "cases": cases,
-        "complaints": complaints,
-        "fpa": fpa,
-        "complaints_join": joined_summary,   # Month, Portfolio_std, ProcessName, Unique_Cases, Complaints, Complaints_per_1000
-        "complaints_rca": rca,               # Month, Portfolio_std, ProcessName, RCA1, Complaints, Share
-    }
-
-
-def _download_df_button(df: pd.DataFrame, label: str, key: str):
-    if df is None or df.empty:
-        return
-    buff = io.BytesIO()
-    df.to_csv(buff, index=False)
-    st.download_button(
-        label=label,
-        data=buff.getvalue(),
-        file_name=f"{key}.csv",
-        mime="text/csv",
-        key=f"dl_{key}"
-    )
-
-
-def _render_payload(payload: Dict):
-    # Insights
-    for tip in payload.get("insights", []):
-        st.markdown(f"• {tip}")
-
-    # Visuals first (if any)
-    figs = payload.get("figs", {})
-    if figs:
-        cols = st.columns(len(figs))
-        for i, (name, fig) in enumerate(figs.items()):
-            with cols[i]:
-                st.plotly_chart(fig, use_container_width=True)
-
-    # Tables (each with a download)
-    tables = payload.get("tables", {})
-    if tables:
-        for name, df in tables.items():
-            st.markdown(f"**{name.replace('_',' ').title()}**")
-            st.dataframe(df, use_container_width=True, height=min(520, 80 + 28 * min(len(df), 12)))
-            _download_df_button(df, "Download CSV", key=name)
-
-
-# ------------------------- Sidebar (lightweight status) -------------------------
-with st.sidebar:
+def _left_status(store):
     st.markdown("### Data status")
-    sig_cases = _folder_signature("data/cases")
-    sig_complaints = _folder_signature("data/complaints")
-    sig_fpa = _folder_signature("data/first_pass_accuracy")
+    cases_rows = len(store["cases"]) if store.get("cases") is not None else 0
+    comp_rows  = len(store["complaints"]) if store.get("complaints") is not None else 0
+    fpa_rows   = len(store["fpa"]) if store.get("fpa") is not None else 0
 
-    store = load_store(sig_cases, sig_complaints, sig_fpa)
+    months = store.get("months", {})
+    lm_cases = months.get("cases_latest")
+    lm_comp  = months.get("complaints_latest")
+    lm_fpa   = months.get("fpa_latest")
 
-    # small counts
-    cases_rows = len(store["cases"])
-    comp_rows = len(store["complaints"])
-    fpa_rows = len(store["fpa"])
-
-    st.markdown(
-        f"<div class='small-muted'>Cases rows: <b>{cases_rows:,}</b><br>"
-        f"Complaints rows: <b>{comp_rows:,}</b><br>"
-        f"FPA rows: <b>{fpa_rows:,}</b></div>",
-        unsafe_allow_html=True
+    st.write(f"**Cases rows:** {cases_rows:,}")
+    st.write(f"**Complaints rows:** {comp_rows:,}")
+    st.write(f"**FPA rows:** {fpa_rows:,}")
+    st.write(
+        f"**Latest Month** — Cases: {_fmt_month(lm_cases)} | "
+        f"Complaints: {_fmt_month(lm_comp)} | FPA: {_fmt_month(lm_fpa)}"
     )
 
-    # show latest months detected
-    def _latest_month(df: pd.DataFrame) -> str:
-        if df is None or df.empty or "Month" not in df.columns:
-            return "—"
-        try:
-            return str(sorted(df["Month"].dropna().unique())[-1])
-        except Exception:
-            return "—"
-
-    st.markdown(
-        f"<div class='small-muted'>Latest Month — "
-        f"Cases: <b>{_latest_month(store['cases'])}</b> | "
-        f"Complaints: <b>{_latest_month(store['complaints'])}</b> | "
-        f"FPA: <b>{_latest_month(store['fpa'])}</b></div>",
-        unsafe_allow_html=True
-    )
-
-    st.divider()
+    st.markdown("---")
     st.caption("Tip: Ask things like:")
     st.markdown(
-        "- `complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025`  \n"
-        "- `show rca1 by portfolio for process \"Member Enquiry\" last 3 months`  \n"
-        "- `unique cases by process and portfolio Apr 2025 to Jun 2025`  \n"
-        "- `show the biggest drivers of case fails`"
+        """
+- complaints per **1000** by **process** for **portfolio London** **Jun 2025 to Aug 2025**
+- show **rca1** by **portfolio** for process **Member Enquiry**
+- unique **cases** by process and portfolio **Apr 2025 to Jun 2025**
+- show the **biggest drivers** of **case fails**
+        """
     )
 
+def _chip(text):
+    st.chat_message("user").write(text)
 
-# ------------------------- Main Chat UI -------------------------
+def _render_payload(payload: dict):
+    """Draw whatever the resolver returned."""
+    kind = payload.get("kind")
+
+    if kind == "text":
+        st.chat_message("assistant").write(payload.get("text", ""))
+        return
+
+    if kind == "table":
+        msg = st.chat_message("assistant")
+        df = payload.get("df")
+        caption = payload.get("caption", "")
+        if df is None or df.empty:
+            msg.warning("No data after applying filters.")
+        else:
+            if caption:
+                msg.caption(caption)
+            msg.dataframe(df, use_container_width=True)
+        return
+
+    if kind == "figure":
+        msg = st.chat_message("assistant")
+        fig = payload.get("fig")
+        caption = payload.get("caption", "")
+        if caption:
+            msg.caption(caption)
+        if fig is None:
+            msg.warning("No chart was produced.")
+        else:
+            msg.plotly_chart(fig, use_container_width=True)
+        # optional extra table if provided
+        df = payload.get("df")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.chat_message("assistant").dataframe(df, use_container_width=True)
+        return
+
+    # Multi payload (list of parts)
+    if kind == "multi":
+        parts = payload.get("parts", [])
+        for part in parts:
+            _render_payload(part)
+        return
+
+    # Fallback
+    st.chat_message("assistant").write("I ran but had nothing to show — try rephrasing?")
+
+# -------------------------------
+# app UI
+# -------------------------------
+# Cache key signals for the loader. Bump these to force refresh.
+sig_cases = "v5"
+sig_complaints = "v5"
+sig_fpa = "v5"
+
+@st.cache_data(show_spinner=False)
+def _load_once(sig_cases, sig_complaints, sig_fpa):
+    return load_store(sig_cases, sig_complaints, sig_fpa)
+
+store = _load_once(sig_cases, sig_complaints, sig_fpa)
+
+# Sidebar status
+with st.sidebar:
+    _left_status(store)
+
 st.title("Halo Quality — Chat")
 
-# Initialize message history
-if "messages" not in st.session_state:
-    st.session_state["messages"] = [
-        {"role": "assistant", "content": "Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy."}
+# seed assistant
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = [
+        dict(role="assistant",
+             content="Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
     ]
 
-# Render history
-for m in st.session_state["messages"]:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+# render history
+for m in st.session_state.chat_history:
+    st.chat_message(m["role"]).write(m["content"])
 
-# Chat input
-prompt = st.chat_input("Type your question (e.g., 'complaints per 1000 by process last 3 months')")
+# quick chips (they post as user messages)
+col = st.container()
+_ = col  # for symmetry if we expand later
+_chip("complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025")
+_chip("show rca1 by portfolio for process Member Enquiry")
 
-if prompt:
-    # Show user message
-    st.session_state["messages"].append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# chat input
+user_q = st.chat_input("Type your question (e.g., 'complaints per 1000 by process last 3 months')")
 
-    # Run NL engine immediately (no background tasks)
-    with st.chat_message("assistant"):
-        try:
-            payload = run_nl(prompt, store)
-            # Persist a short textual summary to history
-            _summary = "; ".join(payload.get("insights", [])[:1]) or "Let’s look at that…"
-            st.session_state["messages"].append({"role": "assistant", "content": _summary})
-            # Render full payload (charts + tables + downloads)
-            _render_payload(payload)
-        except Exception as e:
-            st.error(f"Sorry, I couldn't process that: {e}")
+if user_q:
+    # echo user
+    st.session_state.chat_history.append(dict(role="user", content=user_q))
+    st.chat_message("user").write(user_q)
+
+    # run NL
+    try:
+        with st.spinner("Let’s look at that…"):
+            payload = run_nl(user_q, store)
+    except Exception as e:
+        st.chat_message("assistant").error(f"Sorry, I hit an error: {e}")
+    else:
+        # keep a plain-text breadcrumb for history
+        st.session_state.chat_history.append(dict(role="assistant", content=""))
+        # draw result now
+        _render_payload(payload)
