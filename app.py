@@ -1,5 +1,8 @@
 # app.py
+import streamlit as st
 from core import load_store
+# ... any other imports
+
 from types import SimpleNamespace
 
 import streamlit as st
