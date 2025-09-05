@@ -6,3 +6,4 @@ rapidfuzz==3.9.6
 scikit-learn
 streamlit
 plotly
+PyYAML>=6.0.2
