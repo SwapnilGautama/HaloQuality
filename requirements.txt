@@ -2,7 +2,7 @@ pandas
 numpy
 python-dateutil
 openpyxl
-rapidfuzz>=3.9.6
+rapidfuzz==3.9.6
 scikit-learn
 streamlit
 plotly
