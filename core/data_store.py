@@ -1,55 +1,65 @@
 from __future__ import annotations
+
 from pathlib import Path
 import pandas as pd
-from __future__ import annotations
-import pandas as pd
 
-import core.ingest as ingest
-from core.join_cases_complaints import build_cases_complaints_join
+# Streamlit cache when available (falls back to normal memoization if app imports this outside Streamlit)
+try:
+    import streamlit as st
+    cache_fn = st.cache_data(show_spinner=False)
+except Exception:  # pragma: no cover
+    from functools import lru_cache as cache_fn  # type: ignore
+
+# Local loaders (each returns a pandas DataFrame)
+from .loader_cases import load_cases
+from .loader_complaints import load_complaints
+from .loader_fpa import load_fpa
+from .join_cases_complaints import build_cases_complaints_join
 
 
-ROOT = Path(__file__).resolve().parents[1]
-PROC_DIR = ROOT / "data" / "processed"
+DATA_DIR = Path("data")  # root data dir (as in your repo layout)
 
-def _read_or_empty(path: Path) -> pd.DataFrame:
-    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
-def load_processed(rebuild_if_missing: bool = True) -> dict[str, pd.DataFrame]:
-    comps = _read_or_empty(PROC_DIR / "complaints.parquet")
-    cases = _read_or_empty(PROC_DIR / "cases.parquet")
-    surv  = _read_or_empty(PROC_DIR / "survey.parquet")
+def _safe_len(df: pd.DataFrame | None) -> int:
+    return 0 if df is None else int(len(df))
 
-    if not rebuild_if_missing:
-        return {"complaints": comps, "cases": cases, "survey": surv}
 
-    if comps.empty or cases.empty or surv.empty:
-        return ingest.build_processed_datasets()
+@cache_fn
+def load_store(sig_cases: str = "", sig_complaints: str = "", sig_fpa: str = "") -> dict:
+    """
+    Central entrypoint the app calls.
+    - Loads Cases, Complaints, and FPA (each can be multi-month and auto-merged).
+    - Builds the joined view: complaints × cases (per your join rules).
+    - Returns a dictionary with the raw and derived tables, and some quick stats.
 
-    return {"complaints": comps, "cases": cases, "survey": surv}
+    The signature strings (sig_*) only exist to give Streamlit cache a cheap invalidation
+    key when you change data on disk; the function ignores their contents otherwise.
+    """
 
-def latest_month(df: pd.DataFrame) -> str | None:
-    if df is None or df.empty or "month" not in df.columns: return None
-    vals = df["month"].dropna().astype(str).tolist()
-    return max(vals) if vals else None
+    # ---- Load raw tables ----
+    cases = load_cases(DATA_DIR / "cases")
+    complaints = load_complaints(DATA_DIR / "complaints")
+    fpa = load_fpa(DATA_DIR / "first_pass_accuracy")
 
-def available_months(*dfs: pd.DataFrame) -> list[str]:
-    months = set()
-    for d in dfs:
-        if d is not None and not d.empty and "month" in d.columns:
-            months.update(d["month"].dropna().astype(str).tolist())
-    return sorted(months)
+    # ---- Build joined tables (complaints × cases) ----
+    joined_summary, rca = build_cases_complaints_join(cases, complaints)
 
-# ---------- NEW: common-month helpers ----------
-def _to_month_set(df: pd.DataFrame) -> set[str]:
-    if df is None or df.empty or "month" not in df.columns: return set()
-    return set(df["month"].dropna().astype(str).tolist())
+    # ---- Quick stats the UI shows in the left panel ----
+    stats = {
+        "cases_rows": _safe_len(cases),
+        "complaints_rows": _safe_len(complaints),
+        "fpa_rows": _safe_len(fpa),
+        "latest_cases_month": str(cases["month"].max()) if "month" in cases.columns and len(cases) else "NaT",
+        "latest_complaints_month": str(complaints["month"].max()) if "month" in complaints.columns and len(complaints) else "NaT",
+        "latest_fpa_month": str(fpa["month"].max()) if "month" in fpa.columns and len(fpa) else "NaT",
+    }
 
-def common_months(*dfs: pd.DataFrame) -> list[str]:
-    sets = [ _to_month_set(d) for d in dfs if _to_month_set(d) ]
-    if not sets: return []
-    common = set.intersection(*sets) if len(sets) > 1 else sets[0]
-    return sorted(common)
-
-def latest_common_month(*dfs: pd.DataFrame) -> str | None:
-    cm = common_months(*dfs)
-    return cm[-1] if cm else None
+    # Package everything for the app
+    return {
+        "cases": cases,
+        "complaints": complaints,
+        "fpa": fpa,
+        "joined_summary": joined_summary,
+        "rca": rca,
+        "stats": stats,
+    }
