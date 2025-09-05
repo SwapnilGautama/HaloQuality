@@ -1,8 +1,4 @@
 # questions/__init__.py
-"""
-Mark `questions` as a package so `import questions.<slug>` works.
-Optionally expose slugs via __all__ (not required for importlib).
-"""
 __all__ = [
     "complaints_per_thousand",
     "complaint_volume_rate",
