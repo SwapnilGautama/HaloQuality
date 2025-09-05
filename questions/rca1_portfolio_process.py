@@ -31,21 +31,22 @@ def _alias_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     # Parent_Case_Type_std
     if "Parent_Case_Type_std" not in df.columns:
-        # Prefer Parent Case Type; fallback to Process Name if that’s what the file has
-        pct = first_present(["Parent Case Type", "Parent_Case_Type", "Parent case type",
-                             "Process Name", "Process", "Process_Name", "Processname"])
+        pct = first_present([
+            "Parent Case Type", "Parent_Case_Type", "Parent case type",
+            "Process Name", "Process", "Process_Name", "Processname"
+        ])
         df["Parent_Case_Type_std"] = df[pct].astype(str).str.strip().str.lower() if pct else ""
 
     # Friendly aliases for other code paths that might expect these
     df["ProcessName_std"] = df.get("ProcessName_std", df["Parent_Case_Type_std"])
 
     if "Process Name" not in df.columns:
-        # raw alias; some old utilities look for this exact header
         df["Process Name"] = df.get("Parent Case Type", df.get("Parent_Case_Type", df["Parent_Case_Type_std"]))
 
     return df
 
-def run(store, params, user_text):
+# IMPORTANT: make user_text optional so the module works with (store, params) and (store, params, user_text)
+def run(store, params, user_text: str | None = None):
     st.subheader(TITLE)
 
     comp = store.get("complaints", pd.DataFrame()).copy()
@@ -56,7 +57,7 @@ def run(store, params, user_text):
     # Robust column aliases so we never KeyError on headers
     comp = _alias_cols(comp)
 
-    # Ensure RCA labels exist (cheap, vectorized)
+    # Ensure RCA labels exist
     if "RCA1" not in comp.columns:
         comp = label_complaints_rca(comp)
 
