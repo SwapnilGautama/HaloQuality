@@ -1,0 +1,75 @@
+# questions/question_q6.py
+from __future__ import annotations
+import collections, re
+import pandas as pd
+import streamlit as st
+
+def _ensure_month(df: pd.DataFrame, date_col: str, out_col="month"):
+    out = df.copy()
+    if out_col not in out.columns:
+        out[out_col] = pd.to_datetime(out[date_col]).dt.strftime("%Y-%m")
+    return out
+
+def _month_range(rr):
+    s,e = rr
+    s2 = pd.to_datetime(s+"-01"); e2 = pd.to_datetime(e+"-01")
+    return [d.strftime("%Y-%m") for d in pd.date_range(s2, e2, freq="MS")]
+
+def run(store, params):
+    fpa = store.get("fpa")
+    if fpa is None or fpa.empty:
+        st.info("No FPA data loaded.")
+        return
+
+    date_col = "Review_Date" if "Review_Date" in fpa.columns else fpa.columns[0]
+    fpa = _ensure_month(fpa, date_col)
+
+    rr_col = "Review_Result" if "Review_Result" in fpa.columns else "review_result"
+    if rr_col not in fpa.columns:
+        st.error("FPA missing Review_Result.")
+        return
+
+    fpa = fpa[fpa[rr_col].str.lower()=="fail"]
+
+    if params.portfolio and "Portfolio_std" in fpa.columns:
+        fpa = fpa[fpa["Portfolio_std"].str.casefold()==params.portfolio.casefold()]
+    if params.process and "ProcessName" in fpa.columns:
+        fpa = fpa[fpa["ProcessName"].str.casefold()==params.process.casefold()]
+
+    if params.month_range:
+        fpa = fpa[fpa["month"].isin(_month_range(params.month_range))]
+    elif params.last_n:
+        fpa = fpa[fpa["month"].isin(sorted(fpa["month"].unique())[-params.last_n:])]
+
+    label_col = None
+    for c in ["FPA_Label","Label","RCA1"]:
+        if c in fpa.columns:
+            label_col = c; break
+
+    if label_col:
+        top = (fpa.groupby(label_col).size().rename("count").sort_values(ascending=False).head(25).reset_index())
+        st.subheader("Top FPA fail drivers (labels)")
+        st.bar_chart(top.set_index(label_col)["count"])
+        with st.expander("Data", expanded=False):
+            st.dataframe(top)
+        return
+
+    # fallback: tokenise comments
+    text_col = None
+    for c in ["Case_Comment","Comments","Case comment","comment"]:
+        if c in fpa.columns:
+            text_col = c; break
+    if not text_col:
+        st.info("No labels or comment field available.")
+        return
+
+    cnt = collections.Counter()
+    for t in fpa[text_col].dropna().astype(str):
+        toks = [w for w in re.findall(r"[a-zA-Z']{3,}", t.lower()) if w not in {"the","and","for","with","from","that"}]
+        cnt.update(toks)
+
+    top = pd.DataFrame(cnt.most_common(30), columns=["token","count"])
+    st.subheader("Top tokens in FPA fail comments")
+    st.bar_chart(top.set_index("token")["count"])
+    with st.expander("Data", expanded=False):
+        st.dataframe(top)
