@@ -1,5 +1,5 @@
 # app.py
-import re
+from core import load_store
 from types import SimpleNamespace
 
 import streamlit as st
