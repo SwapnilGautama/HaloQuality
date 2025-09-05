@@ -10,6 +10,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
+from question_engine import run_nl
 
 import numpy as np
 import pandas as pd
