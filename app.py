@@ -1,360 +1,200 @@
-# app.py — Halo Quality (Streamlit) — minimal chat UI, auto-load data, Q1 + MoM overview
-# - Autoloads latest files from ./data
-# - Single prompt box; routes to:
-#     1) complaints vs NPS correlation by portfolio (latest or specified month)
-#     2) month-on-month overview (complaints, NPS, complaints/1k) + tabs by dimension
-# ------------------------------------------------------------------------------
-
+# chat.py
 from __future__ import annotations
-import re
-import sys
+import io
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
-from question_engine import run_nl
+from typing import Dict, Tuple, List
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
 
-# Optional: keep existing working question modules if present in the repo
-try:
-    from questions import corr_nps as q_corr_nps  # your working Q1 implementation
-except Exception:
-    q_corr_nps = None  # we'll fall back to a built-in implementation if missing
+# ---- Data loaders & joiners ----
+from core.loader_cases import load_cases
+from core.loader_complaints import load_complaints
+from core.loader_fpa import load_fpa
+from core.fpa_labeller import label_fpa_comments
+from core.join_cases_complaints import build_cases_complaints_join
 
-try:
-    from questions import mom_overview  # new MoM question file you added
-except Exception:
-    mom_overview = None  # (will warn if route hits this and the file isn't present)
+# ---- NL question engine ----
+from question_engine import run_nl  # requires question_engine/__init__.py to expose run_nl
 
-
-# ------------------------------------------------------------------------------
-# Paths / page config
-# ------------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-CASES_DIR = DATA_DIR / "cases"
-COMPLAINTS_DIR = DATA_DIR / "complaints"
-SURVEY_DIR = DATA_DIR / "surveys"
-
-st.set_page_config(page_title="Conversational Analytics Assistant", layout="wide")
+# Optional: Plotly is used by the NL engine for charts
+# If you prefer Altair or Plotly setup tweaks, adjust question_engine/aggregate.py
 
 
-# ------------------------------------------------------------------------------
-# Helpers — month parsing / normalization
-# ------------------------------------------------------------------------------
-MONTH_RE = re.compile(r"\b(20\d{2})[-/](0[1-9]|1[0-2])\b")
+# ------------------------- Page & Styling -------------------------
+st.set_page_config(page_title="Halo Quality — Conversational Analytics", layout="wide")
 
-def _to_month_str(x) -> Optional[str]:
-    """Return YYYY-MM or None. Accepts datetime/Period/str."""
-    if x is None:
-        return None
-    # datetime-like
-    if hasattr(x, "year") and hasattr(x, "month"):
-        try:
-            return f"{int(x.year):04d}-{int(x.month):02d}"
-        except Exception:
-            pass
-    # pandas Period
-    if hasattr(x, "strftime"):
-        try:
-            return pd.Period(x, freq="M").strftime("%Y-%m")
-        except Exception:
-            pass
-    s = str(x)
-    # try direct regex YYYY-MM
-    m = MONTH_RE.search(s)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    # try common strings like "Jun'25", "June 2025"
-    try:
-        dt = pd.to_datetime(s, errors="coerce", dayfirst=False)
-        if not pd.isna(dt):
-            return f"{dt.year:04d}-{dt.month:02d}"
-    except Exception:
-        pass
-    return None
+HIDE_SIDEBAR_CSS = """
+<style>
+    [data-testid="stSidebar"] { width: 300px !important; }
+    .small-muted { color:#6b7280; font-size:0.85rem; }
+    .tight-table table { font-size: 0.9rem; }
+</style>
+"""
+st.markdown(HIDE_SIDEBAR_CSS, unsafe_allow_html=True)
 
 
-def _months_set(df: pd.DataFrame) -> List[str]:
-    if df is None or df.empty or "month" not in df.columns:
-        return []
-    return sorted({ _to_month_str(x) for x in df["month"].dropna() if _to_month_str(x) })
-
-
-def _latest_common_month(*dfs: pd.DataFrame) -> Optional[str]:
-    sets = [set(_months_set(d)) for d in dfs if d is not None and not d.empty]
-    sets = [s for s in sets if s]
-    if not sets:
-        return None
-    common = set.intersection(*sets) if len(sets) > 1 else sets[0]
-    return sorted(common)[-1] if common else None
-
-
-def _find_month_in_prompt(prompt: str) -> Optional[str]:
-    if not prompt:
-        return None
-    m = MONTH_RE.search(prompt)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    if "last month" in prompt.lower():
-        # The caller will replace this with latest common month
-        return "__LAST__"
-    return None
-
-
-# ------------------------------------------------------------------------------
-# Data loading (cached)
-# Expectation:
-#   - Cases files under data/cases/** contain columns: "Case ID", "month", and dimensions (e.g., "Portfolio_std")
-#   - Complaints under data/complaints/** contain "month" and dimensions (e.g., "Portfolio_std")
-#   - Survey under data/surveys/** contain "month", "NPS" (+ optional same dimensions)
-# ------------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_cases() -> pd.DataFrame:
-    rows = []
-    for p in sorted(CASES_DIR.rglob("*.xls*")):
-        try:
-            df = pd.read_excel(p)
-        except Exception:
-            continue
-        # column normalization
-        cols = {c.strip(): c for c in df.columns}
-        # month
-        if "month" not in df.columns:
-            # try to infer from any date-like column
-            for cand in ["Month", "Created Month", "Date", "Created", "case_month"]:
-                if cand in df.columns:
-                    df["month"] = df[cand]
-                    break
-        df["month"] = df["month"].map(_to_month_str) if "month" in df.columns else _to_month_str(p.stem)
-        # Case ID must exist
-        if "Case ID" not in df.columns:
-            # try common variants
-            for cand in ["CaseID", "Case_Id", "CaseId", "Case id", "Unique_Case_ID"]:
-                if cand in df.columns:
-                    df = df.rename(columns={cand: "Case ID"})
-                    break
-        # keep minimal columns + all dims
-        if "Case ID" in df.columns and "month" in df.columns:
-            rows.append(df)
-    if not rows:
-        return pd.DataFrame()
-    cases = pd.concat(rows, ignore_index=True)
-    # Coerce month
-    cases["month"] = cases["month"].map(_to_month_str)
-    return cases.dropna(subset=["month"])
-
-
-@st.cache_data(show_spinner=False)
-def load_complaints() -> pd.DataFrame:
-    rows = []
-    for p in sorted(COMPLAINTS_DIR.rglob("*.xls*")):
-        try:
-            df = pd.read_excel(p)
-        except Exception:
-            continue
-        if "month" not in df.columns:
-            for cand in ["Month", "Complaints Date", "Date", "Created"]:
-                if cand in df.columns:
-                    df["month"] = df[cand]
-                    break
-        df["month"] = df["month"].map(_to_month_str) if "month" in df.columns else _to_month_str(p.stem)
-        rows.append(df)
-    if not rows:
-        return pd.DataFrame()
-    out = pd.concat(rows, ignore_index=True)
-    out["month"] = out["month"].map(_to_month_str)
-    return out.dropna(subset=["month"])
-
-
-@st.cache_data(show_spinner=False)
-def load_survey() -> pd.DataFrame:
-    rows = []
-    for p in sorted(SURVEY_DIR.rglob("*.xls*")):
-        try:
-            df = pd.read_excel(p)
-        except Exception:
-            continue
-        # ensure NPS column
-        if "NPS" not in df.columns:
-            for cand in ["nps", "Nps", "NPS Score", "NPS_score"]:
-                if cand in df.columns:
-                    df = df.rename(columns={cand: "NPS"})
-                    break
-        if "month" not in df.columns:
-            for cand in ["Month", "Survey Date", "Date", "Response Month"]:
-                if cand in df.columns:
-                    df["month"] = df[cand]
-                    break
-        df["month"] = df["month"].map(_to_month_str) if "month" in df.columns else _to_month_str(p.stem)
-        rows.append(df)
-    if not rows:
-        return pd.DataFrame()
-    out = pd.concat(rows, ignore_index=True)
-    out["month"] = out["month"].map(_to_month_str)
-    return out.dropna(subset=["month"])
-
-
-# ------------------------------------------------------------------------------
-# Built-in “corr_nps” fallback (used only if your existing q_corr_nps module is missing)
-# ------------------------------------------------------------------------------
-def _corr_nps_builtin(store: Dict[str, pd.DataFrame], month: str, group_by: str = "Portfolio_std"):
-    complaints = store["complaints"]
-    cases = store["cases"]
-    survey = store["survey"]
-
-    need_msg = []
-    if complaints.empty: need_msg.append("complaints")
-    if cases.empty: need_msg.append("cases")
-    if survey.empty: need_msg.append("survey")
-    if need_msg:
-        st.warning(f"Missing data: {', '.join(need_msg)}.")
-        return
-
-    # Month filter (use common latest if requested)
-    if month == "__AUTO__":
-        month = _latest_common_month(complaints, cases, survey)
-        if not month:
-            st.warning("No overlapping month across datasets.")
-            return
-
-    complaints_m = complaints[complaints["month"] == month].copy()
-    cases_m = cases[cases["month"] == month].copy()
-    survey_m = survey[survey["month"] == month].copy()
-
-    if complaints_m.empty or cases_m.empty or survey_m.empty:
-        st.warning(f"No overlapping rows found for {month}.")
-        return
-
-    # Per-group
-    comp_g = complaints_m.groupby(group_by, dropna=False).size().reset_index(name="Complaints")
-    uniq_g = cases_m.groupby(group_by, dropna=False)["Case ID"].nunique().reset_index(name="Unique_Cases")
-    nps_g = survey_m.groupby(group_by, dropna=False)["NPS"].mean().reset_index()
-
-    df = comp_g.merge(uniq_g, on=group_by, how="outer").merge(nps_g, on=group_by, how="outer").fillna(0.0)
-    df["Complaints_per_1000"] = np.where(df["Unique_Cases"] > 0,
-                                         (df["Complaints"] / df["Unique_Cases"]) * 1000.0,
-                                         np.nan)
-
-    # Plot
-    title = f"NPS vs Complaints per 1,000 — {month}"
-    fig = px.scatter(
-        df, x="Complaints_per_1000", y="NPS", text=group_by,
-        title=title, labels={"Complaints_per_1000": "Complaints per 1,000"},
-    )
-    fig.update_traces(mode="markers+text", textposition="top center")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Table
-    st.subheader("By portfolio")
-    show_cols = [group_by, "Complaints", "Unique_Cases", "Complaints_per_1000", "NPS"]
-    st.dataframe(df[show_cols].sort_values("Complaints_per_1000", ascending=False), use_container_width=True)
-
-
-# ------------------------------------------------------------------------------
-# Intent Router
-# ------------------------------------------------------------------------------
-MOM_KEYWORDS = [
-    "month on month", "mom", "mo m", "trend", "trends",
-    "time series", "over time", "by month", "monthly"
-]
-
-def route(prompt: str) -> str | None:
-    p = (prompt or "").lower().strip()
-    if not p:
-        return None
-    # Q1 correlation
-    if "nps" in p and "complaint" in p and "correl" in p:
-        return "corr_nps"
-    # MoM overview
-    if any(k in p for k in MOM_KEYWORDS) or ("complaint" in p and "month" in p):
-        return "mom_overview"
-    return None
-
-
-# ------------------------------------------------------------------------------
-# UI: Header + Data status
-# ------------------------------------------------------------------------------
-def header_and_status(complaints: pd.DataFrame, cases: pd.DataFrame, survey: pd.DataFrame):
-    st.markdown("## Conversational Analytics Assistant")
-    st.caption(
-        "Welcome to **Halo** — we auto-load the latest files from the "
-        "`data/` folder. Try: “**complaints nps correlation**” or add a month like "
-        "“**complaints nps correlation 2025-06**” and press **Enter**."
-    )
-
-    # Status line
-    c_rows = 0 if complaints is None else len(complaints)
-    k_rows = 0 if cases is None else len(cases)
-    s_rows = 0 if survey is None else len(survey)
-    months = sorted(set(_months_set(complaints)) | set(_months_set(cases)) | set(_months_set(survey)))
-    if months:
-        month_span = f"{months[0]} … {months[-1]}" if len(months) > 1 else months[0]
-        st.caption(f"Data status — Complaints: **{c_rows}** • Cases: **{k_rows}** • Survey: **{s_rows}** • Months: {', '.join(months)}")
-    else:
-        st.caption(f"Data status — Complaints: **{c_rows}** • Cases: **{k_rows}** • Survey: **{s_rows}**")
-
-
-# ------------------------------------------------------------------------------
-# Main app
-# ------------------------------------------------------------------------------
-def main():
-    # Load data (cached)
-    complaints = load_complaints()
-    cases = load_cases()
-    survey = load_survey()
-
-    header_and_status(complaints, cases, survey)
-
-    # Prompt box (enter to run)
-    prompt = st.text_input(
-        "Start by typing your business question:",
-        placeholder="e.g., complaints nps correlation",
-        key="prompt_input",
-    ).strip()
-
-    if not prompt:
-        return
-
-    # Route
-    qid = route(prompt)
-    if not qid:
-        st.info("I couldn't match your question. Try “complaints nps correlation” or “complaints month on month”.")
-        return
-
-    # Store
-    store = {"complaints": complaints, "cases": cases, "survey": survey}
-
-    # Month handling (for correlation route)
-    month_in_prompt = _find_month_in_prompt(prompt)
-    if month_in_prompt == "__LAST__":
-        month_in_prompt = _latest_common_month(complaints, cases, survey)
-
-    # Execute
-    if qid == "corr_nps":
-        month = month_in_prompt or _latest_common_month(complaints, cases, survey) or "__AUTO__"
-        if q_corr_nps is not None:
-            # Use your working implementation if present
+# ------------------------- Helpers -------------------------
+def _folder_signature(folder: str | Path, exts: Tuple[str, ...] = (".xlsx", ".xls", ".csv")) -> Tuple[Tuple[str, float], ...]:
+    """
+    Create a deterministic signature for a folder so Streamlit caching is invalidated
+    when files are added/updated. Returns a tuple of (relative_path, mtime) entries.
+    """
+    p = Path(folder)
+    if not p.exists():
+        return tuple()
+    items: List[Tuple[str, float]] = []
+    for f in sorted(p.rglob("*")):
+        if f.is_file() and f.suffix.lower() in exts:
             try:
-                q_corr_nps.run(store, month=month, group_by="Portfolio_std")
-            except TypeError:
-                # In case your module uses a slightly different signature
-                q_corr_nps.run(store, month)
-        else:
-            # Built-in fallback
-            _corr_nps_builtin(store, month=month, group_by="Portfolio_std")
+                rel = str(f.relative_to(p))
+            except Exception:
+                rel = str(f.name)
+            items.append((rel, f.stat().st_mtime))
+    return tuple(items)
+
+
+@st.cache_data(show_spinner=False)
+def load_store(_sig_cases, _sig_complaints, _sig_fpa) -> Dict[str, pd.DataFrame]:
+    """
+    Load all datasets and build derived tables. Cached by folder signatures.
+    """
+    # Core data
+    cases = load_cases("data/cases")
+    complaints = load_complaints("data/complaints")
+
+    # FPA + label failure comments
+    fpa = load_fpa("data/first_pass_accuracy")
+    if not fpa.empty:
+        fpa = label_fpa_comments(fpa, "data/fpa_patterns.yml")
+
+    # Build complaints × cases join (for Complaints_per_1000 etc.)
+    joined_summary, rca = build_cases_complaints_join(cases, complaints)
+
+    return {
+        "cases": cases,
+        "complaints": complaints,
+        "fpa": fpa,
+        "complaints_join": joined_summary,   # Month, Portfolio_std, ProcessName, Unique_Cases, Complaints, Complaints_per_1000
+        "complaints_rca": rca,               # Month, Portfolio_std, ProcessName, RCA1, Complaints, Share
+    }
+
+
+def _download_df_button(df: pd.DataFrame, label: str, key: str):
+    if df is None or df.empty:
         return
+    buff = io.BytesIO()
+    df.to_csv(buff, index=False)
+    st.download_button(
+        label=label,
+        data=buff.getvalue(),
+        file_name=f"{key}.csv",
+        mime="text/csv",
+        key=f"dl_{key}"
+    )
 
-    if qid == "mom_overview":
-        if mom_overview is not None:
-            mom_overview.run(store)
-        else:
-            st.warning("MoM module is not available. Please add `questions/mom_overview.py`.")
-        return
+
+def _render_payload(payload: Dict):
+    # Insights
+    for tip in payload.get("insights", []):
+        st.markdown(f"• {tip}")
+
+    # Visuals first (if any)
+    figs = payload.get("figs", {})
+    if figs:
+        cols = st.columns(len(figs))
+        for i, (name, fig) in enumerate(figs.items()):
+            with cols[i]:
+                st.plotly_chart(fig, use_container_width=True)
+
+    # Tables (each with a download)
+    tables = payload.get("tables", {})
+    if tables:
+        for name, df in tables.items():
+            st.markdown(f"**{name.replace('_',' ').title()}**")
+            st.dataframe(df, use_container_width=True, height=min(520, 80 + 28 * min(len(df), 12)))
+            _download_df_button(df, "Download CSV", key=name)
 
 
-if __name__ == "__main__":
-    main()
+# ------------------------- Sidebar (lightweight status) -------------------------
+with st.sidebar:
+    st.markdown("### Data status")
+    sig_cases = _folder_signature("data/cases")
+    sig_complaints = _folder_signature("data/complaints")
+    sig_fpa = _folder_signature("data/first_pass_accuracy")
+
+    store = load_store(sig_cases, sig_complaints, sig_fpa)
+
+    # small counts
+    cases_rows = len(store["cases"])
+    comp_rows = len(store["complaints"])
+    fpa_rows = len(store["fpa"])
+
+    st.markdown(
+        f"<div class='small-muted'>Cases rows: <b>{cases_rows:,}</b><br>"
+        f"Complaints rows: <b>{comp_rows:,}</b><br>"
+        f"FPA rows: <b>{fpa_rows:,}</b></div>",
+        unsafe_allow_html=True
+    )
+
+    # show latest months detected
+    def _latest_month(df: pd.DataFrame) -> str:
+        if df is None or df.empty or "Month" not in df.columns:
+            return "—"
+        try:
+            return str(sorted(df["Month"].dropna().unique())[-1])
+        except Exception:
+            return "—"
+
+    st.markdown(
+        f"<div class='small-muted'>Latest Month — "
+        f"Cases: <b>{_latest_month(store['cases'])}</b> | "
+        f"Complaints: <b>{_latest_month(store['complaints'])}</b> | "
+        f"FPA: <b>{_latest_month(store['fpa'])}</b></div>",
+        unsafe_allow_html=True
+    )
+
+    st.divider()
+    st.caption("Tip: Ask things like:")
+    st.markdown(
+        "- `complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025`  \n"
+        "- `show rca1 by portfolio for process \"Member Enquiry\" last 3 months`  \n"
+        "- `unique cases by process and portfolio Apr 2025 to Jun 2025`  \n"
+        "- `show the biggest drivers of case fails`"
+    )
+
+
+# ------------------------- Main Chat UI -------------------------
+st.title("Halo Quality — Chat")
+
+# Initialize message history
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": "Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy."}
+    ]
+
+# Render history
+for m in st.session_state["messages"]:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# Chat input
+prompt = st.chat_input("Type your question (e.g., 'complaints per 1000 by process last 3 months')")
+
+if prompt:
+    # Show user message
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Run NL engine immediately (no background tasks)
+    with st.chat_message("assistant"):
+        try:
+            payload = run_nl(prompt, store)
+            # Persist a short textual summary to history
+            _summary = "; ".join(payload.get("insights", [])[:1]) or "Let’s look at that…"
+            st.session_state["messages"].append({"role": "assistant", "content": _summary})
+            # Render full payload (charts + tables + downloads)
+            _render_payload(payload)
+        except Exception as e:
+            st.error(f"Sorry, I couldn't process that: {e}")
