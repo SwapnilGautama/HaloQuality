@@ -1,154 +1,147 @@
 # question_engine/parser.py
 from __future__ import annotations
+
 import re
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
 
-from rapidfuzz import fuzz, process
-from .lexicon import DIM_CANON, DIM_SYNONYMS, METRIC_CANON, METRIC_SYNONYMS, DOMAIN_HINTS
+# ---- fuzzy (fast) with graceful fallback ------------------------------------
+try:
+    from rapidfuzz import process as rf_process, fuzz as rf_fuzz  # type: ignore
+    _HAVE_RF = True
+except Exception:  # pragma: no cover
+    # Fallback keeps the app booting even if rapidfuzz isn't ready yet.
+    from difflib import SequenceMatcher
 
-# Month → "MMM YY"
-def _to_month_str(dt: datetime) -> str:
-    return dt.strftime("%b %y")
+    _HAVE_RF = False
 
-def parse_month_range(text: str) -> Tuple[Optional[str], Optional[str]]:
-    t = text.lower()
+    class _Shim:  # tiny shim so call sites look the same
+        @staticmethod
+        def extractOne(q: str, choices: List[str]):
+            best = None
+            best_score = -1.0
+            for c in choices:
+                s = SequenceMatcher(None, q.lower(), c.lower()).ratio()
+                if s > best_score:
+                    best_score, best = s, c
+            return (best, int(best_score * 100), None)
 
-    # relative: last N months
-    m = re.search(r"last\s+(\d+)\s+months?", t)
+    rf_process = _Shim()  # type: ignore
+
+# -----------------------------------------------------------------------------
+
+INTENTS = {
+    "complaints_per_1000": [
+        "complaints per 1000",
+        "complaints/1000",
+        "complaints per thousand",
+        "cpt",
+    ],
+    "rca1_by_portfolio": [
+        "rca1 by portfolio",
+        "reasons by portfolio",
+        "complaint reasons by portfolio",
+    ],
+    "unique_cases": [
+        "unique cases",
+        "case volume",
+        "cases by",
+    ],
+    "fpa_fail_drivers": [
+        "drivers of case fails",
+        "fpa failures",
+        "first pass accuracy fails",
+        "fpa fail reasons",
+    ],
+}
+
+# map common field synonyms -> canonical columns in your data
+FIELD_SYNONYMS = {
+    "portfolio": ["portfolio", "portfolio_std", "location"],  # keep "portfolio_std" canonical
+    "process": ["process", "process name", "parent case type", "case type", "member enquiry"],
+}
+
+MONTH_RX = re.compile(
+    r"(?P<m1>(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*)\s*['’]?(?P<y1>\d{2,4})"
+    r"(?:\s*(?:to|-|–|—)\s*(?P<m2>(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*)\s*['’]?(?P<y2>\d{2,4}))?",
+    flags=re.I,
+)
+
+LAST_N_RX = re.compile(r"last\s*(?P<n>\d{1,2})\s*months?", re.I)
+
+MONTH_ABBR = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
+
+def _norm_month_name(s: str) -> str:
+    s = s.strip().lower()[:3]
+    return s
+
+def _yyyymm_from_match(m_abbr: str, y: str) -> str:
+    m_idx = MONTH_ABBR.index(_norm_month_name(m_abbr)) + 1
+    y = y.strip()
+    y = f"20{y}" if len(y) == 2 else y
+    return f"{int(y):04d}-{m_idx:02d}"
+
+@dataclass
+class ParseResult:
+    intent: str
+    portfolio: Optional[str] = None
+    process: Optional[str] = None
+    # months is either (start_yyyy_mm, end_yyyy_mm) inclusive, or None
+    months: Optional[Tuple[str, str]] = None
+
+def _pick_intent(q: str) -> str:
+    # score the question against INTENTS vocabulary
+    phrases = []
+    labels = []
+    for label, words in INTENTS.items():
+        for w in words:
+            phrases.append(w)
+            labels.append(label)
+
+    best = rf_process.extractOne(q, phrases)
+    best_phrase = best[0] if best else None
+    return labels[phrases.index(best_phrase)] if best_phrase else "complaints_per_1000"
+
+def _extract_months(q: str) -> Optional[Tuple[str, str]]:
+    m = MONTH_RX.search(q)
     if m:
-        k = int(m.group(1))
-        end = datetime.utcnow().replace(day=1)
-        start = end - relativedelta(months=k)
-        return _to_month_str(start), _to_month_str(end)
+        y1 = m.group("y1")
+        y2 = m.group("y2") or y1
+        mm1 = _yyyymm_from_match(m.group("m1"), y1)
+        mm2 = _yyyymm_from_match(m.group("m2") or m.group("m1"), y2)
+        return (mm1, mm2)
 
-    if "last month" in t:
-        end = datetime.utcnow().replace(day=1) - relativedelta(months=1)
-        return _to_month_str(end), _to_month_str(end)
-
-    # absolute: find two month-like tokens
-    MONTH_NAMES = "(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
-    # e.g., Jun 2025 / June 25
-    pats = [
-        rf"({MONTH_NAMES})\s+(\d{{2,4}})",
-        r"(\d{4})-(\d{2})",
-    ]
-    months: List[str] = []
-    for pat in pats:
-        for m in re.finditer(pat, text, flags=re.IGNORECASE):
-            try:
-                if len(m.groups()) == 2 and m.re.pattern.startswith("("):
-                    mon, y = m.group(1)[:3].title(), m.group(2)
-                    if len(y) == 2: y = "20"+y
-                    dt = datetime.strptime(f"{mon} {y}", "%b %Y")
-                else:
-                    y, mm = int(m.group(1)), int(m.group(2))
-                    dt = datetime(y, mm, 1)
-                months.append(_to_month_str(dt))
-            except Exception:
-                pass
-    if len(months) >= 2:
-        months.sort(key=lambda s: datetime.strptime(s, "%b %y"))
-        return months[0], months[-1]
-    if len(months) == 1:
-        return months[0], months[0]
-    return None, None
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip().lower())
-
-def resolve_dimension(token: str) -> Optional[str]:
-    t = _norm(token)
-    if t in DIM_CANON: return DIM_CANON[t]
-    if t in DIM_SYNONYMS: return DIM_SYNONYMS[t]
-    # fuzzy resolve
-    cand, score, _ = process.extractOne(t, list(DIM_CANON.keys())+list(DIM_SYNONYMS.keys()), scorer=fuzz.partial_ratio)
-    if score >= 85:
-        return DIM_CANON.get(cand, DIM_SYNONYMS.get(cand))
+    m2 = LAST_N_RX.search(q)
+    if m2:
+        # "last N months" -> None here; router will interpret as rolling window
+        return None
     return None
 
-def resolve_metric(token: str) -> Optional[str]:
-    t = _norm(token)
-    if t in METRIC_CANON: return METRIC_CANON[t]
-    if t in METRIC_SYNONYMS: return METRIC_SYNONYMS[t]
-    cand, score, _ = process.extractOne(t, list(METRIC_CANON.keys())+list(METRIC_SYNONYMS.keys()), scorer=fuzz.partial_ratio)
-    if score >= 85:
-        return METRIC_CANON.get(cand, METRIC_SYNONYMS.get(cand))
-    return None
+def _extract_named(q: str, choices: List[str]) -> Optional[str]:
+    if not choices:
+        return None
+    hit = rf_process.extractOne(q, choices)
+    if not hit:
+        return None
+    match, score, _ = hit
+    # mild threshold so users can be sloppy
+    return match if (score >= 70) else None
 
-def infer_domain(text: str) -> str:
-    t = text.lower()
-    scores = {}
-    for dom, keys in DOMAIN_HINTS.items():
-        scores[dom] = sum(1 for k in keys if k in t)
-    # default priority: complaints > fpa > cases (tweakable)
-    ordered = sorted(scores.items(), key=lambda x: (-x[1], {"complaints":0,"fpa":1,"cases":2}[x[0]]))
-    return ordered[0][0] if ordered else "complaints"
+def parse(
+    q: str,
+    portfolios: List[str],
+    processes: List[str],
+) -> ParseResult:
+    q = q.strip()
+    intent = _pick_intent(q)
 
-def parse_group_by(text: str) -> List[str]:
-    """
-    Captures 'by …' lists, e.g., 'show rca1 by portfolio, process'
-    """
-    g = []
-    m = re.search(r"\bby\b(.+)", text, flags=re.IGNORECASE)
-    if not m:
-        return g
-    tail = m.group(1)
-    # stop at 'for', 'where', 'top', 'in', 'over', 'between'
-    tail = re.split(r"\b(for|where|top|in|over|between)\b", tail, flags=re.IGNORECASE)[0]
-    parts = re.split(r"[,/|]+| and ", tail, flags=re.IGNORECASE)
-    for p in parts:
-        dim = resolve_dimension(p)
-        if dim and dim not in g:
-            g.append(dim)
-    return g
+    months = _extract_months(q)
 
-def parse_filters(text: str) -> Dict[str, List[str]]:
-    """
-    Simple dim:value parser. Accepts:
-      - for process X
-      - where portfolio = london, scheme alpha
-      - portfolio london chichester
-      - process "member enquiry"
-    """
-    out: Dict[str, List[str]] = {}
-    # explicit 'for/where' segments
-    for kw in ["for", "where", "in"]:
-        m = re.search(rf"\b{kw}\b(.+)", text, flags=re.IGNORECASE)
-        if not m: continue
-        seg = m.group(1)
-        seg = re.split(r"\b(by|top|between|over)\b", seg, flags=re.IGNORECASE)[0]
-        # look for dim:value pairs first
-        for pair in re.finditer(r"([A-Za-z][A-Za-z\s]+)\s*[:=]\s*\"?([A-Za-z0-9\-\s]+)\"?", seg):
-            dim = resolve_dimension(pair.group(1))
-            if dim:
-                out.setdefault(dim, []).append(pair.group(2).strip())
-        # then loose 'dim value1 value2'
-        tokens = re.findall(r"\"[^\"]+\"|[A-Za-z0-9\-\_]+", seg)
-        i = 0
-        while i < len(tokens)-1:
-            dim = resolve_dimension(tokens[i].strip('"'))
-            if dim:
-                vals = []
-                i += 1
-                while i < len(tokens):
-                    nxt = tokens[i].strip('"')
-                    if resolve_dimension(nxt): break
-                    vals.append(nxt); i += 1
-                if vals: out.setdefault(dim, []).extend(vals)
-            else:
-                i += 1
-    # de-dup
-    for k in list(out.keys()):
-        out[k] = list(dict.fromkeys(out[k]))
-    return out
+    portfolio = _extract_named(q, portfolios) if portfolios else None
+    process = _extract_named(q, processes) if processes else None
 
-def parse_topn(text: str) -> Optional[int]:
-    m = re.search(r"\btop\s+(\d+)", text, flags=re.IGNORECASE)
-    return int(m.group(1)) if m else None
+    # Special-case: if "member enquiry" substring appears, prefer that as process
+    if not process and "member" in q.lower() and "enquir" in q.lower():
+        process = "Member Enquiry"
 
-def parse_sort(text: str) -> Optional[str]:
-    if "ascending" in text.lower() or "asc" in text.lower(): return "asc"
-    if "descending" in text.lower() or "desc" in text.lower(): return "desc"
-    return None
+    return ParseResult(intent=intent, portfolio=portfolio, process=process, months=months)
