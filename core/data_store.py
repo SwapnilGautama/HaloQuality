@@ -3,8 +3,8 @@
 # Centralized data loader + normalizer for Halo Quality
 # - Loads: cases, complaints, fpa (via your existing loader_* modules)
 # - Normalizes to canonical columns used by questions:
-#       month_key  -> pandas.Period[M] for joins/filters
-#       month      -> 'Jun 2025' label for display
+#       month_key  -> pandas.Period[M] (joins/filters)
+#       month      -> 'Jun 2025' (display only)
 #       Portfolio_std -> canonical portfolio
 #       Case ID    -> unique case identifier in cases
 # - Optionally runs RCA and FPA labellers if present
@@ -19,10 +19,10 @@ import pandas as pd
 import streamlit as st
 
 # --- import your existing loaders (already in this repo) ----------------------
-from .loader_cases import load_cases            # expected to return a DataFrame
-from .loader_complaints import load_complaints  # expected to return a DataFrame
+from .loader_cases import load_cases              # -> DataFrame
+from .loader_complaints import load_complaints    # -> DataFrame
 try:
-    from .loader_fpa import load_fpa            # optional
+    from .loader_fpa import load_fpa              # optional
 except Exception:
     load_fpa = None
 
@@ -39,16 +39,22 @@ except Exception:
 
 # ---------- Canonical columns used everywhere by questions / joins -----------
 CANON_MONTH        = "month_key"        # pandas.Period[M]
-CANON_MONTH_LABEL  = "month"            # 'Jun 2025' (display only)
+CANON_MONTH_LABEL  = "month"            # 'Jun 2025' (for display)
 CANON_PORT         = "Portfolio_std"    # standardized portfolio
 CANON_CASE_ID      = "Case ID"          # unique case identifier
 
-# export for other modules (e.g., questions/_utils)
 __all__ = [
     "load_store",
     "normalize_cases", "normalize_complaints", "normalize_fpa",
     "CANON_MONTH", "CANON_MONTH_LABEL", "CANON_PORT", "CANON_CASE_ID",
 ]
+
+# Default dataset folders (used when loaders require a path)
+DEFAULT_DIRS = {
+    "cases": Path("data/cases"),
+    "complaints": Path("data/complaints"),
+    "fpa": Path("data/first_pass_accuracy"),
+}
 
 # -----------------------------------------------------------------------------
 
@@ -61,7 +67,7 @@ def _std_text(x):
     return x.title()
 
 
-def _find_first(df: pd.DataFrame, candidates: list[str] ) -> str | None:
+def _find_first(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for c in candidates:
         if c in df.columns:
             return c
@@ -79,11 +85,9 @@ def _ensure_month_cols(df: pd.DataFrame, date_candidates: list[str]) -> pd.DataF
 
     date_col = _find_first(df, date_candidates)
     if date_col is None:
-        # allow downstream to warn; don't raise here
         return df
 
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    # Period month key and user-friendly label
     df[CANON_MONTH] = df[date_col].dt.to_period("M")
     df[CANON_MONTH_LABEL] = df[CANON_MONTH].astype(str).map(
         lambda s: pd.Period(s, "M").strftime("%b %Y")
@@ -92,9 +96,6 @@ def _ensure_month_cols(df: pd.DataFrame, date_candidates: list[str]) -> pd.DataF
 
 
 def _ensure_portfolio(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure we have a standardized Portfolio_std column for slicing/joins.
-    """
     if df is None or df.empty:
         return df
 
@@ -112,12 +113,6 @@ def _ensure_portfolio(df: pd.DataFrame) -> pd.DataFrame:
 # ------------------------- Public normalizers --------------------------------
 
 def normalize_cases(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make the cases table schema consistent for questions:
-      - Case ID present
-      - month_key / month from Create Date
-      - Portfolio_std standardized
-    """
     if df is None or df.empty:
         return df
 
@@ -126,7 +121,7 @@ def normalize_cases(df: pd.DataFrame) -> pd.DataFrame:
     if cid and cid != CANON_CASE_ID:
         df = df.rename(columns={cid: CANON_CASE_ID})
 
-    # Month from "Create Date" (preferred) or close variants
+    # Month from Create Date (preferred)
     df = _ensure_month_cols(df, ["Create Date", "Create_Date", "Created", "Created On"])
 
     # Portfolio
@@ -136,16 +131,10 @@ def normalize_cases(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_complaints(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make the complaints table schema consistent for questions:
-      - month_key / month from Report Date (preferred)
-      - Portfolio_std standardized
-      - (RCA1/2 left as-is; labeller may add)
-    """
     if df is None or df.empty:
         return df
 
-    # Month from "Report Date" (preferred) or close variants
+    # Month from Report Date (preferred)
     df = _ensure_month_cols(df, ["Report Date", "Report_Date", "Date", "Reported On"])
 
     # Portfolio
@@ -155,24 +144,38 @@ def normalize_complaints(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_fpa(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make the FPA table schema consistent for questions:
-      - month_key / month from review/completion date
-      - Portfolio_std standardized (if present)
-    """
     if df is None or df.empty:
         return df
 
-    # Accept a wider set of candidates we saw in the wild
     df = _ensure_month_cols(
         df,
         [
             "Review Date", "Reviewed Date", "Reviewed On", "Sampling Date",
-            "Completed On", "Completed Date", "Report Date", "Date"
+            "Completed On", "Completed Date", "Report Date", "Date",
         ],
     )
     df = _ensure_portfolio(df)
     return df
+
+
+# ----------------------------- Safe loader calls ------------------------------
+
+def _safe_load(loader, default_path: Path):
+    """
+    Try loader() first; if it requires a 'path' positional arg, retry with default_path.
+    """
+    try:
+        # attempt no-arg call (some loaders support this)
+        return loader()
+    except TypeError as e:
+        # Typical error we saw: "missing 1 required positional argument: 'path'"
+        msg = str(e)
+        needs_path = "positional argument" in msg and "path" in msg
+        if not needs_path:
+            # re-raise any other TypeError
+            raise
+        # retry with default directory
+        return loader(default_path)
 
 
 # ----------------------------- Main loader -----------------------------------
@@ -182,30 +185,17 @@ def load_store(cache_bust: str = "v1") -> dict:
     """
     Loads all datasets, applies normalization, runs optional labellers,
     and returns a dict-like store used by the questions.
-
-    Returns
-    -------
-    store : dict
-        {
-          "cases": pd.DataFrame,
-          "complaints": pd.DataFrame,
-          "fpa": pd.DataFrame | None,
-          "info": {
-              "cases_rows": int,
-              "complaints_rows": int,
-              "fpa_rows": int,
-              "latest": {
-                  "cases": "Jun 2025" | None,
-                  "complaints": "Jun 2025" | None,
-                  "fpa": "Aug 2025" | None,
-              }
-          }
-        }
     """
-    # 1) Load raw
-    cases = load_cases()
-    complaints = load_complaints()
-    fpa = load_fpa() if callable(load_fpa) else None
+    # 1) Load raw (compat with both arg/no-arg loaders)
+    cases = _safe_load(load_cases, DEFAULT_DIRS["cases"])
+    complaints = _safe_load(load_complaints, DEFAULT_DIRS["complaints"])
+    fpa = None
+    if callable(load_fpa):
+        try:
+            fpa = _safe_load(load_fpa, DEFAULT_DIRS["fpa"])
+        except Exception as e:
+            st.warning(f"FPA loader failed: {e}")
+            fpa = None
 
     # 2) Normalize
     cases = normalize_cases(cases)
@@ -214,20 +204,19 @@ def load_store(cache_bust: str = "v1") -> dict:
         fpa = normalize_fpa(fpa)
 
     # 3) Optional labellers
-    if callable(label_complaints_rca):
+    if callable(label_complaints_rca) and complaints is not None and not complaints.empty:
         try:
             complaints = label_complaints_rca(complaints)
         except Exception as e:
-            # Non-fatal; questions that need RCA will explain if missing
             st.warning(f"RCA labeller failed: {e}")
 
-    if fpa is not None and callable(label_fpa_comments):
+    if fpa is not None and callable(label_fpa_comments) and not fpa.empty:
         try:
             fpa = label_fpa_comments(fpa)
         except Exception as e:
             st.warning(f"FPA labeller failed: {e}")
 
-    # 4) Small info block for the sidebar
+    # 4) Info block for sidebar
     def _latest_label(df: pd.DataFrame) -> str | None:
         if df is None or df.empty or CANON_MONTH not in df.columns:
             return None
@@ -247,11 +236,9 @@ def load_store(cache_bust: str = "v1") -> dict:
         },
     }
 
-    # 5) Return the store
-    store = {
+    return {
         "cases": cases,
         "complaints": complaints,
         "fpa": fpa,
         "info": info,
     }
-    return store
