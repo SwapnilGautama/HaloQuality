@@ -1,7 +1,12 @@
 from __future__ import annotations
 from pathlib import Path
 import pandas as pd
-from . import ingest
+from __future__ import annotations
+import pandas as pd
+
+import core.ingest as ingest
+from core.join_cases_complaints import build_cases_complaints_join
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PROC_DIR = ROOT / "data" / "processed"
