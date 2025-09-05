@@ -1,147 +1,200 @@
 # core/data_store.py
-# Loads all datasets and standardizes months across tables
-# Creates two columns on every table:
-#   Month        -> pd.Timestamp at first day of month
-#   Month_label  -> "MMM YY" (e.g., "Jun 25")
-
 from __future__ import annotations
 import os
-import re
+from pathlib import Path
+import hashlib
 import pandas as pd
-from typing import List, Dict, Optional
+import streamlit as st
 
-DATA_ROOT = "data"
+DATA_DIR = Path("data")
 
-# ---------- small utils ----------
-def _canon(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+# ---------- helpers
 
-def _find_first_col(df: pd.DataFrame, preferred_names: List[str]) -> Optional[str]:
-    """Find the first matching column by canonical name (case/space/underscore/dash insensitive).
-    Falls back to substring search with the first preferred name."""
-    if df is None or df.empty:
-        return None
-    canon_map = {_canon(c): c for c in df.columns}
-    for name in preferred_names:
-        key = _canon(name)
-        if key in canon_map:
-            return canon_map[key]
-    # fallback: substring search on the first pref token
-    token = _canon(preferred_names[0])
-    for c in df.columns:
-        if token in _canon(c):
-            return c
-    return None
+def _hash_file(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(2**20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-def _add_month(df: pd.DataFrame, date_col: str, *, dayfirst: bool = True) -> pd.DataFrame:
-    """Adds Month (Timestamp) and Month_label (MMM YY) columns based on date_col."""
-    if df is None or df.empty:
-        return df
-    # For UK-style dates, dayfirst=True helps (DD/MM/YY in complaints)
-    dt = pd.to_datetime(df[date_col], errors="coerce", dayfirst=dayfirst)
-    m = dt.dt.to_period("M").dt.to_timestamp()
-    df["Month"] = m
-    df["Month_label"] = df["Month"].dt.strftime("%b %y")
-    return df
+def _to_parquet_once(xlsx_path: Path, sheet_name: str | None = None) -> Path:
+    """
+    Convert an Excel file (or a specific sheet) to Parquet the first time we see it,
+    and re-materialize if the XLSX changes. Returns the Parquet path.
+    """
+    pq_name = xlsx_path.with_suffix(f".{sheet_name or 'sheet'}.parquet")
+    sig_path = xlsx_path.with_suffix(f".{sheet_name or 'sheet'}.sig")
+    x_sig = _hash_file(xlsx_path) + (f":{sheet_name}" if sheet_name else "")
 
-def _read_folder(folder: str) -> pd.DataFrame:
-    """Read all CSV/XLS/XLSX under folder and concat. Empty if folder missing."""
-    if not os.path.isdir(folder):
-        return pd.DataFrame()
-    parts = []
-    for fname in os.listdir(folder):
-        fpath = os.path.join(folder, fname)
-        if not os.path.isfile(fpath):
-            continue
-        ext = os.path.splitext(fname)[1].lower()
-        try:
-            if ext in [".csv"]:
-                parts.append(pd.read_csv(fpath))
-            elif ext in [".xls", ".xlsx", ".xlsm"]:
-                parts.append(pd.read_excel(fpath))
-        except Exception:
-            # if a single file fails, skip it but keep others
-            continue
-    if not parts:
-        return pd.DataFrame()
-    return pd.concat(parts, ignore_index=True)
+    current_sig = sig_path.read_text() if sig_path.exists() else ""
+    if not pq_name.exists() or current_sig != x_sig:
+        df = pd.read_excel(xlsx_path, sheet_name=sheet_name, engine="openpyxl")
+        df.to_parquet(pq_name, index=False)
+        sig_path.write_text(x_sig)
+    return pq_name
 
+def _read_xlsx_fast(path: Path, sheet_name: str | None = None) -> pd.DataFrame:
+    # Materialize to parquet and read fast
+    pq = _to_parquet_once(path, sheet_name)
+    return pd.read_parquet(pq)
 
-# ---------- loaders (enforce your date rules) ----------
-def load_cases(path: str = os.path.join(DATA_ROOT, "cases")) -> pd.DataFrame:
-    df = _read_folder(path)
-    if df.empty:
-        return df
-    # Create Date
-    col = _find_first_col(df, ["Create Date", "Create_Date", "createdate", "create"])
-    if not col:
-        raise ValueError("Cases: required date column 'Create Date' (or close variant) not found.")
-    _add_month(df, col, dayfirst=True)
-    return df
+def _mmmyy(dt: pd.Series) -> pd.Series:
+    return dt.dt.strftime("%b %y")
 
+def _coerce_date(series: pd.Series, dayfirst: bool = True) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
 
-def load_complaints(path: str = os.path.join(DATA_ROOT, "complaints")) -> pd.DataFrame:
-    df = _read_folder(path)
-    if df.empty:
-        return df
-    # Date Complaint Received - DD/MM/YY
-    col = _find_first_col(df, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "complaint received"])
-    if not col:
-        raise ValueError("Complaints: required date column 'Date Complaint Received - DD/MM/YY' not found.")
-    _add_month(df, col, dayfirst=True)
-    return df
+# ---------- loaders (each returns a DF with 'month_dt' and 'month')
 
+def load_cases(path: Path) -> pd.DataFrame:
+    # Load all XLSX files under data/cases (newest pattern you’re using)
+    files = sorted(Path(path).glob("*.xlsx"))
+    dfs = []
+    for f in files:
+        df = _read_xlsx_fast(f)
+        # Required columns we’ll use repeatedly
+        # If columns differ slightly per file, .get with fallback keeps it robust
+        if "Create Date" in df.columns:
+            dt = _coerce_date(df["Create Date"], dayfirst=True)
+        elif "Create_Date" in df.columns:
+            dt = _coerce_date(df["Create_Date"], dayfirst=True)
+        else:
+            dt = pd.NaT
 
-def load_fpa(path: str = os.path.join(DATA_ROOT, "first_pass_accuracy")) -> pd.DataFrame:
-    df = _read_folder(path)
-    if df.empty:
-        return df
-    # Activity Date
-    col = _find_first_col(df, ["Activity Date", "activity_date"])
-    if not col:
-        raise ValueError("FPA: required date column 'Activity Date' not found.")
-    _add_month(df, col, dayfirst=True)
-    return df
+        df["month_dt"] = dt.dt.to_period("M").dt.to_timestamp()
+        df["month"] = _mmmyy(df["month_dt"])
 
+        # common dims (take as-is if they exist)
+        for c in [
+            "Case ID","Portfolio_std","Portfolio","Process Name","Parent Case Type",
+            "Team Name","Process Group","Onshore/Offshore","Manual/RPA","Location",
+            "ClientName","Scheme"
+        ]:
+            if c not in df.columns:
+                df[c] = pd.NA
 
-def load_checker_accuracy(path: str = os.path.join(DATA_ROOT, "checker_accuracy")) -> pd.DataFrame:
-    df = _read_folder(path)
-    if df.empty:
-        return df
-    # Date Completed OR Review Date (prefer Date Completed)
-    col = _find_first_col(df, ["Date Completed", "date completed", "Review Date", "review date"])
-    if not col:
-        raise ValueError("Checker accuracy: required date column 'Date Completed' or 'Review Date' not found.")
-    _add_month(df, col, dayfirst=True)
-    return df
+        # make sure Case ID is string to avoid dtype mismatches
+        if "Case ID" in df.columns:
+            df["Case ID"] = df["Case ID"].astype(str)
 
+        dfs.append(df[[
+            "Case ID","month_dt","month",
+            "Portfolio_std","Portfolio","Process Name","Parent Case Type",
+            "Team Name","Process Group","Onshore/Offshore","Manual/RPA","Location",
+            "ClientName","Scheme"
+        ]])
+    if not dfs:
+        return pd.DataFrame(columns=[
+            "Case ID","month_dt","month","Portfolio_std","Portfolio","Process Name",
+            "Parent Case Type","Team Name","Process Group","Onshore/Offshore",
+            "Manual/RPA","Location","ClientName","Scheme"
+        ])
+    out = pd.concat(dfs, ignore_index=True)
+    return out
 
-def load_surveys(path: str = os.path.join(DATA_ROOT, "surveys")) -> pd.DataFrame:
-    df = _read_folder(path)
-    if df.empty:
-        return df
-    # Month_received
-    col = _find_first_col(df, ["Month_received", "month_received", "month received"])
-    if not col:
-        raise ValueError("Surveys: required date column 'Month_received' not found.")
-    # Surveys could already be month-like; treat generically
-    _add_month(df, col, dayfirst=True)
-    return df
+def load_complaints(path: Path) -> pd.DataFrame:
+    # one or more complaint workbooks
+    files = sorted(Path(path).glob("*.xlsx"))
+    dfs = []
+    for f in files:
+        df = _read_xlsx_fast(f)
+        # date per your spec: "Date Complaint Received - DD/MM/YY"
+        date_cols = [
+            "Date Complaint Received - DD/MM/YY",
+            "Date Complaint Received",
+            "Date_Complaint_Received"
+        ]
+        date_col = next((c for c in date_cols if c in df.columns), None)
+        dt = _coerce_date(df[date_col], dayfirst=True) if date_col else pd.NaT
 
+        df["month_dt"] = dt.dt.to_period("M").dt.to_timestamp()
+        df["month"] = _mmmyy(df["month_dt"])
 
-# ---------- bundle loader ----------
-def load_store(
-    cases_dir: str = os.path.join(DATA_ROOT, "cases"),
-    complaints_dir: str = os.path.join(DATA_ROOT, "complaints"),
-    fpa_dir: str = os.path.join(DATA_ROOT, "first_pass_accuracy"),
-    checker_dir: str = os.path.join(DATA_ROOT, "checker_accuracy"),
-    surveys_dir: str = os.path.join(DATA_ROOT, "surveys"),
-) -> Dict[str, pd.DataFrame]:
-    cases = load_cases(cases_dir)
-    complaints = load_complaints(complaints_dir)
-    fpa = load_fpa(fpa_dir)
-    checker = load_checker_accuracy(checker_dir)
-    surveys = load_surveys(surveys_dir)
+        # id column (if present)
+        if "Case ID" not in df.columns:
+            df["Case ID"] = pd.NA
+
+        # align dims we join on
+        for c in ["Portfolio_std","Portfolio","Process Name","Parent Case Type"]:
+            if c not in df.columns:
+                df[c] = pd.NA
+
+        dfs.append(df[["Case ID","month_dt","month","Portfolio_std","Portfolio",
+                       "Process Name","Parent Case Type"]].copy())
+
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
+        columns=["Case ID","month_dt","month","Portfolio_std","Portfolio",
+                 "Process Name","Parent Case Type"]
+    )
+
+def load_fpa(path: Path) -> pd.DataFrame:
+    files = sorted(Path(path).glob("*.xlsx"))
+    dfs = []
+    for f in files:
+        df = _read_xlsx_fast(f)
+        date_cols = ["Activity Date","Activity_Date"]
+        date_col = next((c for c in date_cols if c in df.columns), None)
+        dt = _coerce_date(df[date_col], dayfirst=True) if date_col else pd.NaT
+        df["month_dt"] = dt.dt.to_period("M").dt.to_timestamp()
+        df["month"] = _mmmyy(df["month_dt"])
+        for c in ["Portfolio_std","Portfolio","Process Name","Team Name","Team Manager","Scheme","Location","Review Result","Case Comment"]:
+            if c not in df.columns:
+                df[c] = pd.NA
+        dfs.append(df[["month_dt","month","Portfolio_std","Portfolio","Process Name","Team Name","Team Manager","Scheme","Location","Review Result","Case Comment"]])
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
+        columns=["month_dt","month","Portfolio_std","Portfolio","Process Name","Team Name","Team Manager","Scheme","Location","Review Result","Case Comment"]
+    )
+
+def load_checker(path: Path) -> pd.DataFrame:
+    files = sorted(Path(path).glob("*.xlsx"))
+    dfs = []
+    for f in files:
+        df = _read_xlsx_fast(f)
+        date_cols = ["Date Completed","Review Date","Date_Completed","Review_Date"]
+        date_col = next((c for c in date_cols if c in df.columns), None)
+        dt = _coerce_date(df[date_col], dayfirst=True) if date_col else pd.NaT
+        df["month_dt"] = dt.dt.to_period("M").dt.to_timestamp()
+        df["month"] = _mmmyy(df["month_dt"])
+        dfs.append(df[["month_dt","month"] + [c for c in df.columns if c not in ("month_dt","month")]])
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=["month_dt","month"])
+
+def load_surveys(path: Path) -> pd.DataFrame:
+    files = sorted(Path(path).glob("*.xlsx"))
+    dfs = []
+    for f in files:
+        df = _read_xlsx_fast(f)
+        # Some sheets will already have month text; normalize to Timestamp → MMM YY
+        s = df["Month_received"] if "Month_received" in df.columns else pd.Series(pd.NaT, index=df.index)
+        # Try both text and numeric
+        dt = pd.to_datetime(s, errors="coerce")
+        if dt.isna().all():
+            # if it’s like "Jun-25" or "06/2025" in another col, we could add extra heuristics here
+            pass
+        df["month_dt"] = dt.dt.to_period("M").dt.to_timestamp()
+        df["month"] = _mmmyy(df["month_dt"])
+        dfs.append(df[["month_dt","month"] + [c for c in df.columns if c not in ("month_dt","month")]])
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=["month_dt","month"])
+
+# ---------- public (cached) entry point
+
+@st.cache_resource(show_spinner=False)
+def load_store() -> dict:
+    """
+    Returns a dict of DFs with unified monthly keys:
+      * month_dt  (Timestamp at month start)
+      * month     (MMM YY)
+    Only called once per session thanks to cache_resource.
+    """
+    cases = load_cases(DATA_DIR / "cases")
+    complaints = load_complaints(DATA_DIR / "complaints")
+    fpa = load_fpa(DATA_DIR / "first_pass_accuracy")
+    checker = load_checker(DATA_DIR / "checker_accuracy")
+    surveys = load_surveys(DATA_DIR / "surveys")
+
+    # Light slimming
+    for name, df in (("cases", cases), ("complaints", complaints), ("fpa", fpa), ("checker", checker), ("surveys", surveys)):
+        if "month_dt" in df.columns:
+            df.sort_values("month_dt", inplace=True)
 
     return {
         "cases": cases,
