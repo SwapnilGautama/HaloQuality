@@ -1,123 +1,79 @@
-# ingestion/loader.py
+# core/loader_cases.py
 from __future__ import annotations
-import re
 from pathlib import Path
-from typing import Dict, List, Optional
-
-import numpy as np
+from typing import Dict, List
+import re
 import pandas as pd
 
-# ---------- Column alias map (source header -> canonical) ----------
-# Add/extend here instead of touching code elsewhere.
+# Map raw headers → normalized names we’ll use everywhere
 CASE_ALIASES: Dict[str, str] = {
-    # identity
-    "Case ID": "Case_ID",
-    "Case_ID": "Case_ID",
-    "Report_Date": "Report_Date",
+    # dates / ids
     "Create Date": "Create_Date",
     "Create_Date": "Create_Date",
+    "Case ID": "Case_ID",
 
-    # dimensions
+    # dims you asked to slice by
     "Event Type": "EventType",
     "Portfolio": "Portfolio_std",
-    "Location": "Location_std",
+    "Location": "Location",
     "ClientName": "ClientName",
     "Client Name": "ClientName",
     "Scheme": "Scheme",
     "Team Name": "TeamName",
-    "TeamName": "TeamName",
+    "Team Name?": "TeamName",
+    "Team": "TeamName",
     "Process Name": "ProcessName",
-    "Process_Name": "ProcessName",
+    "Process": "ProcessName",
     "Process Group": "ProcessGroup",
-    "Current Outsourcing Team": "OutsourcingTeam",
-    "Onshore/Offshore": "Shore",
-    "Manual/RPA": "Automation",
+    "Current Outsourcing Team": "CurrentOutsourcingTeam",
+    "Onshore/Offshore": "OnshoreOffshore",
+    "Completes Current Onshore/Offshore": "OnshoreOffshore",
+    "Manual/RPA": "ManualRPA",
+    "Manual/ RPA": "ManualRPA",
     "Critical": "Critical",
     "Pend Case": "PendCase",
     "Within SLA": "WithinSLA",
+    "Within SLA Operation": "WithinSLA",
     "Consented/Non consented": "Consented",
     "Mercer Consented": "MercerConsented",
     "Vulnerable Customer": "VulnerableCustomer",
 
-    # numerics
-    "No. of Days": "NumDays",
-    "Number of Days": "NumDays",
-}
-
-# Friendly labels for dims (used by NL parser)
-DIM_CANONICAL = {
-    "event type": "EventType",
-    "event": "EventType",
-    "portfolio": "Portfolio_std",
-    "location": "Location_std",
-    "client": "ClientName",
-    "clientname": "ClientName",
-    "scheme": "Scheme",
-    "team": "TeamName",
-    "teamname": "TeamName",
-    "process": "ProcessName",
-    "process name": "ProcessName",
-    "process group": "ProcessGroup",
-    "outsourcing": "OutsourcingTeam",
-    "outsourcing team": "OutsourcingTeam",
-    "shore": "Shore",
-    "onshore/offshore": "Shore",
-    "automation": "Automation",
-    "manual/rpa": "Automation",
-    "critical": "Critical",
-    "pend": "PendCase",
-    "pend case": "PendCase",
-    "within sla": "WithinSLA",
-    "consented": "Consented",
-    "mercer consented": "MercerConsented",
-    "vulnerable": "VulnerableCustomer",
-    "vulnerable customer": "VulnerableCustomer",
-}
-
-YES_NO_MAP = {
-    "y": "Yes", "yes": "Yes", "true": "Yes", "1": "Yes",
-    "n": "No",  "no": "No",  "false": "No", "0": "No",
+    # metrics
+    "No. of Days": "NoOfDays",
 }
 
 def _clean_header(h: str) -> str:
-    """Normalize column header for alias lookup: strip, collapse space, preserve case for alias map."""
     return re.sub(r"\s+", " ", str(h)).strip()
 
 def _apply_aliases(df: pd.DataFrame, aliases: Dict[str, str]) -> pd.DataFrame:
-    remapped = {}
+    remap = {}
     for c in df.columns:
         key = _clean_header(c)
         if key in aliases:
-            remapped[c] = aliases[key]
+            remap[c] = aliases[key]
         else:
-            # fallback: make a safe-ish name (spaces->_, strip)
-            remapped[c] = re.sub(r"\s+", "_", key)
-    return df.rename(columns=remapped)
+            # safe fallback: normalize to snake-ish
+            remap[c] = re.sub(r"\s+", "_", key)
+    return df.rename(columns=remap)
 
-def _to_datetime(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
+def _to_datetime(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
 
-def _norm_yes_no(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip().str.lower().map(YES_NO_MAP).fillna(series)
-
-def _strip_text(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip()
+def _strip(df: pd.DataFrame, cols: List[str]) -> None:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
 
 def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
     """
-    Load and normalize ALL Excel files from data/cases into a canonical tidy DataFrame.
-
-    Canonical columns we return (when available):
-      - Case_ID (string)
-      - Create_Date (datetime64[ns])
-      - Report_Date (datetime64[ns], optional)
-      - month_ym (YYYY-MM string from Create_Date)
-      - month_mmm (MMM YY string from Create_Date)
-      - EventType, Portfolio_std, Location_std, ClientName, Scheme, TeamName
-      - ProcessName, ProcessGroup, OutsourcingTeam
-      - Shore (Onshore/Offshore), Automation (Manual/RPA)
-      - Critical, PendCase, WithinSLA, Consented, MercerConsented, VulnerableCustomer
-      - NumDays (numeric)
+    Load & normalize all case files under data/cases.
+    Ensures:
+      - Create_Date parsed, month_ym/month_mmm derived
+      - Case_ID present & de-duplicated
+      - Dimensions standardized (EventType, Portfolio_std, Location, ClientName, Scheme,
+        TeamName, ProcessName, ProcessGroup, CurrentOutsourcingTeam, OnshoreOffshore,
+        ManualRPA, Critical, PendCase, WithinSLA, Consented, MercerConsented, VulnerableCustomer)
+      - NoOfDays kept as numeric for KPI like avg days
     """
     cases_dir = Path(cases_dir)
     if not cases_dir.exists():
@@ -125,50 +81,38 @@ def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
 
     frames: List[pd.DataFrame] = []
     for f in sorted(cases_dir.glob("**/*")):
-        if f.suffix.lower() not in (".xlsx", ".xls"):
+        if f.suffix.lower() not in (".xlsx", ".xls", ".csv"):
             continue
         try:
-            df = pd.read_excel(f, dtype=None)
+            if f.suffix.lower() == ".csv":
+                df = pd.read_csv(f)
+            else:
+                df = pd.read_excel(f, dtype=None)
         except Exception:
-            # Some sheets require engine='openpyxl'
             df = pd.read_excel(f, engine="openpyxl", dtype=None)
+
         if df.empty:
             continue
 
         df = _apply_aliases(df, CASE_ALIASES)
 
-        # Date fields
+        # dates
         if "Create_Date" in df.columns:
             df["Create_Date"] = _to_datetime(df["Create_Date"])
-        if "Report_Date" in df.columns:
-            df["Report_Date"] = _to_datetime(df["Report_Date"])
-
-        # Month keys from Create_Date (denominator grain)
-        if "Create_Date" in df.columns:
             df["month_ym"] = df["Create_Date"].dt.strftime("%Y-%m")
             df["month_mmm"] = df["Create_Date"].dt.strftime("%b %y")
 
-        # Normalize key categorical text
-        for col in [
-            "EventType", "Portfolio_std", "Location_std", "ClientName", "Scheme", "TeamName",
-            "ProcessName", "ProcessGroup", "OutsourcingTeam", "Shore", "Automation",
-            "PendCase",
-        ]:
-            if col in df.columns:
-                df[col] = _strip_text(df[col])
+        # normalize text dims
+        _strip(df, [
+            "EventType","Portfolio_std","Location","ClientName","Scheme","TeamName",
+            "ProcessName","ProcessGroup","CurrentOutsourcingTeam","OnshoreOffshore",
+            "ManualRPA","Critical","PendCase","WithinSLA","Consented",
+            "MercerConsented","VulnerableCustomer"
+        ])
 
-        # Normalize boolean flags to Yes/No strings
-        for col in ["Critical", "WithinSLA", "Consented", "MercerConsented", "VulnerableCustomer"]:
-            if col in df.columns:
-                df[col] = _norm_yes_no(df[col])
-
-        # Numerics
-        if "NumDays" in df.columns:
-            df["NumDays"] = pd.to_numeric(df["NumDays"], errors="coerce")
-
-        # Ensure Case_ID exists and is string
-        if "Case_ID" in df.columns:
-            df["Case_ID"] = _strip_text(df["Case_ID"].astype(str))
+        # numeric NoOfDays
+        if "NoOfDays" in df.columns:
+            df["NoOfDays"] = pd.to_numeric(df["NoOfDays"], errors="coerce")
 
         frames.append(df)
 
@@ -177,24 +121,20 @@ def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
 
     data = pd.concat(frames, ignore_index=True)
 
-    # Deduplicate (same case may appear in multiple pulls/files).
-    # Keep the earliest Create_Date record per Case_ID.
-    if "Case_ID" in data.columns and "Create_Date" in data.columns:
-        data = data.sort_values(["Case_ID", "Create_Date"], ascending=[True, True])
-        data = data.drop_duplicates(subset=["Case_ID"], keep="first")
+    # keep one row per Case_ID (latest Create_Date wins)
+    if "Case_ID" in data.columns:
+        data = (
+            data.sort_values(["Case_ID", "Create_Date"], na_position="last")
+                .drop_duplicates(subset=["Case_ID"], keep="last")
+        )
 
-    # Final tidy sort
-    if "Create_Date" in data.columns:
-        data = data.sort_values("Create_Date")
-
-    return data
-
-
-def available_case_dims(df: pd.DataFrame) -> List[str]:
-    """Return canonical dimension columns present in df."""
-    dims = [
-        "EventType", "Portfolio_std", "Location_std", "ClientName", "Scheme", "TeamName",
-        "ProcessName", "ProcessGroup", "OutsourcingTeam", "Shore", "Automation",
-        "Critical", "PendCase", "WithinSLA", "Consented", "MercerConsented", "VulnerableCustomer",
+    # Columns we expect to use across KPIs/joins
+    keep = [
+        "Case_ID","Create_Date","month_ym","month_mmm","NoOfDays",
+        "EventType","Portfolio_std","Location","ClientName","Scheme","TeamName",
+        "ProcessName","ProcessGroup","CurrentOutsourcingTeam","OnshoreOffshore",
+        "ManualRPA","Critical","PendCase","WithinSLA","Consented",
+        "MercerConsented","VulnerableCustomer"
     ]
-    return [c for c in dims if c in df.columns]
+    keep = [c for c in keep if c in data.columns]
+    return data[keep].copy()
