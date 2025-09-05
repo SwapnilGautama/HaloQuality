@@ -1,0 +1,29 @@
+Data entry:
+  Wrong entry:
+    - "\\bwrong data\\b"
+    - "\\bincorrect\\b"
+    - "\\btypo\\b"
+  Missing/blank field:
+    - "\\bmissing\\b"
+    - "\\bblank\\b"
+Documentation:
+  Incorrect document:
+    - "\\bwrong doc(ument)?\\b"
+  Document missing:
+    - "\\bmissing doc\\b"
+Process:
+  Followed wrong process:
+    - "\\bwrong process\\b"
+  Training gap:
+    - "\\btraining\\b"
+  SLA miss:
+    - "\\bsla\\b"
+System:
+  System error:
+    - "\\bsystem (error|issue|down)\\b"
+Customer provided:
+  Incorrect info from customer:
+    - "\\bcustomer.*(wrong|incorrect)\\b"
+Control:
+  Control failure:
+    - "\\bcontrol (gap|fail(ure)?)\\b"
