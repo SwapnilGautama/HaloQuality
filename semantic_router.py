@@ -1,155 +1,84 @@
 # semantic_router.py — tiny semantic matcher for Halo questions
-# -------------------------------------------------------------
-# Returns (slug, args, title) where slug matches a module under questions/
-# We use RapidFuzz on a curated lexicon so users can type freely.
 
 from __future__ import annotations
-
+from typing import Dict, List, Tuple, Any
 import re
-from typing import Dict, Any, Tuple, List
 from rapidfuzz import process, fuzz
 
-
-# Canonical question slugs -> list of surface forms we match against
 LEXICON: Dict[str, List[str]] = {
-    # complaints / cases
     "complaints_per_thousand": [
-        "complaints per 1000",
-        "complaints per thousand",
-        "complaints/1000",
-        "complaint rate per 1000",
-        "complaint rate",
-        "complaints rate",
-        "per 1000 complaints",
+        "complaints per 1000", "complaints/1000", "complaint rate per 1000",
+        "complaint rate", "complaints rate", "per 1000 complaints",
+        "complaints per thousand"
     ],
     "complaint_volume_rate": [
-        "complaint volume",
-        "complaints volume",
-        "complaints trend",
-        "complaints by month",
-        "volume of complaints",
-        "complaint count month on month",
-    ],
-    "corr_nps": [
-        "complaints nps correlation",
-        "nps correlation complaints",
-        "correlation nps",
-        "nps vs complaints",
+        "complaint volume", "complaints volume", "overall complaints by month",
+        "month on month complaints", "complaints mom"
     ],
     "unique_cases_mom": [
-        "unique cases month on month",
-        "cases trend",
-        "cases by month",
-        "cases mom",
+        "unique cases month on month", "cases mom", "unique cases trend", "unique case volume"
     ],
-    "mom_overview": [
-        "overview month on month",
-        "mom overview",
-        "kpi overview",
-        "dashboard overview month",
+    "corr_nps": [
+        "nps correlation", "complaints nps correlation", "correlation between complaints and nps",
+        "nps vs complaints"
+    ],
+    "fpa_fail_rate": [
+        "fpa fail rate", "first pass accuracy fail rate", "fpa failure rate"
+    ],
+    "fpa_fail_drivers": [
+        "fpa fail drivers", "drivers of fpa fails", "root causes of fpa fails"
     ],
     "rca1_portfolio_process": [
-        "rca1 by portfolio",
-        "reasons heatmap",
-        "complaint reasons by portfolio",
-        "rca analysis portfolio process",
+        "rca1 by portfolio for process", "rca by portfolio process", "rca portfolio process"
     ],
-    # FPA
-    "fpa_fail_drivers": [
-        "fpa fail drivers",
-        "drivers of case fails",
-        "first pass accuracy fail drivers",
-        "fpa drivers",
-        "why are cases failing",
-    ],
-    # legacy/alias – you can still ask for 'fpa fail rate', we route to drivers module
-    "fpa_fail_rate": [
-        "fpa fail rate",
-        "fpa failure rate",
-        "case fail rate",
-        "first pass accuracy rate",
+    "mom_overview": [
+        "overview", "summary", "show me an overview", "mom overview"
     ],
 }
 
-# Small set of allowed slugs for quick validation
-ALLOWED_SLUGS = set(LEXICON.keys())
+TITLES = {
+    "complaints_per_thousand": "Complaints per 1,000 cases",
+    "complaint_volume_rate": "Complaint volume (MoM)",
+    "unique_cases_mom": "Unique cases (MoM)",
+    "corr_nps": "Complaints vs NPS — correlation",
+    "fpa_fail_rate": "FPA — Fail rate",
+    "fpa_fail_drivers": "FPA — Fail drivers",
+    "rca1_portfolio_process": "RCA1 by Portfolio × Process",
+    "mom_overview": "MoM Overview",
+}
 
 
-def _best_slug(query: str) -> str:
-    # Build a flat choices list “<slug>::<surface>”
-    choices = []
-    for slug, phrases in LEXICON.items():
-        for p in phrases:
-            choices.append(f"{slug}::{p}")
+def _extract_filters(text: str) -> Dict[str, Any]:
+    args: Dict[str, Any] = {}
+    m = re.search(r"\bportfolio\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)", text, re.IGNORECASE)
+    if m: args["portfolio"] = m.group(1).strip()
 
-    best = process.extractOne(
-        query,
-        choices,
-        scorer=fuzz.token_set_ratio,
-        score_cutoff=55  # forgiving
-    )
-    if not best:
-        # default to a sensible general metric
-        return "complaints_per_thousand"
+    m = re.search(r"\bprocess\s+([A-Za-z ]+?)(?:\s+for|\s+in|\s+last|\s+from|\s+to|$)", text, re.IGNORECASE)
+    if m: args["process_name"] = m.group(1).strip()
 
-    slug = best[0].split("::", 1)[0]
-    return slug
-
-
-# light-month parsing (optional hooks your question modules may use)
-MONTH_RX = re.compile(r"\b(20\d{2}[-/ ]?(?:0?[1-9]|1[0-2])|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", re.I)
-
-
-def _extract_args(query: str) -> Dict[str, Any]:
-    """
-    Keep this intentionally light. We just identify portfolio / process hints
-    and pass them along. Each question module can decide whether to use them.
-    """
-    args: Dict[str, Any] = {"query": query}
-
-    # portfolio hint
-    m = re.search(r"\bportfolio\s+([A-Za-z][\w\- ]+)", query, flags=re.I)
+    m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{4})\s+to\s+([A-Za-z]{3,9})\s+(\d{4})", text, re.IGNORECASE)
     if m:
-        args["portfolio"] = m.group(1).strip()
+        args["start_month"] = f"{m.group(1)} {m.group(2)}"
+        args["end_month"]   = f"{m.group(3)} {m.group(4)}"
 
-    # process hint
-    m2 = re.search(r"\bprocess\s+([A-Za-z][\w\- ]+)", query, flags=re.I)
-    if m2:
-        args["process"] = m2.group(1).strip()
-
-    # month hints (we just surface raw tokens to the module)
-    months = MONTH_RX.findall(query)
-    if months:
-        args["months"] = months
+    m = re.search(r"\blast\s+(\d+)\s+months?\b", text, re.IGNORECASE)
+    if m: args["last_n_months"] = int(m.group(1))
 
     return args
 
 
-def _title_for(slug: str, query: str) -> str:
-    titles = {
-        "complaints_per_thousand": "Complaints per 1,000 cases",
-        "complaint_volume_rate": "Complaints volume (MoM)",
-        "corr_nps": "Complaints ↔ NPS correlation",
-        "unique_cases_mom": "Unique cases (MoM)",
-        "mom_overview": "Month-on-Month Overview",
-        "rca1_portfolio_process": "RCA-1 by Portfolio × Process",
-        "fpa_fail_drivers": "FPA — Fail drivers",
-        "fpa_fail_rate": "FPA — Fail rate",  # legacy (will be aliased)
-    }
-    return titles.get(slug, query)
+def route_intent(user_text: str) -> Tuple[str, Dict[str, Any], str]:
+    if not user_text or not user_text.strip():
+        return "mom_overview", {}, TITLES.get("mom_overview", "Overview")
 
+    candidates = []
+    for slug, phrases in LEXICON.items():
+        best = process.extractOne(user_text, phrases, scorer=fuzz.WRatio)
+        if best:
+            candidates.append((slug, best[1]))
+    candidates.sort(key=lambda x: x[1], reverse=True)
 
-def route_intent(query: str) -> Tuple[str, Dict[str, Any], str]:
-    """
-    Main entry. Returns (slug, args, title).
-    We also normalize legacy slugs to their canonical implementations.
-    """
-    slug = _best_slug(query)
-
-    # legacy normalization: treat fpa_fail_rate as drivers question
-    if slug == "fpa_fail_rate":
-        slug = "fpa_fail_drivers"
-
-    args = _extract_args(query)
-    title = _title_for(slug, query)
+    slug = candidates[0][0] if candidates else "mom_overview"
+    title = TITLES.get(slug, slug.replace("_", " ").title())
+    args = _extract_filters(user_text)
     return slug, args, title
