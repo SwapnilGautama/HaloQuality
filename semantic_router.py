@@ -1,17 +1,15 @@
 # semantic_router.py
 from __future__ import annotations
-import re
+import re, importlib, sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 import streamlit as st
 
-# --- fuzzy (with safe fallback) ---
+# ---- fuzzy matching (rapidfuzz -> difflib fallback) ----
 try:
     from rapidfuzz import process as rf_process
-    _RF = True
-except Exception:  # fallback to difflib
+except Exception:
     from difflib import SequenceMatcher
-    _RF = False
     class _Shim:
         @staticmethod
         def extractOne(q: str, choices: List[str]):
@@ -20,9 +18,9 @@ except Exception:  # fallback to difflib
                 s = SequenceMatcher(None, q.lower(), c.lower()).ratio()
                 if s > score: best, score = c, s
             return (best, int(score*100), None)
-    rf_process = _Shim()  # type: ignore
+    rf_process = _Shim()
 
-# ---------------- date parsing ----------------
+# -------------- date parsing --------------
 MONTH_ABBR = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
 MONTH_RX = re.compile(
     r"(?P<m1>(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*)\s*['’]?(?P<y1>\d{2,4})"
@@ -40,13 +38,15 @@ def _mm_yyyy(abbr: str, year: str) -> str:
 def parse_months(text: str) -> Tuple[Optional[Tuple[str,str]], Optional[int]]:
     m = MONTH_RX.search(text)
     if m:
-        y1, y2 = m.group("y1"), (m.group("y2") or m.group("y1"))
-        return ((_mm_yyyy(m.group("m1"), y1), _mm_yyyy(m.group("m2") or m.group("m1"), y2)), None)
+        y1 = m.group("y1")
+        y2 = m.group("y2") or y1
+        return ((_mm_yyyy(m.group("m1"), y1),
+                 _mm_yyyy(m.group("m2") or m.group("m1"), y2)), None)
     m2 = LAST_N_RX.search(text)
     if m2: return (None, int(m2.group("n")))
     return (None, None)
 
-# --------------- model ----------------
+# --------------- model types ---------------
 @dataclass
 class Parsed:
     qid: str
@@ -63,7 +63,7 @@ class QuestionSpec:
     handler: str               # module path to function run(store, params)
     examples: List[str]
 
-# ------------- registry: YOUR filenames -------------
+# -------- registry (maps qid -> module handler) --------
 CATALOG: List[QuestionSpec] = [
     QuestionSpec(
         qid="complaints_per_thousand",
@@ -140,7 +140,7 @@ CATALOG: List[QuestionSpec] = [
     ),
 ]
 
-# ----------------- helpers -----------------
+# --- choices for fuzzy picking of process/portfolio from prompt
 def _choices_from_store(store) -> Tuple[List[str], List[str]]:
     ports, procs = [], []
     try:
@@ -159,15 +159,17 @@ def _choices_from_store(store) -> Tuple[List[str], List[str]]:
 def _fuzzy(q: str, choices: List[str], threshold=70) -> Optional[str]:
     if not choices: return None
     match, score, _ = rf_process.extractOne(q, choices)
-    return match if score >= threshold else None
+    return match if (score or 0) >= threshold else None
 
 def _pick_qid(prompt: str) -> str:
+    # 1) try exemplars
     phrases, labels = [], []
     for s in CATALOG:
         for ex in s.examples:
             phrases.append(ex); labels.append(s.qid)
     match, score, _ = rf_process.extractOne(prompt, phrases)
     if match: return labels[phrases.index(match)]
+    # 2) simple keywords fallback
     p = prompt.lower()
     if "rca" in p or "reason" in p: return "rca1_portfolio_process"
     if "first pass" in p or "fpa" in p:
@@ -198,21 +200,43 @@ def parse_prompt(prompt: str, store) -> Parsed:
     low = f" {prompt.lower()} "
     by_dim = None
     for token, key in [
-        (" by team ", "team"), (" by manager ", "manager"), (" by location ", "location"),
-        (" by process ", "process"), (" by portfolio ", "portfolio"), (" by scheme ", "scheme"),
+        (" by team ", "team"),
+        (" by manager ", "manager"),
+        (" by location ", "location"),
+        (" by process ", "process"),
+        (" by portfolio ", "portfolio"),
+        (" by scheme ", "scheme"),
     ]:
         if token in low: by_dim = key; break
 
     return Parsed(qid=qid, portfolio=portfolio, process=process,
                   month_range=mr, last_n=lastn, by_dim=by_dim)
 
+# --- robust dynamic importer (with alias fallback)
+_ALIAS = {
+    # allow legacy intent names to keep working
+    "questions.fpa_fail_rate.run":        "questions.fpa_fail_rate.run",
+    "questions.fpa_fail_drivers.run":     "questions.fpa_fail_drivers.run",
+    "questions.complaints_per_thousand.run": "questions.complaints_per_thousand.run",
+    # add more aliases here if you rename files in /questions
+}
+
 def _import_handler(path: str):
-    mod, func = path.rsplit(".", 1)
-    m = __import__(mod, fromlist=[func])
-    return getattr(m, func)
+    importlib.invalidate_caches()
+    # honor alias map first
+    target = _ALIAS.get(path, path)
+    mod_path, func_name = target.rsplit(".", 1)
+    try:
+        mod = importlib.import_module(mod_path)
+        return getattr(mod, func_name)
+    except ModuleNotFoundError as e:
+        # helpful error that prints sys.path for debugging in Streamlit logs
+        raise ModuleNotFoundError(
+            f"Cannot import '{mod_path}'. sys.path={sys.path}"
+        ) from e
 
 def route(prompt: str, store: Dict):
     parsed = parse_prompt(prompt, store)
     spec = next(s for s in CATALOG if s.qid == parsed.qid)
     handler = _import_handler(spec.handler)
-    handler(store, parsed)  # handler is expected to render with Streamlit
+    handler(store, parsed)
