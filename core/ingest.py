@@ -1,203 +1,200 @@
+# ingestion/loader.py
 from __future__ import annotations
-import re, glob
+import re
 from pathlib import Path
+from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data"
-CASES_DIR = DATA_DIR / "cases"
-PROC_DIR = DATA_DIR / "processed"
-PROC_DIR.mkdir(parents=True, exist_ok=True)
+# ---------- Column alias map (source header -> canonical) ----------
+# Add/extend here instead of touching code elsewhere.
+CASE_ALIASES: Dict[str, str] = {
+    # identity
+    "Case ID": "Case_ID",
+    "Case_ID": "Case_ID",
+    "Report_Date": "Report_Date",
+    "Create Date": "Create_Date",
+    "Create_Date": "Create_Date",
 
-def _to_month_str(v):
-    if pd.isna(v): return None
-    d = pd.to_datetime(v, errors="coerce", dayfirst=True)
-    if pd.isna(d): return None
-    return d.to_period("M").strftime("%Y-%m")
+    # dimensions
+    "Event Type": "EventType",
+    "Portfolio": "Portfolio_std",
+    "Location": "Location_std",
+    "ClientName": "ClientName",
+    "Client Name": "ClientName",
+    "Scheme": "Scheme",
+    "Team Name": "TeamName",
+    "TeamName": "TeamName",
+    "Process Name": "ProcessName",
+    "Process_Name": "ProcessName",
+    "Process Group": "ProcessGroup",
+    "Current Outsourcing Team": "OutsourcingTeam",
+    "Onshore/Offshore": "Shore",
+    "Manual/RPA": "Automation",
+    "Critical": "Critical",
+    "Pend Case": "PendCase",
+    "Within SLA": "WithinSLA",
+    "Consented/Non consented": "Consented",
+    "Mercer Consented": "MercerConsented",
+    "Vulnerable Customer": "VulnerableCustomer",
 
-def _pick_first(df: pd.DataFrame, preferred: list[str], contains_any: list[str] | None = None):
-    # exact
-    for c in preferred:
-        if c in df.columns: return c
-    # case-insensitive exact
-    low_map = {c.lower(): c for c in df.columns}
-    for c in preferred:
-        if c.lower() in low_map: return low_map[c.lower()]
-    # substring
-    if contains_any:
-        for c in df.columns:
-            cl = c.lower()
-            if any(sub in cl for sub in contains_any): return c
-    return None
+    # numerics
+    "No. of Days": "NumDays",
+    "Number of Days": "NumDays",
+}
 
-def _std_portfolio(s):
-    if pd.isna(s): return s
-    t = str(s).strip().lower()
-    t = t.replace("leatherhead - baes", "baes leatherhead")
-    t = t.replace("baes-leatherhead", "baes leatherhead")
-    t = t.replace("north west", "northwest")
-    return t.title()
+# Friendly labels for dims (used by NL parser)
+DIM_CANONICAL = {
+    "event type": "EventType",
+    "event": "EventType",
+    "portfolio": "Portfolio_std",
+    "location": "Location_std",
+    "client": "ClientName",
+    "clientname": "ClientName",
+    "scheme": "Scheme",
+    "team": "TeamName",
+    "teamname": "TeamName",
+    "process": "ProcessName",
+    "process name": "ProcessName",
+    "process group": "ProcessGroup",
+    "outsourcing": "OutsourcingTeam",
+    "outsourcing team": "OutsourcingTeam",
+    "shore": "Shore",
+    "onshore/offshore": "Shore",
+    "automation": "Automation",
+    "manual/rpa": "Automation",
+    "critical": "Critical",
+    "pend": "PendCase",
+    "pend case": "PendCase",
+    "within sla": "WithinSLA",
+    "consented": "Consented",
+    "mercer consented": "MercerConsented",
+    "vulnerable": "VulnerableCustomer",
+    "vulnerable customer": "VulnerableCustomer",
+}
 
-def _load_complaints() -> pd.DataFrame:
-    pats = [
-        str(DATA_DIR / "complaints" / "*.xls*"),
-        str(DATA_DIR / "*.xls*"),  # fallback if someone drops at top-level
-    ]
-    files = []
-    for p in pats: files += glob.glob(p)
-    if not files: return pd.DataFrame()
+YES_NO_MAP = {
+    "y": "Yes", "yes": "Yes", "true": "Yes", "1": "Yes",
+    "n": "No",  "no": "No",  "false": "No", "0": "No",
+}
 
-    frames = []
-    for f in sorted(files):
-        try:
-            df = pd.read_excel(f)
-        except Exception:
-            continue
-        if df.empty: continue
+def _clean_header(h: str) -> str:
+    """Normalize column header for alias lookup: strip, collapse space, preserve case for alias map."""
+    return re.sub(r"\s+", " ", str(h)).strip()
 
-        date_col = _pick_first(
-            df,
-            preferred=[
-                "Date Complaint Received - DD/MM/YY", "Date Complaint Received",
-                "Complaint Received Date", "Received Date", "Date", "Complaint Date"
-            ],
-            contains_any=["date","received"]
-        )
-        if date_col:
-            df["month"] = df[date_col].apply(_to_month_str)
+def _apply_aliases(df: pd.DataFrame, aliases: Dict[str, str]) -> pd.DataFrame:
+    remapped = {}
+    for c in df.columns:
+        key = _clean_header(c)
+        if key in aliases:
+            remapped[c] = aliases[key]
         else:
-            df["month"] = np.nan
+            # fallback: make a safe-ish name (spaces->_, strip)
+            remapped[c] = re.sub(r"\s+", "_", key)
+    return df.rename(columns=remapped)
 
-        port_col = _pick_first(
-            df, preferred=["Portfolio","Portfolio Name"],
-            contains_any=["portfolio","scheme","office","site","location","team"]
-        )
-        if port_col is None:
-            port_col = "Portfolio"
-            df[port_col] = np.nan
+def _to_datetime(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
 
-        # optional reason column if present
-        reason_col = _pick_first(df, preferred=["Reason","Complaint Reason"], contains_any=["reason","category"])
-        if reason_col is None and "reason" not in df.columns:
-            df["Reason"] = np.nan
-        elif reason_col and reason_col != "Reason":
-            df = df.rename(columns={reason_col:"Reason"})
+def _norm_yes_no(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().str.lower().map(YES_NO_MAP).fillna(series)
 
-        df["Portfolio_std"] = df[port_col].apply(_std_portfolio)
-        frames.append(df[["month","Portfolio_std","Reason"]].copy())
+def _strip_text(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip()
 
-    if not frames: return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
-    out = out.dropna(subset=["month"])
-    return out
+def load_cases(cases_dir: str | Path = "data/cases") -> pd.DataFrame:
+    """
+    Load and normalize ALL Excel files from data/cases into a canonical tidy DataFrame.
 
-def _load_cases() -> pd.DataFrame:
-    files = glob.glob(str(CASES_DIR / "*.xls*"))
-    if not files: return pd.DataFrame()
-    frames = []
-    for f in sorted(files):
-        try:
-            d = pd.read_excel(f)
-        except Exception:
+    Canonical columns we return (when available):
+      - Case_ID (string)
+      - Create_Date (datetime64[ns])
+      - Report_Date (datetime64[ns], optional)
+      - month_ym (YYYY-MM string from Create_Date)
+      - month_mmm (MMM YY string from Create_Date)
+      - EventType, Portfolio_std, Location_std, ClientName, Scheme, TeamName
+      - ProcessName, ProcessGroup, OutsourcingTeam
+      - Shore (Onshore/Offshore), Automation (Manual/RPA)
+      - Critical, PendCase, WithinSLA, Consented, MercerConsented, VulnerableCustomer
+      - NumDays (numeric)
+    """
+    cases_dir = Path(cases_dir)
+    if not cases_dir.exists():
+        return pd.DataFrame()
+
+    frames: List[pd.DataFrame] = []
+    for f in sorted(cases_dir.glob("**/*")):
+        if f.suffix.lower() not in (".xlsx", ".xls"):
             continue
-        if "Case ID" not in d.columns: continue
+        try:
+            df = pd.read_excel(f, dtype=None)
+        except Exception:
+            # Some sheets require engine='openpyxl'
+            df = pd.read_excel(f, engine="openpyxl", dtype=None)
+        if df.empty:
+            continue
 
-        mcol = _pick_first(d, preferred=["Report_Date","Month"], contains_any=["date","month"])
-        if mcol:
-            d["month"] = d[mcol].apply(_to_month_str)
-        elif "month" not in d.columns:
-            d["month"] = np.nan
+        df = _apply_aliases(df, CASE_ALIASES)
 
-        port_col = _pick_first(
-            d, preferred=["Portfolio","Portfolio Name"],
-            contains_any=["portfolio","scheme","office","site","location","team"]
-        )
-        if port_col is None:
-            port_col = "Portfolio"
-            d[port_col] = np.nan
+        # Date fields
+        if "Create_Date" in df.columns:
+            df["Create_Date"] = _to_datetime(df["Create_Date"])
+        if "Report_Date" in df.columns:
+            df["Report_Date"] = _to_datetime(df["Report_Date"])
 
-        d["Portfolio_std"] = d[port_col].apply(_std_portfolio)
-        d = d.dropna(subset=["Case ID"])
-        d["Case ID"] = d["Case ID"].astype(str)
-        frames.append(d[["Case ID","month","Portfolio_std"]].copy())
+        # Month keys from Create_Date (denominator grain)
+        if "Create_Date" in df.columns:
+            df["month_ym"] = df["Create_Date"].dt.strftime("%Y-%m")
+            df["month_mmm"] = df["Create_Date"].dt.strftime("%b %y")
 
-    if not frames: return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
-    out = out.dropna(subset=["month"])
-    out = out.drop_duplicates(subset=["month","Case ID"], keep="first")
-    return out
+        # Normalize key categorical text
+        for col in [
+            "EventType", "Portfolio_std", "Location_std", "ClientName", "Scheme", "TeamName",
+            "ProcessName", "ProcessGroup", "OutsourcingTeam", "Shore", "Automation",
+            "PendCase",
+        ]:
+            if col in df.columns:
+                df[col] = _strip_text(df[col])
 
-def _load_survey() -> pd.DataFrame:
-    pats = [
-        str(DATA_DIR / "surveys" / "*.xls*"),
-        str(DATA_DIR / "*.xls*"),
+        # Normalize boolean flags to Yes/No strings
+        for col in ["Critical", "WithinSLA", "Consented", "MercerConsented", "VulnerableCustomer"]:
+            if col in df.columns:
+                df[col] = _norm_yes_no(df[col])
+
+        # Numerics
+        if "NumDays" in df.columns:
+            df["NumDays"] = pd.to_numeric(df["NumDays"], errors="coerce")
+
+        # Ensure Case_ID exists and is string
+        if "Case_ID" in df.columns:
+            df["Case_ID"] = _strip_text(df["Case_ID"].astype(str))
+
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    data = pd.concat(frames, ignore_index=True)
+
+    # Deduplicate (same case may appear in multiple pulls/files).
+    # Keep the earliest Create_Date record per Case_ID.
+    if "Case_ID" in data.columns and "Create_Date" in data.columns:
+        data = data.sort_values(["Case_ID", "Create_Date"], ascending=[True, True])
+        data = data.drop_duplicates(subset=["Case_ID"], keep="first")
+
+    # Final tidy sort
+    if "Create_Date" in data.columns:
+        data = data.sort_values("Create_Date")
+
+    return data
+
+
+def available_case_dims(df: pd.DataFrame) -> List[str]:
+    """Return canonical dimension columns present in df."""
+    dims = [
+        "EventType", "Portfolio_std", "Location_std", "ClientName", "Scheme", "TeamName",
+        "ProcessName", "ProcessGroup", "OutsourcingTeam", "Shore", "Automation",
+        "Critical", "PendCase", "WithinSLA", "Consented", "MercerConsented", "VulnerableCustomer",
     ]
-    files = []
-    for p in pats: files += glob.glob(p)
-    # prefer likely survey files
-    files = [f for f in files if re.search(r"survey|overall raw data|nps", f, re.I)]
-    if not files: return pd.DataFrame()
-
-    frames = []
-    for f in sorted(files):
-        try:
-            df = pd.read_excel(f)
-        except Exception:
-            continue
-        if df.empty: continue
-
-        # month
-        mcol = _pick_first(df, preferred=["month","Month"], contains_any=["month","date"])
-        if mcol:
-            df["month"] = df[mcol].apply(_to_month_str)
-        elif "month" not in df.columns:
-            df["month"] = np.nan
-
-        # portfolio
-        port_col = _pick_first(
-            df, preferred=["Portfolio","Portfolio Name"],
-            contains_any=["portfolio","scheme","office","site","location","team"]
-        )
-        if port_col is None:
-            port_col = "Portfolio"; df[port_col] = np.nan
-        df["Portfolio_std"] = df[port_col].apply(_std_portfolio)
-
-        # NPS direct or derive
-        nps_col = _pick_first(df, preferred=["NPS","Net Promoter Score"], contains_any=["nps"])
-        if nps_col:
-            frames.append(df[["month","Portfolio_std",nps_col]].rename(columns={nps_col:"NPS"}))
-            continue
-
-        low = {c.lower(): c for c in df.columns}
-        prom = next((low[k] for k in low if k in {"promoters","promoters_count"} or ("promoter" in k and "count" in k)), None)
-        detr = next((low[k] for k in low if k in {"detractors","detractors_count"} or ("detractor" in k and "count" in k)), None)
-        pasv = next((low[k] for k in low if k in {"passives","passives_count"} or ("passive" in k and "count" in k)), None)
-        if prom and detr and pasv:
-            x = df[["month","Portfolio_std",prom,detr,pasv]].copy()
-            x["total"] = x[prom] + x[detr] + x[pasv]
-            x = x[x["total"] > 0]
-            x["NPS"] = ((x[prom] - x[detr]) / x["total"]) * 100.0
-            frames.append(x[["month","Portfolio_std","NPS"]])
-
-    if not frames: return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
-    out = out.dropna(subset=["month"])
-    # if multiple sources overlap, keep mean NPS per month/portfolio
-    out = out.groupby(["month","Portfolio_std"], dropna=False)["NPS"].mean().reset_index()
-    return out
-
-def build_processed_datasets() -> dict[str, pd.DataFrame]:
-    comp = _load_complaints()
-    cases = _load_cases()
-    surv  = _load_survey()
-
-    if not comp.empty:
-        comp.to_parquet(PROC_DIR / "complaints.parquet", index=False)
-    if not cases.empty:
-        cases.to_parquet(PROC_DIR / "cases.parquet", index=False)
-    if not surv.empty:
-        surv.to_parquet(PROC_DIR / "survey.parquet", index=False)
-
-    return {"complaints": comp, "cases": cases, "survey": surv}
-
+    return [c for c in dims if c in df.columns]
