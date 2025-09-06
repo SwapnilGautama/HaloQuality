@@ -1,120 +1,162 @@
 # data_store.py
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
+
 import pandas as pd
 import streamlit as st
 
-DATA_DIR = Path("data")
 
-def _first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in cols:
-            return cols[cand.lower()]
+DATA_DIRS = [
+    Path.cwd() / "data",
+    Path.cwd() / "core" / "data",
+]
+
+
+# ---------- utilities ----------
+def _first_existing(paths: Iterable[Path]) -> Optional[Path]:
+    for p in paths:
+        if p.exists():
+            return p
     return None
 
-def _norm_str(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.strip().str.lower()
 
-def _as_month_start(dt: pd.Series) -> pd.Series:
-    return pd.to_datetime(dt, errors="coerce").dt.to_period("M").dt.to_timestamp()
+def _read_any(f: Path) -> pd.DataFrame:
+    if f.suffix.lower() in [".parquet"]:
+        return pd.read_parquet(f)
+    if f.suffix.lower() in [".csv"]:
+        return pd.read_csv(f)
+    # excel
+    return pd.read_excel(f)
 
-def _read_any_excel_or_parquet(path: Path) -> pd.DataFrame:
-    if not path.exists():
+
+def _load_folder(sub: str) -> pd.DataFrame:
+    base = _first_existing([d / sub for d in DATA_DIRS])
+    if not base or not base.exists():
         return pd.DataFrame()
-    if path.suffix.lower() in {".parquet", ".pq"}:
-        return pd.read_parquet(path)
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path)
-    return pd.read_excel(path)
-
-def _concat_dir(dir_path: Path) -> pd.DataFrame:
-    if not dir_path.exists():
-        return pd.DataFrame()
-    parts = []
-    for p in dir_path.glob("*"):
-        if p.suffix.lower() in (".xlsx", ".xls", ".parquet", ".pq", ".csv"):
+    out = []
+    for f in sorted(base.glob("**/*")):
+        if f.is_file() and f.suffix.lower() in [".xlsx", ".xls", ".csv", ".parquet"]:
             try:
-                parts.append(_read_any_excel_or_parquet(p))
+                out.append(_read_any(f))
             except Exception:
+                # ignore bad files
                 pass
-    if parts:
-        return pd.concat(parts, ignore_index=True)
-    return pd.DataFrame()
+    if not out:
+        return pd.DataFrame()
+    df = pd.concat(out, ignore_index=True) if len(out) > 1 else out[0]
+    return df
 
-@st.cache_data(show_spinner=False)
-def load_store(assume_year_for_complaints: int = 2025, **_cache_busters) -> dict:
-    """
-    Loads and standardizes data from data/cases, data/complaints, data/fpa.
-    - Cases date: Create Date -> 'case_date' + '_month_dt'
-    - Complaints date: 'Date Complaint Received - DD/MM/YY' -> 'complaint_date' + '_month_dt'
-      Fallback: if a 'Month' column is present, assume provided year (default=2025).
-    """
-    cases_raw = _concat_dir(DATA_DIR / "cases")
-    complaints_raw = _concat_dir(DATA_DIR / "complaints")
-    fpa_raw = _concat_dir(DATA_DIR / "fpa")
 
-    # ---------- CASES ----------
-    if not cases_raw.empty:
-        id_col   = _first_col(cases_raw, ["Case ID", "CaseID", "Id", "ID"])
-        port_col = _first_col(cases_raw, ["Portfolio"])
-        proc_col = _first_col(cases_raw, ["Process", "Process Name"])
-        date_col = _first_col(cases_raw, ["Create Date", "Created Date", "Case Created", "Start Date"])
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    # strip whitespace in string columns
+    for c in df.columns:
+        if pd.api.types.is_string_dtype(df[c]):
+            df[c] = df[c].astype(str).str.strip()
+    return df
 
-        cases = cases_raw.rename(columns={
-            id_col: "id",
-            port_col: "portfolio",
-            proc_col: "process",
-            date_col: "case_date",
-        })
 
-        if "portfolio" in cases:
-            cases["portfolio"] = _norm_str(cases["portfolio"])
-        if "process" in cases:
-            cases["process"] = cases["process"].astype(str).str.strip()
-        if "case_date" in cases:
-            cases["case_date"] = pd.to_datetime(cases["case_date"], errors="coerce", dayfirst=True)
-            cases["_month_dt"] = _as_month_start(cases["case_date"])
-        else:
-            cases["_month_dt"] = pd.NaT
+def _rename_cases(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = _norm_cols(df)
+    ren = {
+        "case id": "id",
+        "unique identifier": "id",
+        "unique identi": "id",
+        "process name": "process",
+        "process": "process",
+        "portfolio": "portfolio",
+        "create date": "date",
+        "report_date": "date",
+        "report date": "date",
+        "created date": "date",
+    }
+    df = df.rename(columns={k: v for k, v in ren.items() if k in df.columns})
+    # portfolio normalize
+    if "portfolio" in df.columns:
+        df["portfolio"] = df["portfolio"].astype(str).str.strip().str.title()
+    # parse date
+    if "date" not in df.columns:
+        # try to find something that looks like date
+        for c in df.columns:
+            if "date" in c:
+                df = df.rename(columns={c: "date"})
+                break
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        df["_month"] = df["date"].dt.to_period("M")
     else:
-        cases = pd.DataFrame(columns=["id", "portfolio", "process", "case_date", "_month_dt"])
+        df["_month"] = pd.NaT
+    return df
 
-    # ---------- COMPLAINTS ----------
-    if not complaints_raw.empty:
-        port_c  = _first_col(complaints_raw, ["Portfolio"])
-        proc_c  = _first_col(complaints_raw, ["Parent Case Type", "Process", "Process Name"])
-        recv_c  = _first_col(complaints_raw, ["Date Complaint Received - DD/MM/YY", "Complaint Received Date", "Date Received"])
-        month_c = _first_col(complaints_raw, ["Month"])
 
-        complaints = complaints_raw.rename(columns={
-            port_c: "portfolio",
-            proc_c: "process",
-            recv_c: "complaint_date",
-            month_c: "month_text",
-        })
+def _rename_complaints(df: pd.DataFrame, assume_year_for_complaints: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = _norm_cols(df)
+    ren = {
+        "original process affected case id": "case_id",
+        "parent case type": "process",
+        "portfolio": "portfolio",
+        "date complaint received - dd/mm/yy": "date",
+        "date complaint received": "date",
+        "month": "month_text",
+    }
+    df = df.rename(columns={k: v for k, v in ren.items() if k in df.columns})
 
-        if "portfolio" in complaints:
-            complaints["portfolio"] = _norm_str(complaints["portfolio"])
-        if "process" in complaints:
-            complaints["process"] = complaints["process"].astype(str).str.strip()
+    if "portfolio" in df.columns:
+        df["portfolio"] = df["portfolio"].astype(str).str.strip().str.title()
 
-        if "complaint_date" in complaints and complaints["complaint_date"].notna().any():
-            complaints["complaint_date"] = pd.to_datetime(
-                complaints["complaint_date"], errors="coerce", dayfirst=True
+    # Date: if explicit date column -> parse; else if month_text, assume given year
+    if "date" in df.columns and df["date"].notna().any():
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        df["_month"] = df["date"].dt.to_period("M")
+    else:
+        # Expect month_text like 'June' or 'Jun'
+        if "month_text" in df.columns:
+            # normalize text to 'Mon' abbreviations
+            m = (
+                df["month_text"]
+                .astype(str)
+                .str.strip()
+                .str.capitalize()
+                .str.slice(0, 3)
             )
-            complaints["_month_dt"] = _as_month_start(complaints["complaint_date"])
+            # build date = first of that month in assumed year
+            df["_month"] = pd.to_datetime(
+                m + f" {assume_year_for_complaints}", format="%b %Y", errors="coerce"
+            ).dt.to_period("M")
+            df["date"] = df["_month"].dt.to_timestamp()
         else:
-            # Fallback to Month text (e.g., "June")
-            if "month_text" in complaints:
-                m = complaints["month_text"].astype(str).str.strip()
-                complaints["_month_dt"] = pd.to_datetime(
-                    f"{assume_year_for_complaints}-" + m + "-01", errors="coerce"
-                ).dt.to_period("M").dt.to_timestamp()
-            else:
-                complaints["_month_dt"] = pd.NaT
-    else:
-        complaints = pd.DataFrame(columns=["portfolio", "process", "complaint_date", "_month_dt"])
+            df["_month"] = pd.NaT
+            df["date"] = pd.NaT
 
-    return {"cases": cases, "complaints": complaints, "fpa": fpa_raw}
+    # if process missing, keep but don't fail later
+    return df
+
+
+# ---------- public loader ----------
+@st.cache_data(show_spinner="Reading Excel / parquet sources", ttl=3600)
+def load_store(assume_year_for_complaints: int = 2025) -> Dict[str, Any]:
+    cases = _load_folder("cases")
+    complaints = _load_folder("complaints")
+    fpa = _load_folder("fpa")
+
+    cases = _rename_cases(cases)
+    complaints = _rename_complaints(complaints, assume_year_for_complaints)
+
+    # expose simple counts
+    store: Dict[str, Any] = {
+        "cases": cases,
+        "complaints": complaints,
+        "fpa": fpa,
+        "cases_rows": len(cases),
+        "complaints_rows": len(complaints),
+        "fpa_rows": len(fpa),
+    }
+    return store
