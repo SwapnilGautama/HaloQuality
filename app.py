@@ -1,281 +1,259 @@
-# app.py
+# app.py — HaloQuality Chat (robust caller)
+# ---------------------------------------------------------
+# Preserves your current UI/flow and adds a resilient
+# question runner that works with all question.run(...)
+# signatures you’ve used (with/without `params`, kwargs only, etc.)
+
 from __future__ import annotations
 
 import importlib
-from dataclasses import asdict
-from typing import Any, Dict, Optional
+import inspect
+from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
-import pandas as pd
 import streamlit as st
 
-# Local modules
+# local packages
 from core.data_store import load_store
 from semantic_router import match_query, IntentMatch
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Streamlit setup
-# ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Halo Quality — Chat", layout="wide", page_icon="🛠️")
-st.markdown(
+# -------------------------------
+# Helpers: importing & safe caller
+# -------------------------------
+
+@st.cache_resource(show_spinner=False)
+def _import_question_module(slug: str):
     """
-    <style>
-      .pill-btn > button { border-radius: 12px !important; }
-      .muted { color: rgba(49,51,63,.6); font-size: 0.9rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    Import a question module from questions/<slug>.py.
+    First try canonical alias if semantic router provided one;
+    otherwise import direct.
+    """
+    # Support either "slug" or "questions.slug"
+    if slug.startswith("questions."):
+        module_name = slug
+    else:
+        module_name = f"questions.{slug}"
+    return importlib.import_module(module_name)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Data loading (cached)
-# ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Loading data store…", ttl=60 * 10)
-def _load_store_cached() -> Dict[str, Any]:
-    # load_store() comes from core/data_store.py (already in your repo)
-    return load_store()
+def _safe_call_run(mod, store, params: Dict[str, Any], user_text: Optional[str]) -> Any:
+    """
+    Call question.run(...) regardless of its signature.
 
+    Supports:
+        run(store, params, user_text=None)
+        run(store, **params)
+        run(store, params)
+        run(store, **params, user_text=...)
+        run(params, store)   (rare, but handle)
+        run(**params)        (when module pulls from global store)
+    We try a small ordered set of strategies until one works.
+    """
+    # Make sure params is always a dict
+    params = params or {}
 
-store = _load_store_cached()
+    # Build candidate call patterns (ordered)
+    candidates = []
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _month_from_any(s: pd.Series) -> Optional[pd.Series]:
-    """Coerce to datetime and return month start; None if cannot."""
-    if s is None:
-        return None
+    sig = None
     try:
-        return pd.to_datetime(s, errors="coerce").dt.to_period("M").dt.to_timestamp()
+        sig = inspect.signature(mod.run)  # type: ignore[attr-defined]
     except Exception:
-        return None
+        # If we can't introspect, just try broad patterns
+        pass
 
+    # Most common first
+    candidates.append(lambda: mod.run(store, params, user_text))               # run(store, params, user_text)
+    candidates.append(lambda: mod.run(store, params))                           # run(store, params)
+    candidates.append(lambda: mod.run(store=store, params=params, user_text=user_text))
+    candidates.append(lambda: mod.run(store=store, params=params))
+    candidates.append(lambda: mod.run(store, **params))                         # run(store, **params)
+    candidates.append(lambda: mod.run(store=store, **params))
+    candidates.append(lambda: mod.run(**params, store=store))
+    candidates.append(lambda: mod.run(**params))                                # run(**params)
 
-def _first_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
-    if df is None:
-        return None
-    lower = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower:
-            return lower[cand.lower()]
-        for lc, orig in lower.items():
-            if cand.lower() in lc:
-                return orig
+    # If the function exposes 'user_text' but not 'params', prioritize kwargs path
+    if sig is not None:
+        ps = sig.parameters
+        has_store = "store" in ps
+        has_params = "params" in ps
+        has_user_text = "user_text" in ps
+
+        ordered = []
+        if has_store and has_params and has_user_text:
+            ordered = [
+                lambda: mod.run(store, params, user_text),
+                lambda: mod.run(store=store, params=params, user_text=user_text),
+            ]
+        elif has_store and has_params:
+            ordered = [
+                lambda: mod.run(store, params),
+                lambda: mod.run(store=store, params=params),
+            ]
+            if has_user_text:
+                ordered.insert(0, lambda: mod.run(store, params, user_text))
+        elif has_store and not has_params:
+            # Try kwargs shapes with/without user_text
+            if has_user_text:
+                ordered = [
+                    lambda: mod.run(store, **params, user_text=user_text),
+                    lambda: mod.run(store=store, **params, user_text=user_text),
+                ]
+            ordered += [
+                lambda: mod.run(store, **params),
+                lambda: mod.run(store=store, **params),
+            ]
+        else:
+            # No explicit 'store' in signature
+            if has_user_text:
+                ordered = [
+                    lambda: mod.run(**params, user_text=user_text),
+                ]
+            ordered += [
+                lambda: mod.run(**params),
+            ]
+
+        # Put our introspection-based attempts first
+        candidates = ordered + candidates
+
+    last_err = None
+    for attempt in candidates:
+        try:
+            return attempt()
+        except TypeError as e:
+            # Signature mismatch; try next pattern
+            last_err = e
+        except Exception:
+            # Let question modules surface their own errors (rendered in UI)
+            raise
+
+    # If nothing matched, re-raise the most recent signature error
+    if last_err:
+        raise last_err
+
+    # Fallback (should never reach)
     return None
 
 
-def _latest_month_label(df: Optional[pd.DataFrame], date_candidates: list[str]) -> Optional[str]:
-    if df is None or df.empty:
-        return None
-    month_col = None
-    if "month_dt" in df.columns:
-        month_col = "month_dt"
-    else:
-        col = _first_col(df, date_candidates)
-        if col:
-            df = df.copy()
-            df["__m"] = _month_from_any(df[col])
-            month_col = "__m"
-    if not month_col:
-        return None
-    m = df[month_col].max()
-    if pd.isna(m):
-        return None
-    return pd.Timestamp(m).strftime("%b %y")
+def _run_question(match: IntentMatch, store, user_text: Optional[str]):
+    """
+    Given a semantic match, import and run the corresponding question module.
+    """
+    slug = match.slug
+    params = match.params or {}
 
-
-def _count_rows(df: Optional[pd.DataFrame]) -> Optional[int]:
-    if df is None:
-        return None
     try:
-        return int(len(df))
-    except Exception:
-        return None
+        mod = _import_question_module(slug)
+    except ModuleNotFoundError as e:
+        st.error(f"Sorry—couldn't load question module '{slug}'.")
+        st.exception(e)
+        return
+
+    # A little UX: show parsed filters for transparency
+    with st.expander("Parsed filters", expanded=False):
+        if not params:
+            st.write("None")
+        else:
+            # pretty print the normalized params
+            nice = {k: (str(v) if v is not None else v) for k, v in params.items()}
+            st.write(nice)
+
+    # And run it, letting the module render into the page
+    try:
+        _safe_call_run(mod, store, params, user_text)
+    except Exception as e:
+        st.error("This question failed (signature mismatch or runtime error).")
+        st.exception(e)
 
 
-def _run_question(slug: str, params: Dict[str, Any], store: Dict[str, Any], user_text: str) -> Any:
-    """
-    Import questions.<slug> and call its run().
+# -------------------------------
+# Page UI
+# -------------------------------
 
-    IMPORTANT: We pass BOTH names (params & args) so legacy modules that
-    expect `args` keep working alongside newer modules that expect `params`.
-    """
-    mod = importlib.import_module(f"questions.{slug}")
-    safe_kwargs = {
-        "params": params or {},
-        "args": params or {},
-        "user_text": user_text or "",
-    }
-    return mod.run(store, **safe_kwargs)
+def _data_status(store) -> None:
+    # Left rail: quick data stats
+    st.sidebar.subheader("Data status")
+    st.sidebar.write(f"Cases rows: **{store['cases_rows']:,}**")
+    st.sidebar.write(f"Complaints rows: **{store['complaints_rows']:,}**")
+    st.sidebar.write(f"FPA rows: **{store['fpa_rows']:,}**")
 
+    latest_cases = store.get("latest_cases_month_label", "—")
+    latest_complaints = store.get("latest_complaints_month_label", "—")
+    latest_fpa = store.get("latest_fpa_month_label", "—")
 
-def _chip(label: str, key: str) -> bool:
-    # Small helper for pill-like buttons
-    with st.container():
-        return st.button(label, key=key, use_container_width=True)
-
-
-def _pretty_filters(p: Dict[str, Any]) -> Dict[str, Any]:
-    """Format filters for the 'Parsed filters' expander."""
-    pretty = {}
-    if not p:
-        return pretty
-    for k, v in p.items():
-        if v is None:
-            continue
-        if "month" in k and isinstance(v, (str, pd.Timestamp)):
-            try:
-                ts = pd.to_datetime(v, errors="coerce")
-                if not pd.isna(ts):
-                    pretty[k] = ts.strftime("%Y-%m-%d")
-                    continue
-            except Exception:
-                pass
-        pretty[k] = v
-    return pretty
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Sidebar — Data status
-# ──────────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.subheader("Data status")
-    cases = store.get("cases")
-    complaints = store.get("complaints")
-    fpa = store.get("fpa")
-
-    # Counts
-    st.write(
-        f"**Cases rows:** {_count_rows(cases) if _count_rows(cases) is not None else '—'}"
+    st.sidebar.markdown(
+        f"Latest Month — Cases: **{latest_cases}** | "
+        f"Complaints: **{latest_complaints}** | "
+        f"FPA: **{latest_fpa}**"
     )
-    st.write(
-        f"**Complaints rows:** {_count_rows(complaints) if _count_rows(complaints) is not None else '—'}"
-    )
-    st.write(f"**FPA rows:** {_count_rows(fpa) if _count_rows(fpa) is not None else '—'}")
 
-    # Latest months
-    cases_latest = _latest_month_label(
-        cases, ["Create Date", "Created Date", "Report Date", "Report_Date"]
-    )
-    comp_latest = _latest_month_label(
-        complaints,
-        [
-            "Date Complaint Received - DD/MM/YY",
-            "Date Complaint Received",
-            "Complaint Date",
-            "Created Date",
-        ],
-    )
-    fpa_latest = _latest_month_label(fpa, ["Activity Date", "Date", "Completed Date"])
-
-    left_bits = []
-    if cases_latest:
-        left_bits.append(f"Cases: {cases_latest}")
-    if comp_latest:
-        left_bits.append(f"Complaints: {comp_latest}")
-    if fpa_latest:
-        left_bits.append(f"FPA: {fpa_latest}")
-    if left_bits:
-        st.write(
-            f"<span class='muted'>Latest Month — "
-            + " | ".join(left_bits)
-            + "</span>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("---")
-    st.caption("Tip: Ask things like:")
-    st.markdown(
-        """
-        - complaints per **1000** by process for **portfolio London** **Jun 2025** to **Aug 2025**  
-        - show **rca1** by portfolio for process **Member Enquiry** **last 3 months**  
-        - **unique cases** by process and portfolio **Apr 2025** to **Jun 2025**
-        """
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Tip: Ask things like:")
+    st.sidebar.markdown(
+        "- complaints **per 1000** by process for **portfolio London Jun 2025 to Aug 2025**\n"
+        "- show **rca1** by portfolio for process **Member Enquiry** last **3 months**\n"
+        "- **unique cases** by process and portfolio **Apr 2025 to Jun 2025**"
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Header
-# ──────────────────────────────────────────────────────────────────────────────
-st.title("Halo Quality — Chat")
-st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
+def _suggestion_chips():
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"):
+            st.session_state["free_text"] = "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"
+    with cols[1]:
+        if st.button("show rca1 by portfolio for process Member Enquiry last 3 months"):
+            st.session_state["free_text"] = "show rca1 by portfolio for process Member Enquiry last 3 months"
+    with cols[2]:
+        if st.button("unique cases by process and portfolio Apr 2025 to Jun 2025"):
+            st.session_state["free_text"] = "unique cases by process and portfolio Apr 2025 to Jun 2025"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Quick-ask chips (your three canonical examples)
-# ──────────────────────────────────────────────────────────────────────────────
-col1, col2, col3 = st.columns(3)
-with col1:
-    if _chip(
-        "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025",
-        key="pill_q1",
-    ):
-        st.session_state["free_text"] = "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"
-        st.rerun()
-with col2:
-    if _chip(
-        "show rca1 by portfolio for process Member Enquiry last 3 months",
-        key="pill_q2",
-    ):
-        st.session_state["free_text"] = "show rca1 by portfolio for process Member Enquiry last 3 months"
-        st.rerun()
-with col3:
-    if _chip(
-        "unique cases by process and portfolio Apr 2025 to Jun 2025",
-        key="pill_q3",
-    ):
-        st.session_state["free_text"] = "unique cases by process and portfolio Apr 2025 to Jun 2025"
-        st.rerun()
+def main():
+    st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
+    st.title("Halo Quality — Chat")
+    st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
+
+    # Load data store
+    try:
+        store = load_store()
+    except Exception as e:
+        st.error("Failed to load data store.")
+        st.exception(e)
+        return
+
+    # Sidebar status
+    _data_status(store)
+
+    # Suggestion buttons
+    _suggestion_chips()
+
+    # Free text input
+    free_text = st.session_state.get("free_text", "")
+    free_text = st.text_input(
+        "Type your question (e.g., 'complaints per 1000 by process last 3 months')",
+        value=free_text,
+        key="free_text",
+        placeholder="e.g., complaints per 1000 by process last 3 months",
+    ).strip()
+
+    if not free_text:
+        st.stop()
+
+    # Route the query
+    match = match_query(free_text)
+
+    if match is None:
+        st.error("Sorry—couldn't understand that question.")
+        st.info("Try something like: 'complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025'.")
+        st.stop()
+
+    # Section title mirrors the matched intent title
+    st.header(match.title or "Results")
+
+    # Run matched question
+    _run_question(match, store, user_text=free_text)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Free-text query box
-# ──────────────────────────────────────────────────────────────────────────────
-ft = st.text_input(
-    "Type your question (e.g., 'complaints per 1000 by process last 3 months')",
-    key="free_text",
-    placeholder="complaints per 1000 by process last 3 months",
-)
-
-query = (ft or "").strip()
-
-# Nothing asked yet – stop here.
-if not query:
-    st.stop()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Route the query → question module
-# ──────────────────────────────────────────────────────────────────────────────
-match: Optional[IntentMatch] = match_query(query)
-if not match:
-    st.error("Sorry—couldn't understand that question.")
-    st.stop()
-
-# Title block
-st.subheader(match.title or "Question")
-params = dict(match.args or {})
-
-# Parsed filters expander
-with st.expander("Parsed filters", expanded=False):
-    pretty = _pretty_filters(params)
-    if pretty:
-        st.write(" | ".join(f"**{k}**: {v}" for k, v in pretty.items()))
-    else:
-        st.caption("No explicit filters were parsed.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Execute the question module
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    _run_question(match.slug, params, store, user_text=query)
-except TypeError as te:
-    # Common developer-time errors: unexpected kw, missing positional arg etc.
-    st.error("This question failed (signature mismatch).")
-    st.exception(te)
-except Exception as ex:
-    st.error("This question failed.")
-    st.exception(ex)
+if __name__ == "__main__":
+    main()
