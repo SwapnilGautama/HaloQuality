@@ -1,66 +1,62 @@
 # semantic_router.py
+from __future__ import annotations
 from dataclasses import dataclass
 import re
-import pandas as pd
 
 @dataclass
 class IntentMatch:
     slug: str
     params: dict
 
-def _parse_month(s: str):
-    # supports "Jun 2025", "Aug 25"
-    try:
-        return pd.to_datetime(s, errors="raise").to_period("M").to_timestamp()
-    except Exception:
-        # try adding "01" for dayfirst safety
-        try:
-            return pd.to_datetime(f"01 {s}", dayfirst=True).to_period("M").to_timestamp()
-        except Exception:
-            return None
+def _month_token(s: str) -> str | None:
+    m = re.search(r"(20\d{2}[-/](0?[1-9]|1[0-2]))", s)
+    return m.group(1) if m else None
 
-def match_query(q: str) -> IntentMatch:
-    ql = (q or "").strip().lower()
+def match_query(q: str) -> IntentMatch | None:
+    ql = q.strip().lower()
 
-    # button-friendly fallbacks
-    if ql.startswith("complaints per 1000"):
-        # try to pull portfolio and month range
-        # e.g., "complaints per 1000 by process for portfolio london jun 2025 to aug 2025"
-        m = re.search(r"portfolio\s+([a-z\s\-]+)\s+([a-z]{3}\s?\d{2,4})\s+to\s+([a-z]{3}\s?\d{2,4})", ql)
-        params = {}
-        if m:
-            params["portfolio"] = m.group(1).strip()
-            params["start_month"] = _parse_month(m.group(2))
-            params["end_month"]   = _parse_month(m.group(3))
-            if params["start_month"] is not None:
-                params["start_month"] = str(params["start_month"].date())
-            if params["end_month"] is not None:
-                params["end_month"] = str(params["end_month"].date())
-        return IntentMatch(slug="complaints_per_thousand", params=params)
+    # Complaints per 1000
+    if "complaints per 1000" in ql or "complaints per thousand" in ql:
+        portfolio = None
+        m = re.search(r"portfolio\s+([a-z &]+)", ql)
+        if m: portfolio = m.group(1).strip().title()
+        # month range e.g., 'jun 2025 to aug 2025' OR '2025-06 to 2025-08'
+        sm = _month_token(ql)
+        em = None
+        if " to " in ql:
+            tail = ql.split(" to ", 1)[1]
+            em = _month_token(tail) or em
+        return IntentMatch(
+            slug="complaints_per_thousand",
+            params={"portfolio": portfolio, "start_month": sm, "end_month": em},
+        )
 
-    if ql.startswith("show rca1"):
-        # e.g., show rca1 by portfolio for process member enquiry last 3 months
-        m = re.search(r"process\s+([a-z\s\-]+)", ql)
-        params = {}
-        if m:
-            params["process"] = m.group(1).strip()
-        return IntentMatch(slug="rca1_portfolio_process", params=params)
+    # Unique cases MoM
+    if "unique cases" in ql and ("mom" in ql or "month" in ql):
+        portfolio = None
+        m = re.search(r"portfolio\s+([a-z &]+)", ql)
+        if m: portfolio = m.group(1).strip().title()
+        sm = _month_token(ql)
+        em = None
+        if " to " in ql:
+            tail = ql.split(" to ", 1)[1]
+            em = _month_token(tail) or em
+        return IntentMatch(
+            slug="unique_cases_mom",
+            params={"portfolio": portfolio, "start_month": sm, "end_month": em},
+        )
 
-    if ql.startswith("unique cases"):
-        # e.g., unique cases by process and portfolio apr 2025 to jun 2025
-        m = re.search(r"([a-z]{3}\s?\d{2,4})\s+to\s+([a-z]{3}\s?\d{2,4})", ql)
-        params = {}
-        if m:
-            params["start_month"] = _parse_month(m.group(1))
-            params["end_month"]   = _parse_month(m.group(2))
-            if params["start_month"] is not None:
-                params["start_month"] = str(params["start_month"].date())
-            if params["end_month"] is not None:
-                params["end_month"] = str(params["end_month"].date())
-        return IntentMatch(slug="unique_cases_mom", params=params)
+    # RCA1 by portfolio for a process (last N months)
+    if "show rca1" in ql or ("rca1" in ql and "portfolio" in ql):
+        months = 3
+        m = re.search(r"last\s+(\d+)\s*month", ql)
+        if m: months = int(m.group(1))
+        portfolio = None
+        m = re.search(r"portfolio\s+([a-z &]+)", ql)
+        if m: portfolio = m.group(1).strip().title()
+        return IntentMatch(
+            slug="rca1_portfolio_process",
+            params={"portfolio": portfolio, "months": months},
+        )
 
-    if "dashboard" in ql and "complaint" in ql:
-        return IntentMatch(slug="complaints_per_thousand", params={})
-
-    # default: try complaints per 1000
-    return IntentMatch(slug="complaints_per_thousand", params={})
+    return None
