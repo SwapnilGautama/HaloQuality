@@ -1,199 +1,160 @@
-# semantic_router.py — tiny semantic matcher for Halo questions
+# semantic_router.py
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Any, Optional
 
+import pandas as pd
 from rapidfuzz import process, fuzz
 
+# ----- intents & surfaces -----------------------------------------------------
 
-@dataclass
-class IntentMatch:
-    slug: str                 # questions.<slug>
-    title: str                # display title
-    params: Dict[str, object] # parameters passed to the question
-
-
-# ------------------------
-# Canonical slugs -> surface forms we match against
-# ------------------------
 LEXICON: Dict[str, List[str]] = {
-    # Q1: complaints / cases
+    # complaints per 1,000 cases
     "complaints_per_thousand": [
         "complaints per 1000",
         "complaints per thousand",
-        "per 1000 complaints",
+        "complaints/1000",
         "complaint rate per 1000",
-        "complaints per 1k",
-        "complaints per 1000 by process",
-        "complaints per 1000 by portfolio",
+        "per 1000 complaints",
+        "complaint rate",
+        "complaint index",
     ],
-
-    # Q2: rca1 by portfolio × process
+    # rca1 by portfolio x process
     "rca1_portfolio_process": [
-        "rca1 by portfolio",
-        "show rca1",
-        "root cause rca1",
-        "show rca1 by process",
+        "show rca1 by portfolio for process",
         "rca1 by portfolio by process",
+        "rca by portfolio process",
+        "drivers by portfolio and process",
+        "top drivers by portfolio and process",
     ],
-
-    # Q3: unique cases MoM
+    # unique cases by month
     "unique_cases_mom": [
-        "unique cases",
+        "unique cases by process and portfolio",
         "unique cases month on month",
-        "unique cases by process",
-        "unique cases by portfolio",
         "unique cases mom",
+        "cases unique per month",
+        "distinct cases per month",
     ],
 }
 
+TITLES = {
+    "complaints_per_thousand": "Complaints per 1,000 cases",
+    "rca1_portfolio_process": "RCA1 by Portfolio × Process — last 3 months",
+    "unique_cases_mom": "Unique cases (MoM)",
+}
 
-# ------------------------
-# Light parsers
-# ------------------------
-_MONTH_RE = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})"
+# ----- small data structure ---------------------------------------------------
 
+@dataclass
+class IntentMatch:
+    slug: str
+    title: str
+    args: Dict[str, Any]
 
-def _parse_month(s: str) -> Optional[datetime]:
-    m = re.search(_MONTH_RE, s, flags=re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%b %Y")
-    except Exception:
-        return None
+# ----- argument parsing helpers ----------------------------------------------
 
+_MONTH_RX = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+20\d{2}"
+RANGE_RX = re.compile(
+    rf"(?P<s>{_MONTH_RX})\s*(to|-|→)\s*(?P<e>{_MONTH_RX})",
+    re.IGNORECASE,
+)
 
-def _parse_month_range(q: str) -> Tuple[Optional[datetime], Optional[datetime]]:
-    # "... Jun 2025 to Aug 2025"
-    m = re.search(f"{_MONTH_RE}\\s+to\\s+{_MONTH_RE}", q, flags=re.IGNORECASE)
-    if not m:
-        return None, None
-    try:
-        s = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%b %Y")
-        e = datetime.strptime(f"{m.group(3)} {m.group(4)}", "%b %Y")
+def _find_months(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (start_month, end_month) as 'YYYY-MM' strings if found, else (None, None).
+    Supports 'Apr 2025 to Jun 2025' or a single month 'Aug 2025'.
+    """
+    m = RANGE_RX.search(text)
+    if m:
+        s = pd.to_datetime(m.group("s")).strftime("%Y-%m")
+        e = pd.to_datetime(m.group("e")).strftime("%Y-%m")
         return s, e
-    except Exception:
-        return None, None
 
+    single = re.search(_MONTH_RX, text, re.IGNORECASE)
+    if single:
+        s = pd.to_datetime(single.group(0)).strftime("%Y-%m")
+        return s, s
 
-def _parse_relative_months(q: str) -> Optional[int]:
-    # "last 3 months" / "last three months"
-    m = re.search(r"last\s+(\d+)\s+months?", q, flags=re.IGNORECASE)
+    return None, None
+
+def _find_relative_months(text: str) -> Optional[int]:
+    m = re.search(r"last\s+(\d{1,2})\s+months?", text, re.IGNORECASE)
     if m:
-        try:
-            n = int(m.group(1))
-            return max(1, min(24, n))
-        except Exception:
-            pass
-    words = {
-        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-        "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    }
-    m2 = re.search(r"last\s+(one|two|three|four|five|six|seven|eight|nine|ten)\s+months?", q, flags=re.IGNORECASE)
-    if m2:
-        return words.get(m2.group(1).lower(), None)
+        return int(m.group(1))
     return None
 
-
-def _parse_portfolio(q: str) -> Optional[str]:
-    # naïve grab after keyword 'portfolio'
-    m = re.search(r"portfolio\s+([A-Za-z0-9 &/-]+)", q, flags=re.IGNORECASE)
+def _find_portfolio(text: str) -> Optional[str]:
+    # examples: "for portfolio London", "portfolio: Member Services"
+    m = re.search(r"(?:for\s+)?portfolio[:\s]+([A-Za-z0-9 &/_-]{2,})", text, re.IGNORECASE)
     if m:
-        return m.group(1).strip().rstrip(".")
+        return m.group(1).strip()
     return None
 
-
-def _parse_process(q: str) -> Optional[str]:
-    # For now, we only really need "Member Enquiry". Add more if needed.
-    known = [
-        "Member Enquiry",
-        "Member Enquiries",
-        "Member Enquiry ",
-    ]
-    for k in known:
-        if re.search(re.escape(k), q, flags=re.IGNORECASE):
-            return "Member Enquiry"
-    # Fallback generic capture
-    m = re.search(r"process\s+([A-Za-z0-9 &/-]+)", q, flags=re.IGNORECASE)
+def _find_process(text: str) -> Optional[str]:
+    # examples: "for process Member Enquiry", "process: Billing"
+    m = re.search(r"(?:for\s+)?process[:\s]+([A-Za-z0-9 &/_-]{2,})", text, re.IGNORECASE)
     if m:
-        return m.group(1).strip().rstrip(".")
+        return m.group(1).strip()
     return None
 
-
-def _best_slug(q: str) -> Optional[str]:
-    # Flatten LEXICON into (surface, slug)
-    surfaces = []
-    owners = []
-    for slug, forms in LEXICON.items():
-        for f in forms:
-            surfaces.append(f)
-            owners.append(slug)
-
-    choice = process.extractOne(q, surfaces, scorer=fuzz.WRatio, score_cutoff=60)
-    if not choice:
-        return None
-    idx = surfaces.index(choice[0])
-    return owners[idx]
-
-
-# ------------------------
-# Public API
-# ------------------------
-def match_query(q: str) -> Optional[IntentMatch]:
+def _parse_args(slug: str, text: str) -> Dict[str, Any]:
     """
-    Returns an IntentMatch(slug, title, params) or None if no intent found.
-    - We standardize params to keep question.run(store, params, user_text) simple.
+    Extract a clean argument dict for the question `slug`.
+    Only keys that questions commonly support are returned.
     """
-    q = (q or "").strip()
-    if not q:
-        return None
+    args: Dict[str, Any] = {}
 
-    slug = _best_slug(q)
-    if not slug:
-        return None
-
-    params: Dict[str, object] = {}
-
-    # Common captures
-    start, end = _parse_month_range(q)
-    if start:
-        params["start_month"] = start.strftime("%Y-%m")
-    if end:
-        params["end_month"] = end.strftime("%Y-%m")
-
-    portfolio = _parse_portfolio(q)
-    if portfolio:
-        params["portfolio"] = portfolio
-
-    # Intent-specific tweaks
-    if slug == "complaints_per_thousand":
-        title = "Complaints per 1,000 cases"
-        # Accept a location like 'London' after 'portfolio' when users type
-        # 'for portfolio London ...'
-        loc_match = re.search(r"\bfor\s+portfolio\s+([A-Za-z0-9 /&-]+)", q, flags=re.IGNORECASE)
-        if loc_match:
-            params["portfolio"] = loc_match.group(1).strip()
-        # If nothing specified, leave params as-is; the question will show a picker.
-
-    elif slug == "rca1_portfolio_process":
-        title = "RCA1 by Portfolio × Process — last 3 months"
-        process_name = _parse_process(q)
-        if process_name:
-            params["process"] = process_name
-        rel = _parse_relative_months(q)
-        if rel:
-            params["relative_months"] = rel
-        # If explicit start/end months exist, the question can use them instead of relative.
-
-    elif slug == "unique_cases_mom":
-        title = "Unique cases (MoM)"
-        # If user asked a range, we already captured start/end above.
-        # Otherwise, leave empty and let the question surface controls.
+    # time windows
+    start, end = _find_months(text)
+    rel = _find_relative_months(text)
+    if start and end:
+        args["start_month"] = start
+        args["end_month"] = end
+    elif rel is not None:
+        args["relative_months"] = rel
     else:
+        # good default for RCA and unique-cases is last 3 months
+        if slug in {"rca1_portfolio_process"}:
+            args["relative_months"] = 3
+
+    # entities
+    port = _find_portfolio(text)
+    proc = _find_process(text)
+    if port:
+        args["portfolio"] = port
+    if proc:
+        args["process"] = proc
+
+    return args
+
+# ----- main matcher -----------------------------------------------------------
+
+def match_query(text: str, *, cutoff: int = 70) -> Optional[IntentMatch]:
+    """
+    Return best (slug, args, title) for a query or None if nothing is good enough.
+    """
+    text_norm = " ".join(text.lower().split())
+
+    # score every surface form of every intent
+    candidates: List[Tuple[str, str, int]] = []
+    for slug, surfaces in LEXICON.items():
+        # RapidFuzz top score among surfaces for this intent
+        choice = process.extractOne(text_norm, surfaces, scorer=fuzz.token_set_ratio)
+        if choice:
+            score = choice[1]
+            candidates.append((slug, choice[0], score))
+
+    if not candidates:
         return None
 
-    return IntentMatch(slug=slug, title=title, params=params)
+    # pick highest-scoring intent if it clears the cutoff
+    slug, _, score = max(candidates, key=lambda x: x[2])
+    if score < cutoff:
+        return None
+
+    args = _parse_args(slug, text_norm)
+    title = TITLES.get(slug, slug.replace("_", " ").title())
+
+    return IntentMatch(slug=slug, title=title, args=args)
