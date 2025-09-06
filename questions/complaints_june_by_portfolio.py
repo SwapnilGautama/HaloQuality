@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # questions/complaints_june_by_portfolio.py
 from __future__ import annotations
 
@@ -70,11 +69,11 @@ DETAILS = {
     "Aptia standard Timescale": [r"\bstandard timescale\b", r"\btimescale\b", r"\bSLA\b"],
     "Delay Pension set up": [r"\bpension set up\b", r"\bsetup\b"],
     "Delay Postal Delay": [r"\bpostal\b", r"\bpost\b", r"\bmail\b"],
-    "Delay – AVC": [r"\bAVC\b"],
+    "Delay - AVC": [r"\bAVC\b"],
     "Delay Requirement not checked": [r"\brequirement not checked\b", r"\bnot checked\b"],
     "Delay Case not created": [r"\bcase not created\b"],
     "Delay 2nd Review": [r"\b2(nd)? review\b", r"\bsecond review\b"],
-    "Delay – Trustee": [r"\btrustee\b"],
+    "Delay - Trustee": [r"\btrustee\b"],
     "Scheme Rules": [r"\bscheme rules?\b"],
     "Drop in value/ factor change": [r"\bfactor change\b", r"\bdrop in value\b"],
     "Death benefits payout": [r"\bdeath benefit(s)?\b"],
@@ -84,8 +83,9 @@ DETAILS = {
 }
 
 def _has_any(text: str, pats: list[str]) -> bool:
+    s = "" if pd.isna(text) else str(text)
     for p in pats:
-        if re.search(p, str(text), flags=re.I):
+        if re.search(p, s, flags=re.I):
             return True
     return False
 
@@ -132,13 +132,11 @@ def _summarize_reasons(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 # -------------------------
 def run(store, params: Dict, user_text: str):
     """
-    Complaint analysis (one question):
+    Complaint analysis (single question):
       - June 2025 portfolio table (cases, complaints, per_1000)
-      - MoM complaints-per-1000 line (past 13 months, fill missing with 0)
-      - June 2025 reasons deep-dive from "Brief Description - RCA done by admin"
+      - MoM complaints-per-1000 line (past 13 months, missing months filled with 0)
+      - June 2025 reasons deep-dive from 'Brief Description - RCA done by admin'
     """
-    # import matplotlib inside run to avoid import-time failures
-    import matplotlib.pyplot as plt
 
     # 1) get data + month keys
     cases = store.cases.copy()
@@ -200,16 +198,21 @@ def run(store, params: Dict, user_text: str):
         trend = pd.DataFrame({"month": idx, "cases": c_m.values, "complaints": q_m.values})
         trend["per_1000"] = (trend["complaints"] / trend["cases"].replace(0, np.nan) * 1000).fillna(0).round(2)
 
-        fig, ax = plt.subplots(figsize=(8.5, 3.6))
-        ax.plot(trend["month"], trend["per_1000"], marker="o", linewidth=2.5)
-        ax.grid(True, alpha=0.25)
-        ax.set_ylabel("per 1,000")
-        ax.set_xlabel("Month")
-        step = max(1, len(trend) // 12)
-        ax.set_xticks(range(0, len(trend), step))
-        for s in ["top", "right"]:
-            ax.spines[s].set_visible(False)
-        st.pyplot(fig, use_container_width=True)
+        # Try Altair (soft colors, smooth line); fallback to st.line_chart if Altair not available
+        try:
+            import altair as alt
+            chart = (
+                alt.Chart(trend)
+                .mark_line(interpolate="monotone", point=True, strokeWidth=3)
+                .encode(
+                    x=alt.X("month:N", title="Month"),
+                    y=alt.Y("per_1000:Q", title="per 1,000"),
+                    color=alt.value("#7BAFD4")  # soft pastel-ish blue
+                )
+            )
+            st.altair_chart(chart, use_container_width=True)
+        except Exception:
+            st.line_chart(trend.set_index("month")["per_1000"])
 
         st.dataframe(trend, use_container_width=True)
     else:
