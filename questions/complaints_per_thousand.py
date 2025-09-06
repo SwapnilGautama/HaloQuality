@@ -1,183 +1,134 @@
 # questions/complaints_per_thousand.py
 from __future__ import annotations
-import re
 import pandas as pd
 
 TITLE = "Complaints per 1,000 cases"
 
-# --------------------------
-# Small internal helpers
-# --------------------------
-def _norm(name: str) -> str:
-    return re.sub(r'[^a-z0-9]+', '', str(name).strip().lower())
+# --- FIXED column names you confirmed ---
+CASE_ID_COL               = "Case ID"
+CASE_PORTFOLIO_COL        = "Portfolio"
+CASE_PROCESS_COLS         = ["Process", "Process Name"]        # support either
+CASE_DATE_COL             = "Create Date"
 
-def _pick_col(df: pd.DataFrame, candidates=None, regex: str | None = None) -> str | None:
-    """
-    Pick a column from df using case/space-insensitive matching.
-    - candidates: list of names to try (leniently matched)
-    - regex: optional regex fallback
-    """
-    if candidates is None:
-        candidates = []
-    norm_map = {_norm(c): c for c in df.columns}
-    # try provided candidates first
-    for c in candidates:
-        key = _norm(c)
-        if key in norm_map:
-            return norm_map[key]
-    # fallback to regex
-    if regex:
-        pat = re.compile(regex, re.I)
-        for c in df.columns:
-            if pat.search(str(c)):
-                return c
+COMP_ID_COL               = "Original Process Affected Case ID"
+COMP_PROCESS_COL          = "Parent Case Type"
+COMP_DATE_COL             = "Date Complaint Received - DD/MM/YY"
+
+def _get_col(df: pd.DataFrame, names: list[str]) -> str | None:
+    for n in names:
+        if n in df.columns:
+            return n
     return None
 
-def _ensure_datetime(series: pd.Series) -> pd.Series:
-    # dayfirst=True handles DD/MM/YY formats (e.g., complaints date)
-    return pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
-
-def _portfolio_selector(series: pd.Series, wanted: str) -> pd.Series:
-    s = series.fillna("").astype(str)
-    w = (wanted or "").strip()
-    # Exact match first
-    exact = s.str.casefold().eq(w.casefold())
-    if w and exact.any():
-        return exact
-    # Then a word-boundary "contains"
-    return s.str.contains(rf"\b{re.escape(w)}\b", case=False, na=False) if w else pd.Series([True]*len(s), index=s.index)
-
-def _month_bounds(start_month: str | None, end_month: str | None):
-    """
-    Build inclusive month window [start, end].
-    Params can be 'YYYY-MM' or a date string; we normalize to month start/end.
-    Defaults to the last 3 months if not provided.
-    """
-    if start_month and end_month:
-        start = pd.to_datetime(start_month, errors="coerce")
-        end = pd.to_datetime(end_month, errors="coerce")
-    else:
+def _month_bounds(params: dict) -> tuple[pd.Timestamp, pd.Timestamp]:
+    if params.get("start_month") and params.get("end_month"):
+        start = pd.to_datetime(params["start_month"])
+        end   = pd.to_datetime(params["end_month"]) + pd.offsets.MonthEnd(0)
+    elif params.get("relative_months"):
+        # e.g., last 3 months
         end = pd.Timestamp.today().normalize() + pd.offsets.MonthEnd(0)
-        start = (end - pd.offsets.MonthBegin(3)) + pd.offsets.MonthBegin(1)
-
-    start = (start.normalize() if pd.notna(start) else pd.Timestamp.today()).replace(day=1)
-    end = (end.normalize() if pd.notna(end) else pd.Timestamp.today()) + pd.offsets.MonthEnd(0)
+        start = (end - pd.offsets.MonthBegin(int(params["relative_months"])) + pd.offsets.MonthBegin(1)).normalize()
+    else:
+        # default: last 3 months
+        end = pd.Timestamp.today().normalize() + pd.offsets.MonthEnd(0)
+        start = (end - pd.offsets.MonthBegin(3) + pd.offsets.MonthBegin(1)).normalize()
+    # ensure month starts
+    start = start.replace(day=1)
     return start, end
 
-# --------------------------
-# Main entry point
-# --------------------------
+def _portfolio_mask(series: pd.Series, portfolio_val: str | None) -> pd.Series:
+    if not portfolio_val:
+        return pd.Series(True, index=series.index)
+    s = series.fillna("").astype(str)
+    # exact match if possible, fallback to contains
+    exact = s.str.casefold().eq(portfolio_val.casefold())
+    return exact if exact.any() else s.str.contains(portfolio_val, case=False, na=False)
+
+def _safe_to_datetime(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
+
 def run(store, params=None, user_text: str | None = None):
-    """
-    Inputs expected in store:
-      store["cases"]       : DF with (Case ID, Portfolio, Process/Process Name, and a date column like 'Create Date' or 'Report Date')
-      store["complaints"]  : DF with ('Original Process Affected Case ID' -> Case ID link,
-                                      'Parent Case Type' (process),
-                                      'Date Complaint Received - DD/MM/YY' (date))
-
-    Params (parsed already by app/semantic router):
-      - portfolio (e.g., "London")
-      - start_month, end_month (optional; inclusive window)
-    """
     params = params or {}
-    portfolio_val = (params.get("portfolio") or params.get("site") or "").strip()
 
-    # Month window
-    start, end = _month_bounds(params.get("start_month"), params.get("end_month"))
+    # --- pull dataframes
+    cases = store["cases"].copy()
+    complaints = store["complaints"].copy()
 
-    # --- Load dataframes
-    cases: pd.DataFrame = store["cases"]
-    complaints: pd.DataFrame = store["complaints"]
+    # --- resolve columns (hard-wired to your fields)
+    case_id = CASE_ID_COL if CASE_ID_COL in cases.columns else _get_col(cases, [CASE_ID_COL])
+    case_pf = CASE_PORTFOLIO_COL
+    case_proc = _get_col(cases, CASE_PROCESS_COLS)
+    case_dt = CASE_DATE_COL
 
-    # --- Column selection: CASES
-    case_id_col   = _pick_col(cases, ["Case ID", "CaseID", "Case_Id", "Original Case ID"], regex=r"\bcase\b.*\bid\b")
-    portfolio_col = _pick_col(cases, ["Portfolio"])
-    case_proc_col = _pick_col(cases, ["Process", "Process Name"], regex=r"\bprocess\b")
-    case_date_col = _pick_col(
-        cases,
-        ["Create Date", "Report Date", "Start Date", "Report_Date"],
-        regex=r"(create|report|start)[ _-]*date",
-    )
-
-    if not case_id_col or not portfolio_col or not case_proc_col or not case_date_col:
+    if not (case_id and case_pf and case_proc and case_dt):
         return (
             TITLE,
             pd.DataFrame(),
-            f"Missing columns in cases. Found: id={case_id_col}, portfolio={portfolio_col}, process={case_proc_col}, date={case_date_col}",
+            f"Missing columns in cases. Need: '{CASE_ID_COL}', '{CASE_PORTFOLIO_COL}', "
+            f"'{CASE_PROCESS_COLS[0]}' or '{CASE_PROCESS_COLS[1]}', '{CASE_DATE_COL}'. "
+            f"Found: {list(cases.columns)}"
         )
 
-    c = cases.copy()
-    c[case_date_col] = _ensure_datetime(c[case_date_col])
-    c["month"] = c[case_date_col].dt.to_period("M").dt.to_timestamp()
+    comp_id = COMP_ID_COL
+    comp_proc = COMP_PROCESS_COL
+    comp_dt = COMP_DATE_COL
 
-    mask = (c[case_date_col] >= start) & (c[case_date_col] <= end)
-    if portfolio_val:
-        mask &= _portfolio_selector(c[portfolio_col], portfolio_val)
+    if not all(c in complaints.columns for c in [comp_id, comp_proc, comp_dt]):
+        return (
+            TITLE,
+            pd.DataFrame(),
+            f"Missing columns in complaints. Need: '{COMP_ID_COL}', '{COMP_PROCESS_COL}', '{COMP_DATE_COL}'. "
+            f"Found: {list(complaints.columns)}"
+        )
 
-    cases_f = c.loc[mask, [case_id_col, portfolio_col, case_proc_col, "month"]].dropna(subset=["month"])
+    # --- date coercion
+    cases[case_dt] = _safe_to_datetime(cases[case_dt])
+    complaints[comp_dt] = _safe_to_datetime(complaints[comp_dt])
 
+    # --- month bounds
+    start, end = _month_bounds(params)
+
+    # --- filter cases by month + (optional) portfolio
+    cases["month"] = cases[case_dt].dt.to_period("M").dt.to_timestamp()
+    mask = (cases[case_dt] >= start) & (cases[case_dt] <= end)
+    pf_val = (params.get("portfolio") or "").strip()
+    if pf_val:
+        mask &= _portfolio_mask(cases[case_pf], pf_val)
+
+    cases_f = cases.loc[mask, [case_id, case_pf, case_proc, "month"]].dropna(subset=["month"])
     if cases_f.empty:
-        return (
-            TITLE,
-            pd.DataFrame(),
-            f"No cases after applying filters (portfolio='{portfolio_val}' months={start:%b %Y}–{end:%b %Y}).",
-        )
+        note = f"No cases after applying the selected filters/date window."
+        return (TITLE, pd.DataFrame(), note)
 
+    # --- aggregate cases by month × process
     cases_by = (
-        cases_f.groupby(["month", case_proc_col], dropna=False, as_index=False)
-               .size()
-               .rename(columns={"size": "cases", case_proc_col: "process"})
+        cases_f.groupby(["month", case_proc], as_index=False, dropna=False)
+               .size().rename(columns={"size": "cases", case_proc: "process"})
     )
 
-    # --- Column selection: COMPLAINTS
-    comp_id_col = _pick_col(
-        complaints,
-        ["Original Process Affected Case ID", "Original Case ID", "Case ID"],
-        regex=r"(original.*affected.*case.*id)|(original.*case.*id)|(^case.*id$)",
-    )
-    comp_proc_col = _pick_col(complaints, ["Parent Case Type", "Process Name"], regex=r"\b(parent)?\s*case\s*type\b|\bprocess\b")
-    # specifically handle column "Date Complaint Received - DD/MM/YY"
-    comp_date_col = _pick_col(
-        complaints,
-        ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Date Received"],
-        regex=r"(date).*?(complaint).*?(received)|(^date.*received$)",
-    )
+    # --- prepare complaints
+    comp = complaints[[comp_id, comp_proc, comp_dt]].copy()
+    comp["month"] = complaints[comp_dt].dt.to_period("M").dt.to_timestamp()
+    comp = comp.rename(columns={comp_proc: "process", comp_id: case_id})
 
-    if not comp_id_col or not comp_proc_col or not comp_date_col:
-        # Return cases with zero complaints rather than error hard-stop
-        out = cases_by.copy()
-        out["complaints"] = 0
-        out["per_1000"] = 0.0
-        out["_month"] = out["month"].dt.strftime("%b %y")
-        out = out[["_month", "process", "cases", "complaints", "per_1000"]].sort_values(["_month", "process"])
-        return (
-            TITLE,
-            out,
-            f"Missing columns in complaints. Found: id={comp_id_col}, process={comp_proc_col}, date={comp_date_col}",
-        )
+    # join to cases for portfolio and then filter portfolio (so complaints inherit portfolio from cases)
+    comp = comp.merge(cases[[case_id, case_pf]], on=case_id, how="left")
+    if pf_val:
+        comp = comp[_portfolio_mask(comp[case_pf], pf_val)]
+    comp = comp[(comp[comp_dt] >= start) & (comp[comp_dt] <= end)]
 
-    comp = complaints[[comp_id_col, comp_proc_col, comp_date_col]].copy()
-    comp[comp_date_col] = _ensure_datetime(comp[comp_date_col])
-    comp = comp[(comp[comp_date_col] >= start) & (comp[comp_date_col] <= end)]
-    comp = comp.rename(columns={comp_proc_col: "process", comp_id_col: case_id_col})
-    comp["month"] = comp[comp_date_col].dt.to_period("M").dt.to_timestamp()
-
-    # Bring portfolio onto complaints via Case ID, then filter to the requested portfolio
-    comp = comp.merge(cases[[case_id_col, portfolio_col]], on=case_id_col, how="left")
-    if portfolio_val:
-        comp = comp[_portfolio_selector(comp[portfolio_col], portfolio_val)]
-
+    # --- aggregate complaints by month × process
     complaints_by = (
-        comp.groupby(["month", "process"], dropna=False, as_index=False)
-            .size()
-            .rename(columns={"size": "complaints"})
+        comp.groupby(["month", "process"], as_index=False, dropna=False)
+            .size().rename(columns={"size": "complaints"})
     )
 
+    # --- combine + compute per 1000
     out = cases_by.merge(complaints_by, on=["month", "process"], how="left")
     out["complaints"] = out["complaints"].fillna(0).astype(int)
-    out["per_1000"] = (out["complaints"] / out["cases"]).fillna(0) * 1000
-
+    out["per_1000"] = (out["complaints"] / out["cases"]).fillna(0) * 1000.0
     out["_month"] = out["month"].dt.strftime("%b %y")
-    out = out[["_month", "process", "cases", "complaints", "per_1000"]].sort_values(["_month", "process"])
 
+    # final tidy
+    out = out[["_month", "process", "cases", "complaints", "per_1000"]].sort_values(["_month", "process"])
     return TITLE, out, None
