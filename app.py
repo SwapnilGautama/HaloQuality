@@ -1,157 +1,99 @@
 # app.py
-import importlib
-import traceback
-from pathlib import Path
-from typing import Any, Dict, Optional
+from __future__ import annotations
 
-import pandas as pd
+import importlib
+import inspect
+import traceback
+
 import streamlit as st
 
 from core.data_store import load_store
 from semantic_router import match_query, IntentMatch
 
-
-# ---------- Page & cache ----------
-
 st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
 
-@st.cache_data(show_spinner=False)
+# --- data store ------------------------------------------------------------
+@st.cache_data(show_spinner=True, ttl=60 * 15)
 def _load_store_cached():
     return load_store()
 
-store = _load_store_cached()
+try:
+    store = _load_store_cached()
+    left = st.sidebar
+    cases_rows = len(store["cases"]) if "cases" in store else 0
+    comp_rows = len(store["complaints"]) if "complaints" in store else 0
+    fpa_rows = len(store["fpa"]) if "fpa" in store else 0
+    left.markdown("### Data status")
+    left.markdown(f"**Cases rows:** {cases_rows:,}")
+    left.markdown(f"**Complaints rows:** {comp_rows:,}")
+    left.markdown(f"**FPA rows:** {fpa_rows:,}")
+except Exception as e:
+    st.error("Failed to load data store.")
+    st.exception(e)
+    st.stop()
 
-# ---------- Small helpers ----------
-
-def _import_question(slug: str):
-    """Import questions.<slug> (module must be under questions/ and end with .py)."""
-    try:
-        return importlib.import_module(f"questions.{slug}")
-    except Exception as e:
-        raise ImportError(
-            f"Could not import module 'questions.{slug}'. "
-            f"Make sure questions/{slug}.py exists and has a 'run(store, params, user_text=\"\")' function."
-        ) from e
-
-
-def _run_question(slug: str, params: Dict[str, Any], user_text: str):
-    """Run a question module's run(store, params, user_text)."""
-    mod = _import_question(slug)
-    if not hasattr(mod, "run"):
-        raise AttributeError(
-            f"'questions.{slug}' has no function 'run(store, params, user_text=\"\")'."
-        )
-    # Call with a single params dict (uniform contract).
-    return mod.run(store, params, user_text=user_text)
-
-
-def _pill(label: str, value: Any):
-    st.markdown(
-        f"""
-        <div style="display:inline-block;border:1px solid #e5e7eb;border-radius:9999px;padding:4px 10px;margin-right:8px;background:#f8fafc;">
-            <span style="color:#6b7280">{label}</span>
-            <strong style="margin-left:6px">{value}</strong>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ---------- Left status column ----------
-
-with st.sidebar:
-    st.subheader("Data status")
-    try:
-        cases = store["cases"]
-        complaints = store["complaints"]
-        fpa = store["fpa"]
-        _pill("Cases rows", f"{len(cases):,}")
-        _pill("Complaints rows", f"{len(complaints):,}")
-        _pill("FPA rows", f"{len(fpa):,}")
-
-        # Latest months shown with the normalized month column each loader created
-        def _last_month(df: pd.DataFrame, col: str) -> Optional[str]:
-            if col in df.columns and not df.empty:
-                try:
-                    return df[col].max().strftime("%b %y")
-                except Exception:
-                    return None
-            return None
-
-        last_case = _last_month(cases, "month_dt")
-        last_comp = _last_month(complaints, "month_dt")
-        last_fpa = _last_month(fpa, "month_dt")
-
-        if last_case or last_comp or last_fpa:
-            st.caption(
-                "Latest Month — "
-                + " | ".join(
-                    filter(
-                        None,
-                        [
-                            f"Cases: {last_case}" if last_case else None,
-                            f"Complaints: {last_comp}" if last_comp else None,
-                            f"FPA: {last_fpa}" if last_fpa else None,
-                        ],
-                    )
-                )
-            )
-    except Exception as e:
-        st.error("Failed to load data store.")
-        st.exception(e)
-
-# ---------- Header & quick suggestions ----------
-
-st.title("Halo Quality — Chat")
+st.markdown("## Halo Quality — Chat")
 st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    if st.button("complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"):
-        st.session_state["__q"] = "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"
-with col2:
-    if st.button("show rca1 by portfolio for process Member Enquiry last 3 months"):
-        st.session_state["__q"] = "show rca1 by portfolio for process Member Enquiry last 3 months"
-with col3:
-    if st.button("unique cases by process and portfolio Apr 2025 to Jun 2025"):
-        st.session_state["__q"] = "unique cases by process and portfolio Apr 2025 to Jun 2025"
-
-# ---------- Input ----------
-
-q = st.text_input(
-    "Type your question (e.g., 'complaints per 1000 by process last 3 months')",
-    value=st.session_state.pop("__q", "") if "__q" in st.session_state else "",
+# quick examples
+col = st.container()
+col.write(
+    st.text_input(
+        "Type your question (e.g., 'complaints per 1000 by process last 3 months')",
+        key="free_text",
+        label_visibility="collapsed",
+        placeholder="Type your question…",
+    )
 )
 
-# ---------- Run ----------
+chip1, chip2, chip3 = st.columns(3)
+if chip1.button("complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"):
+    st.session_state.free_text = "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"
+if chip2.button("show rca1 by portfolio for process Member Enquiry last 3 months"):
+    st.session_state.free_text = "show rca1 by portfolio for process Member Enquiry last 3 months"
+if chip3.button("unique cases by process and portfolio Apr 2025 to Jun 2025"):
+    st.session_state.free_text = "unique cases by process and portfolio Apr 2025 to Jun 2025"
 
-def _show_exception(e: Exception):
-    st.error(f"Sorry—this question failed: {e}")
-    with st.expander("Traceback"):
-        st.code("".join(traceback.format_exc()))
+query = st.session_state.get("free_text") or ""
 
-if q.strip():
-    # 1) route
-    intent: Optional[IntentMatch] = None
+# --- question runner -------------------------------------------------------
+def _import_question_module(slug: str):
+    """
+    Import questions.<slug>. If import fails for canonical slugs,
+    try a direct import of the provided slug.
+    """
     try:
-        intent = match_query(q)
-    except Exception as e:
-        _show_exception(e)
+        return importlib.import_module(f"questions.{slug}")
+    except Exception:
+        # Surface the inner error in the UI for debugging
+        raise
 
-    if intent is None:
-        st.error("Sorry—couldn't understand that question.")
-    else:
-        # 2) title + params pills
-        st.subheader(intent.title)
-        if intent.params:
-            pills = []
-            for k, v in intent.params.items():
-                if v is None or v == "":
-                    continue
-                _pill(k, v)
+def _run_question(slug: str, args: dict, store, user_text: str):
+    mod = _import_question_module(slug)
+    if not hasattr(mod, "run"):
+        raise RuntimeError(f"Question module questions.{slug} has no run()")
 
-        # 3) execute
+    # filter kwargs to what run() accepts
+    spec = inspect.signature(mod.run)
+    safe = {k: v for k, v in (args or {}).items() if k in spec.parameters}
+    if "store" in spec.parameters:
+        safe["store"] = store
+    if "user_text" in spec.parameters:
+        safe["user_text"] = user_text
+
+    return mod.run(**safe)
+
+# --- handle input ----------------------------------------------------------
+if query.strip():
+    with st.container():
         try:
-            _run_question(intent.slug, intent.params, user_text=q)
-        except Exception as e:
-            _show_exception(e)
+            m: IntentMatch | None = match_query(query)
+            if not m:
+                st.error("Sorry—couldn't understand that question.")
+            else:
+                st.subheader(m.title)
+                _run_question(m.slug, m.args, store, query)
+        except Exception:
+            st.error("Sorry—this question failed.")
+            with st.expander("Traceback"):
+                st.code(traceback.format_exc())
