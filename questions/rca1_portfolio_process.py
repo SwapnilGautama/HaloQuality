@@ -1,49 +1,50 @@
-# rca1_portfolio_process.py
+# questions/rca1_portfolio_process.py
+from __future__ import annotations
 import pandas as pd
-import numpy as np
 
-def _auto_label_from_comment(s: pd.Series) -> pd.Series:
-    s = s.fillna("").str.lower()
-    return np.select(
-        [
-            s.str.contains("manual", na=False),
-            s.str.contains("standard|timescale", na=False),
-            s.str.contains("scheme|rules", na=False),
-            s.str.contains("pension set up|set up", na=False),
-            s.str.contains("requirement not checked|not checked", na=False),
-            s.str.contains("case not created", na=False),
-        ],
-        ["Manual", "Standard Timescale", "Scheme Rules", "Pension set up", "Requirement not checked", "Case not created"],
-        default="Other",
-    )
+def run(store: dict, params: dict, user_text: str | None = None) -> dict:
+    """
+    Show RCA1 (first-level reason) counts by portfolio × process for last N months (default 3).
+    Requires a column 'RCA1' in complaints. If missing, return an informative table.
+    params:
+      - months: int = 3
+      - portfolio: optional
+    """
+    cmps = store.get("complaints", pd.DataFrame()).copy()
+    if cmps.empty:
+        return {"dataframe": pd.DataFrame([{"portfolio":"", "process":"", "rca1":"", "complaints":0}]),
+                "meta": {"title":"RCA1 by Portfolio × Process — last 3 months", "filters": {}}}
 
-def run(store, params=None, user_text=""):
-    comp = store["complaints"].copy()
-    if comp.empty:
-        return pd.DataFrame(columns=["portfolio","process","rca1","complaints"])
+    if "RCA1" not in cmps.columns:
+        msg = pd.DataFrame(
+            [{"portfolio":"", "process":"", "rca1":"",
+              "complaints":"RCA1 labels not found. Add an 'RCA1' column to complaints (e.g., via your labeller)."}]
+        )
+        return {"dataframe": msg, "meta": {"title":"RCA1 by Portfolio × Process — last 3 months", "filters": {}}}
 
-    # ensure RCA labels present
-    if "rca1" not in comp.columns or comp["rca1"].isna().all():
-        comp["rca1"] = _auto_label_from_comment(comp.get("comment"))
-
-    # window: last 3 months from latest complaint
-    last = comp["month_dt"].max()
+    months = int((params or {}).get("months") or 3)
+    cmps["_month_dt"] = pd.to_datetime(cmps["_month_dt"], errors="coerce")
+    last = cmps["_month_dt"].max()
     if pd.isna(last):
-        return pd.DataFrame(columns=["portfolio","process","rca1","complaints"])
-    window_start = (last.to_period("M") - 2).to_timestamp()
-    df = comp[(comp["month_dt"]>=window_start) & (comp["month_dt"]<=last)]
+        return {"dataframe": pd.DataFrame([{"portfolio":"", "process":"", "rca1":"", "complaints":0}]),
+                "meta": {"title":"RCA1 by Portfolio × Process — last 3 months", "filters": {}}}
+    start = (last.to_period("M") - (months-1)).to_timestamp()
 
-    # filters
-    if params:
-        p = params.get("portfolio")
-        if p:
-            df = df[df["portfolio"].eq(str(p).lower().strip())]
-        pr = params.get("process")
-        if pr:
-            df = df[df["process"].eq(str(pr).lower().strip())]
+    portfolio = (params or {}).get("portfolio")
+    if portfolio and portfolio != "All" and "Portfolio" in cmps:
+        cmps = cmps[cmps["Portfolio"].eq(portfolio)]
 
-    out = (df.groupby(["portfolio","process","rca1"])
-             .agg(complaints=("complaint_id","nunique"))
-             .reset_index()
-             .sort_values(["portfolio","process","complaints"], ascending=[True,True,False]))
-    return out
+    cmps = cmps[(cmps["_month_dt"] >= start) & (cmps["_month_dt"] <= last)]
+
+    g = (cmps.groupby(["Portfolio","Process","RCA1"], dropna=False, as_index=False)
+              .agg(complaints=("Case ID", "nunique"))
+              .sort_values(["Portfolio","complaints"], ascending=[True, False]))
+    if g.empty:
+        g = pd.DataFrame([{"portfolio":"", "process":"", "rca1":"", "complaints":0}])
+    else:
+        g = g.rename(columns={"Portfolio":"portfolio", "RCA1":"rca1", "Process":"process"})
+    meta = {
+        "title": f"RCA1 by Portfolio × Process — last {months} months",
+        "filters": {"portfolio": portfolio or "All", "months": months},
+    }
+    return {"dataframe": g[["portfolio","process","rca1","complaints"]], "meta": meta}
