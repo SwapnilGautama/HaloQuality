@@ -1,24 +1,44 @@
-# unique_cases_mom.py
+# questions/unique_cases_mom.py
+from __future__ import annotations
 import pandas as pd
 
-def run(store, params=None, user_text=""):
-    cases = store["cases"].copy()
+def run(store: dict, params: dict, user_text: str | None = None) -> dict:
+    """
+    Show unique case volume month-over-month (optionally by portfolio).
+    params:
+      - start_month, end_month (optional)
+      - portfolio (optional)
+    """
+    cases = store.get("cases", pd.DataFrame()).copy()
     if cases.empty:
-        return pd.DataFrame(columns=["_month","unique_cases"])
+        return {"dataframe": pd.DataFrame([{"_month":"", "unique_cases":0}]),
+                "meta": {"title":"Unique cases (MoM)", "filters": {}}}
 
-    # parse window
-    if params and params.get("start_month") and params.get("end_month"):
-        sm = pd.to_datetime(params["start_month"]).to_period("M").to_timestamp()
-        em = pd.to_datetime(params["end_month"]).to_period("M").to_timestamp()
-    else:
-        last = cases["month_dt"].max()
-        sm = (last.to_period("M")-2).to_timestamp()
-        em = last
+    cases["_month_dt"] = pd.to_datetime(cases["_month_dt"], errors="coerce")
+    cases["Case ID"] = cases["Case ID"].astype("string")
 
-    df = cases[(cases["month_dt"]>=sm) & (cases["month_dt"]<=em)]
-    g = (df.groupby("month_dt")
-           .agg(unique_cases=("case_id","nunique"))
-           .reset_index()
-           .sort_values("month_dt"))
-    g["_month"] = g["month_dt"].dt.strftime("%b %y")
-    return g[["_month","unique_cases"]]
+    portfolio = (params or {}).get("portfolio")
+    start = pd.to_datetime((params or {}).get("start_month"), errors="coerce")
+    end   = pd.to_datetime((params or {}).get("end_month"),   errors="coerce")
+
+    if portfolio and portfolio != "All" and "Portfolio" in cases:
+        cases = cases[cases["Portfolio"].eq(portfolio)]
+
+    if pd.notna(start): cases = cases[cases["_month_dt"] >= start]
+    if pd.notna(end):   cases = cases[cases["_month_dt"] <= end]
+
+    g = (cases.dropna(subset=["_month_dt"])
+              .groupby("_month_dt", as_index=False)
+              .agg(unique_cases=("Case ID", "nunique")))
+    g["_month"] = pd.to_datetime(g["_month_dt"]).dt.strftime("%b %y")
+    g = g.sort_values("_month_dt")[["_month", "unique_cases"]]
+
+    meta = {
+        "title": "Unique cases (MoM)",
+        "filters": {
+            "portfolio": portfolio or "All",
+            "start_month": pd.to_datetime(start).strftime("%Y-%m") if pd.notna(start) else None,
+            "end_month": pd.to_datetime(end).strftime("%Y-%m") if pd.notna(end) else None,
+        },
+    }
+    return {"dataframe": g, "meta": meta}
