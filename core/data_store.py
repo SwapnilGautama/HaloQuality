@@ -2,177 +2,165 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
+from typing import Dict, List
+
 import pandas as pd
+import streamlit as st
 
 
-# Where your folders live in Streamlit Cloud
-DATA_DIR = Path("/mount/src/haloquality/data")  # change if yours is different
+# ---------------------------
+# Column mapping helpers
+# ---------------------------
+def _first_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+        # forgive subtle differences
+        for col in df.columns:
+            if col.strip().lower() == c.strip().lower():
+                return col
+    return None
 
-def _read_any(path: Path, sheet_name=0) -> pd.DataFrame:
-    """Read Excel (first sheet) or Parquet with a tiny PQ cache next to the file."""
-    if path.suffix.lower() in {".parquet", ".pq"}:
-        return pd.read_parquet(path)
-    pq = path.with_suffix(".parquet")
-    if pq.exists() and pq.stat().st_mtime >= path.stat().st_mtime:
-        return pd.read_parquet(pq)
-    df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
-    try:
-        df.to_parquet(pq, index=False)
-    except Exception:
-        pass
-    return df
+def _to_month_start(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M").dt.to_timestamp()
 
 
-def _coerce_month(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+# ---------------------------
+# Normalizers
+# ---------------------------
+def _normalize_cases(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Find the first date-like column in `candidates` that exists in df, coerce to datetime,
-    then return the month start (Timestamp). Never returns object dtype.
+    Expect:
+      - ID: 'Case ID' (or similar)
+      - Portfolio: 'Portfolio'
+      - Process (optional): 'Process' or 'Process Name'
+      - Date (month key): Prefer 'Create Date', fallback 'Report_Date' / 'Report Date'
     """
-    for col in candidates:
-        if col in df.columns:
-            s = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-            if s.notna().any():
-                return s.dt.to_period("M").dt.to_timestamp()
-    # If nothing matched, try any column containing 'date'
-    for col in df.columns:
-        if re.search(r"date", col, re.I):
-            s = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-            if s.notna().any():
-                return s.dt.to_period("M").dt.to_timestamp()
-    # Fallback: all-NaT month series
-    return pd.to_datetime(pd.Series([pd.NaT] * len(df))).dt.to_period("M").dt.to_timestamp()
+    df = df.copy()
 
+    id_col = _first_col(df, ["Case ID", "CaseID", "Unique Identifier", "Unique identifier", "id"])
+    if id_col is None:
+        raise ValueError("Cases: missing Case ID column.")
+    portfolio_col = _first_col(df, ["Portfolio"])
+    if portfolio_col is None:
+        raise ValueError("Cases: missing Portfolio column.")
 
-def _clean_str(s: pd.Series) -> pd.Series:
-    return (
-        s.astype(str)
-        .str.strip()
-        .replace({"nan": None, "NaN": None, "None": None})
+    process_col = _first_col(df, ["Process Name", "Process", "Process  ", "Process_name"])
+    # date preference
+    date_col = _first_col(df, ["Create Date", "Create_Date", "Report_Date", "Report Date"])
+    if date_col is None:
+        raise ValueError("Cases: missing date column (Create Date / Report_Date).")
+
+    out = pd.DataFrame(
+        {
+            "id": df[id_col],
+            "portfolio": df[portfolio_col],
+            "process": df[process_col] if process_col else None,
+            "date": pd.to_datetime(df[date_col], errors="coerce", dayfirst=True),
+        }
     )
+    # if Create Date present but empty and Report_Date exists, swap in
+    if "Create Date" not in df.columns and "Report_Date" in df.columns:
+        pass  # we already used Report_Date
+    else:
+        # if many NaT in date because Create Date empty, try to fallback to report date
+        if out["date"].isna().mean() > 0.5:
+            rd = _first_col(df, ["Report_Date", "Report Date"])
+            if rd:
+                out["date"] = out["date"].fillna(pd.to_datetime(df[rd], errors="coerce", dayfirst=True))
+
+    out["month"] = _to_month_start(out["date"])
+    return out.dropna(subset=["date"]).reset_index(drop=True)
 
 
-def load_cases(dir_path: Path) -> pd.DataFrame:
-    """Load & normalize cases."""
-    files = sorted(list(dir_path.glob("*.xlsx"))) + sorted(list(dir_path.glob("*.parquet")))
-    frames = []
-    for f in files:
-        df = _read_any(f)
-        # Normalize column names (case-insensitive, keep originals if not found)
-        cols = {c.lower(): c for c in df.columns}
-        # IDs
-        case_id = cols.get("case id") or next((c for c in df.columns if re.fullmatch(r"(?i)case\s*id", c)), None)
-        if case_id is None:
+def _normalize_complaints(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expect:
+      - Linked case (optional): 'Original Process Affected Case ID' == Cases 'Case ID'
+      - Portfolio: 'Portfolio'
+      - Process (for display if available): 'Parent Case Type'
+      - Date: 'Date Complaint Received - DD/MM/YY'
+    """
+    df = df.copy()
+
+    portfolio_col = _first_col(df, ["Portfolio"])
+    if portfolio_col is None:
+        raise ValueError("Complaints: missing Portfolio column.")
+
+    process_col = _first_col(df, ["Parent Case Type", "Parent Case type", "ParentCaseType"])
+    link_col = _first_col(df, ["Original Process Affected Case ID", "Original Case ID", "Original CaseId"])
+    date_col = _first_col(df, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Complaint Date"])
+
+    if date_col is None:
+        raise ValueError("Complaints: missing 'Date Complaint Received - DD/MM/YY' column.")
+
+    out = pd.DataFrame(
+        {
+            "portfolio": df[portfolio_col],
+            "process": df[process_col] if process_col else None,
+            "case_link": df[link_col] if link_col else None,
+            "date": pd.to_datetime(df[date_col], errors="coerce", dayfirst=True),
+        }
+    )
+    out["month"] = _to_month_start(out["date"])
+    return out.dropna(subset=["date"]).reset_index(drop=True)
+
+
+def _read_many(paths: List[Path]) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    for p in paths:
+        try:
+            if p.suffix.lower() in [".xlsx", ".xls"]:
+                frames.append(pd.read_excel(p))
+            elif p.suffix.lower() in [".parquet", ".pq"]:
+                frames.append(pd.read_parquet(p))
+        except Exception:
+            # tolerate odd files
             continue
-        df = df.rename(columns={case_id: "Case ID"})
-        # Process & Portfolio
-        proc_col = cols.get("process name") or next((c for c in df.columns if re.search(r"(?i)^process(\s|_)name$", c)), None)
-        if proc_col:
-            df = df.rename(columns={proc_col: "Process"})
-        port_col = cols.get("portfolio") or next((c for c in df.columns if re.fullmatch(r"(?i)portfolio", c)), None)
-        if port_col:
-            df = df.rename(columns={port_col: "Portfolio"})
-        # Month
-        df["_month_dt"] = _coerce_month(
-            df,
-            [
-                "Case Created Date",
-                "Created Date",
-                "Open Date",
-                "Start Date",
-                "Report Date",
-            ],
-        )
-        frames.append(df)
-
     if not frames:
-        return pd.DataFrame(columns=["Case ID", "Process", "Portfolio", "_month_dt"])
-
-    out = pd.concat(frames, ignore_index=True)
-    out["Case ID"] = _clean_str(out["Case ID"])
-    if "Process" in out.columns:
-        out["Process"] = _clean_str(out["Process"])
-    else:
-        out["Process"] = None
-    if "Portfolio" in out.columns:
-        out["Portfolio"] = _clean_str(out["Portfolio"])
-    else:
-        out["Portfolio"] = None
-    # Guarantee datetime dtype
-    out["_month_dt"] = pd.to_datetime(out["_month_dt"], errors="coerce")
-    return out[["Case ID", "Process", "Portfolio", "_month_dt"]]
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
-def load_complaints(dir_path: Path, cases: pd.DataFrame) -> pd.DataFrame:
-    """Load & normalize complaints; map Process and Portfolio per your rules."""
-    files = sorted(list(dir_path.glob("*.xlsx"))) + sorted(list(dir_path.glob("*.parquet")))
-    frames = []
-    for f in files:
-        df = _read_any(f)
-        cols = {c.lower(): c for c in df.columns}
+def _discover_files(kind: str) -> List[Path]:
+    """
+    naive discovery: search typical folders & names
+    """
+    roots = [Path("."), Path("./data"), Path("./core"), Path("./datasets")]
+    globs = {
+        "cases": ["*case*.xlsx", "*cases*.xlsx", "*case*.parquet", "*cases*.parquet"],
+        "complaints": ["*complaint*.xlsx", "*complaints*.xlsx", "*complaint*.parquet", "*complaints*.parquet"],
+        "fpa": ["*fpa*.xlsx", "*first*pass*.xlsx", "*fpa*.parquet"],
+    }[kind]
 
-        # The two key columns you specified
-        parent_type = cols.get("parent case type") or next((c for c in df.columns if re.fullmatch(r"(?i)parent\s*case\s*type", c)), None)
-        affected_id = cols.get("original process affected case id") or next((c for c in df.columns if re.search(r"(?i)affected.*case\s*id", c)), None)
-        if not affected_id:
-            # Try common alternates
-            affected_id = next((c for c in df.columns if re.fullmatch(r"(?i)original\s*case\s*id", c)), None)
-
-        if parent_type:
-            df = df.rename(columns={parent_type: "Process"})
-        else:
-            df["Process"] = None
-
-        if affected_id:
-            df = df.rename(columns={affected_id: "Case ID"})
-        else:
-            df["Case ID"] = None
-
-        # Month (the sheet label you shared earlier)
-        date_col = cols.get("report date dd/mm/yy format only") or cols.get("report date") or \
-                   next((c for c in df.columns if re.search(r"(?i)report.*date", c)), None)
-        df["_month_dt"] = _coerce_month(df, [date_col] if date_col else [])
-
-        frames.append(df)
-
-    if not frames:
-        return pd.DataFrame(columns=["Case ID", "Process", "Portfolio", "_month_dt"])
-
-    cmp = pd.concat(frames, ignore_index=True)
-    cmp["Case ID"] = _clean_str(cmp["Case ID"])
-    cmp["Process"] = _clean_str(cmp["Process"])
-    cmp["_month_dt"] = pd.to_datetime(cmp["_month_dt"], errors="coerce")
-
-    # Join to cases to fetch Portfolio (and optionally backstop Process if missing)
-    if not cases.empty:
-        joined = cmp.merge(
-            cases[["Case ID", "Process", "Portfolio"]],
-            on="Case ID",
-            how="left",
-            suffixes=("", "_cases"),
-        )
-        # Process preference: Parent Case Type (complaints) if present, else cases Process
-        joined["Process"] = joined["Process"].where(joined["Process"].notna() & (joined["Process"] != ""), joined["Process_cases"])
-        joined["Portfolio"] = joined["Portfolio"]  # already from cases merge
-        cmp = joined.drop(columns=[c for c in ["Process_cases"] if c in joined.columns])
-
-    # Final shape
-    return cmp[["Case ID", "Process", "Portfolio", "_month_dt"]]
+    paths: List[Path] = []
+    for r in roots:
+        for pat in globs:
+            paths.extend(r.rglob(pat))
+    # de-dupe
+    seen = set()
+    uniq = []
+    for p in paths:
+        if p.resolve() not in seen:
+            uniq.append(p)
+            seen.add(p.resolve())
+    return uniq
 
 
-def load_store() -> dict:
-    """Entry point used by the app."""
-    cases_dir = DATA_DIR / "cases"
-    complaints_dir = DATA_DIR / "complaints"
-    fpa_dir = DATA_DIR / "first_pass_accuracy"  # optional
+@st.cache_data(show_spinner=False)
+def load_store() -> Dict[str, pd.DataFrame]:
+    # Discover & read
+    cases_paths = _discover_files("cases")
+    complaints_paths = _discover_files("complaints")
+    fpa_paths = _discover_files("fpa")
 
-    cases = load_cases(cases_dir) if cases_dir.exists() else pd.DataFrame(columns=["Case ID","Process","Portfolio","_month_dt"])
-    complaints = load_complaints(complaints_dir, cases) if complaints_dir.exists() else pd.DataFrame(columns=["Case ID","Process","Portfolio","_month_dt"])
+    raw_cases = _read_many(cases_paths)
+    raw_complaints = _read_many(complaints_paths)
+    raw_fpa = _read_many(fpa_paths)
 
-    store = {
-        "cases": cases,
-        "complaints": complaints,
-        "cases_rows": int(cases.shape[0]),
-        "complaints_rows": int(complaints.shape[0]),
-    }
-    return store
+    # Normalize
+    cases = _normalize_cases(raw_cases) if not raw_cases.empty else pd.DataFrame(columns=["id", "portfolio", "process", "date", "month"])
+    complaints = _normalize_complaints(raw_complaints) if not raw_complaints.empty else pd.DataFrame(columns=["portfolio", "process", "case_link", "date", "month"])
+    fpa = raw_fpa
+
+    return {"cases": cases, "complaints": complaints, "fpa": fpa}
