@@ -1,50 +1,57 @@
 # questions/rca1_portfolio_process.py
 from __future__ import annotations
+
 import pandas as pd
+import streamlit as st
 
-def run(store: dict, params: dict, user_text: str | None = None) -> dict:
+
+def _coerce_month(s: str) -> pd.Timestamp:
+    return pd.to_datetime(s).to_period("M").to_timestamp()
+
+
+def run(store, params: dict, user_text: str):
     """
-    Show RCA1 (first-level reason) counts by portfolio × process for last N months (default 3).
-    Requires a column 'RCA1' in complaints. If missing, return an informative table.
-    params:
-      - months: int = 3
-      - portfolio: optional
+    Lightweight RCA1 view. If an 'rca1' (or similar) column exists in complaints,
+    we show counts by portfolio x process for the last N months; otherwise we show
+    complaints grouped by Parent Case Type as a proxy.
     """
-    cmps = store.get("complaints", pd.DataFrame()).copy()
-    if cmps.empty:
-        return {"dataframe": pd.DataFrame([{"portfolio":"", "process":"", "rca1":"", "complaints":0}]),
-                "meta": {"title":"RCA1 by Portfolio × Process — last 3 months", "filters": {}}}
+    complaints = store["complaints"]
+    if complaints.empty:
+        st.info("No complaints available.")
+        return
 
-    if "RCA1" not in cmps.columns:
-        msg = pd.DataFrame(
-            [{"portfolio":"", "process":"", "rca1":"",
-              "complaints":"RCA1 labels not found. Add an 'RCA1' column to complaints (e.g., via your labeller)."}]
-        )
-        return {"dataframe": msg, "meta": {"title":"RCA1 by Portfolio × Process — last 3 months", "filters": {}}}
+    # Default is "last 3 months" if not provided
+    start_m = _coerce_month(params.get("start_month", pd.Timestamp.today()))
+    end_m = _coerce_month(params.get("end_month", pd.Timestamp.today()))
+    portfolio = params.get("portfolio")
 
-    months = int((params or {}).get("months") or 3)
-    cmps["_month_dt"] = pd.to_datetime(cmps["_month_dt"], errors="coerce")
-    last = cmps["_month_dt"].max()
-    if pd.isna(last):
-        return {"dataframe": pd.DataFrame([{"portfolio":"", "process":"", "rca1":"", "complaints":0}]),
-                "meta": {"title":"RCA1 by Portfolio × Process — last 3 months", "filters": {}}}
-    start = (last.to_period("M") - (months-1)).to_timestamp()
+    df = complaints[(complaints["month"] >= start_m) & (complaints["month"] <= end_m)].copy()
+    if portfolio:
+        df = df[df["portfolio"].astype(str).str.strip().str.casefold() == str(portfolio).strip().casefold()]
 
-    portfolio = (params or {}).get("portfolio")
-    if portfolio and portfolio != "All" and "Portfolio" in cmps:
-        cmps = cmps[cmps["Portfolio"].eq(portfolio)]
+    use_col = None
+    for cand in ["rca1", "RCA1", "rca_1", "root_cause_1"]:
+        if cand in df.columns:
+            use_col = cand
+            break
 
-    cmps = cmps[(cmps["_month_dt"] >= start) & (cmps["_month_dt"] <= last)]
+    if use_col is None:
+        # fallback to Parent Case Type
+        if "process" not in df.columns:
+            st.info("No RCA1 column and no Parent Case Type to proxy.")
+            return
+        use_col = "process"
 
-    g = (cmps.groupby(["Portfolio","Process","RCA1"], dropna=False, as_index=False)
-              .agg(complaints=("Case ID", "nunique"))
-              .sort_values(["Portfolio","complaints"], ascending=[True, False]))
-    if g.empty:
-        g = pd.DataFrame([{"portfolio":"", "process":"", "rca1":"", "complaints":0}])
-    else:
-        g = g.rename(columns={"Portfolio":"portfolio", "RCA1":"rca1", "Process":"process"})
-    meta = {
-        "title": f"RCA1 by Portfolio × Process — last {months} months",
-        "filters": {"portfolio": portfolio or "All", "months": months},
-    }
-    return {"dataframe": g[["portfolio","process","rca1","complaints"]], "meta": meta}
+    out = (
+        df.groupby(["portfolio", "process"] if use_col == "rca1" else ["portfolio", use_col], as_index=False)
+        .size()
+        .rename(columns={"size": "complaints"})
+        .sort_values("complaints", ascending=False)
+    )
+
+    if out.empty:
+        st.info("No complaints for the selected filters.")
+        return
+
+    st.subheader("RCA1 by Portfolio × Process — last 3 months")
+    st.dataframe(out, use_container_width=True, hide_index=True)
