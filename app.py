@@ -1,93 +1,48 @@
 # app.py
 from __future__ import annotations
-
-import importlib
-import traceback
+import importlib, traceback
 from pathlib import Path
-from typing import Any, Dict
-
 import streamlit as st
+import pandas as pd
 
-# ---- Safe import for data_store from root or core ----
-def _import_load_store():
+# ---------- resilient import helpers ----------
+def _imp(mod: str, attr: str | None = None):
     try:
-        return importlib.import_module("data_store").load_store
+        m = importlib.import_module(mod)
     except ModuleNotFoundError:
-        return importlib.import_module("core.data_store").load_store
+        m = importlib.import_module(f"core.{mod}")
+    return getattr(m, attr) if attr else m
 
-
-load_store = _import_load_store()
-
-# ---- Router (root semantic_router.py) ----
-router = importlib.import_module("semantic_router")
-
-
-def _import_question_module(slug: str):
-    """Import question module by slug from 'questions.<slug>'. Fallback to 'core.questions.<slug>'."""
-    module_path = f"questions.{slug}"
-    try:
-        return importlib.import_module(module_path)
-    except ModuleNotFoundError:
-        module_path = f"core.questions.{slug}"
-        return importlib.import_module(module_path)
-
-
-def _run_question(mod, store: Dict[str, Any], params: Dict[str, Any], user_text: str):
-    """Be liberal with signatures: support old/new run() shapes."""
-    try:
-        return mod.run(store, params)
-    except TypeError:
-        try:
-            return mod.run(params, store)
-        except TypeError:
-            try:
-                return mod.run(store, params=params, user_text=user_text)
-            except TypeError:
-                return mod.run(store, **(params or {}))
-
+load_store = _imp("data_store", "load_store")
+sem_router = _imp("semantic_router")
 
 # ---------- UI ----------
 st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
 st.title("Halo Quality — Chat")
 st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
 
-# Load data (assume 2025 if complaints only have 'Month')
-store = load_store(assume_year_for_complaints=2025)
+# Load data once (assume year=2025 for complaints Report Month)
+with st.spinner("Reading Excel / parquet sources"):
+    store = load_store(assume_year_for_complaints=2025)
+cases = store.get("cases", pd.DataFrame())
+complaints = store.get("complaints", pd.DataFrame())
 
+# Data status
 with st.sidebar:
-    st.subheader("Data status")
-    st.write(f"Cases rows: **{store.get('cases_rows', 0):,}**")
-    st.write(f"Complaints rows: **{store.get('complaints_rows', 0):,}**")
-    st.write(f"FPA rows: **{store.get('fpa_rows', 0):,}**")
+    st.header("Data status")
+    st.write(f"Cases rows: **{len(cases):,}**")
+    st.write(f"Complaints rows: **{len(complaints):,}**")
 
 # Quick chips
-c1, c2, c3 = st.columns(3)
-with c1:
-    if st.button("complaint analysis — June 2025 (by portfolio)"):
-        st.session_state["quick_query"] = "complaint analysis for June 2025 by portfolio"
-with c2:
-    if st.button("show rca1 by portfolio for process Member Enquiry last 3 months"):
-        st.session_state["quick_query"] = "show rca1 by portfolio for process Member Enquiry last 3 months"
-with c3:
-    if st.button("unique cases by process and portfolio Apr 2025 to Jun 2025"):
-        st.session_state["quick_query"] = "unique cases by process and portfolio Apr 2025 to Jun 2025"
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True):
+        st.session_state["q"] = "complaint analysis — June 2025 (by portfolio)"
+with col2:
+    st.button("show rca1 by portfolio for process Member Enquiry last 3 months", use_container_width=True)
+with col3:
+    st.button("unique cases by process and portfolio Apr 2025 to Jun 2025", use_container_width=True)
 
-query = st.text_input(
-    "Type your question (e.g., 'complaint analysis for June 2025 by portfolio')",
-    value=st.session_state.get("quick_query", ""),
-    placeholder="complaint analysis for June 2025 by portfolio",
-)
-
-if query:
-    try:
-        match = router.match(query)
-        slug = match.get("slug")
-        params = match.get("params", {}) or {}
-        mod = _import_question_module(slug)
-        _run_question(mod, store, params, user_text=query)
-    except ModuleNotFoundError as e:
-        st.error(f"That question module failed to import.\n\n**Import error details**\n```\n{e}\n```")
-    except Exception:
-        st.error("This question failed.")
-        with st.expander("Traceback", expanded=False):
-            st.code("".join(traceback.format_exc()))
+# Query box
+default_q = st.session_state.get("q", "complaint analysis for June 2025 by portfolio")
+q = st.text_input("Type your question (e.g., 'complaint analysis for June 2025 by portfolio')
