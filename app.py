@@ -1,191 +1,61 @@
-# app.py — HaloQuality Chat (robust caller)
-# ---------------------------------------------------------
-# Preserves your current UI/flow and adds a resilient
-# question runner that works with all question.run(...)
-# signatures you’ve used (with/without `params`, kwargs only, etc.)
+# app.py — Halo Quality Chat
 
 from __future__ import annotations
 
 import importlib
 import inspect
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
+import pandas as pd
 import streamlit as st
 
-# local packages
+# Data and routing
 from core.data_store import load_store
 from semantic_router import match_query, IntentMatch
 
 
-# -------------------------------
-# Helpers: importing & safe caller
-# -------------------------------
+# -----------------------------
+# Helpers
+# -----------------------------
 
-@st.cache_resource(show_spinner=False)
-def _import_question_module(slug: str):
-    """
-    Import a question module from questions/<slug>.py.
-    First try canonical alias if semantic router provided one;
-    otherwise import direct.
-    """
-    # Support either "slug" or "questions.slug"
-    if slug.startswith("questions."):
-        module_name = slug
-    else:
-        module_name = f"questions.{slug}"
-    return importlib.import_module(module_name)
+def _fmt_month_label(dt: Optional[pd.Timestamp]) -> str:
+    if dt is None or pd.isna(dt):
+        return "—"
+    # MMM YY format
+    return pd.Timestamp(dt).strftime("%b %y")
 
 
-def _safe_call_run(mod, store, params: Dict[str, Any], user_text: Optional[str]) -> Any:
-    """
-    Call question.run(...) regardless of its signature.
-
-    Supports:
-        run(store, params, user_text=None)
-        run(store, **params)
-        run(store, params)
-        run(store, **params, user_text=...)
-        run(params, store)   (rare, but handle)
-        run(**params)        (when module pulls from global store)
-    We try a small ordered set of strategies until one works.
-    """
-    # Make sure params is always a dict
-    params = params or {}
-
-    # Build candidate call patterns (ordered)
-    candidates = []
-
-    sig = None
-    try:
-        sig = inspect.signature(mod.run)  # type: ignore[attr-defined]
-    except Exception:
-        # If we can't introspect, just try broad patterns
-        pass
-
-    # Most common first
-    candidates.append(lambda: mod.run(store, params, user_text))               # run(store, params, user_text)
-    candidates.append(lambda: mod.run(store, params))                           # run(store, params)
-    candidates.append(lambda: mod.run(store=store, params=params, user_text=user_text))
-    candidates.append(lambda: mod.run(store=store, params=params))
-    candidates.append(lambda: mod.run(store, **params))                         # run(store, **params)
-    candidates.append(lambda: mod.run(store=store, **params))
-    candidates.append(lambda: mod.run(**params, store=store))
-    candidates.append(lambda: mod.run(**params))                                # run(**params)
-
-    # If the function exposes 'user_text' but not 'params', prioritize kwargs path
-    if sig is not None:
-        ps = sig.parameters
-        has_store = "store" in ps
-        has_params = "params" in ps
-        has_user_text = "user_text" in ps
-
-        ordered = []
-        if has_store and has_params and has_user_text:
-            ordered = [
-                lambda: mod.run(store, params, user_text),
-                lambda: mod.run(store=store, params=params, user_text=user_text),
-            ]
-        elif has_store and has_params:
-            ordered = [
-                lambda: mod.run(store, params),
-                lambda: mod.run(store=store, params=params),
-            ]
-            if has_user_text:
-                ordered.insert(0, lambda: mod.run(store, params, user_text))
-        elif has_store and not has_params:
-            # Try kwargs shapes with/without user_text
-            if has_user_text:
-                ordered = [
-                    lambda: mod.run(store, **params, user_text=user_text),
-                    lambda: mod.run(store=store, **params, user_text=user_text),
-                ]
-            ordered += [
-                lambda: mod.run(store, **params),
-                lambda: mod.run(store=store, **params),
-            ]
-        else:
-            # No explicit 'store' in signature
-            if has_user_text:
-                ordered = [
-                    lambda: mod.run(**params, user_text=user_text),
-                ]
-            ordered += [
-                lambda: mod.run(**params),
-            ]
-
-        # Put our introspection-based attempts first
-        candidates = ordered + candidates
-
-    last_err = None
-    for attempt in candidates:
+def _data_status(store: Dict[str, Any]) -> None:
+    """Sidebar data status that works whether or not summary keys exist."""
+    def _rows(key_count: str, key_df: str) -> int:
+        if isinstance(store.get(key_count), int):
+            return int(store[key_count])
+        df = store.get(key_df)
         try:
-            return attempt()
-        except TypeError as e:
-            # Signature mismatch; try next pattern
-            last_err = e
+            return int(len(df)) if df is not None else 0
         except Exception:
-            # Let question modules surface their own errors (rendered in UI)
-            raise
+            return 0
 
-    # If nothing matched, re-raise the most recent signature error
-    if last_err:
-        raise last_err
+    cases_rows = _rows("cases_rows", "cases")
+    complaints_rows = _rows("complaints_rows", "complaints")
+    fpa_rows = _rows("fpa_rows", "fpa")
 
-    # Fallback (should never reach)
-    return None
+    latest_cases = store.get("latest_cases_month_label")
+    latest_complaints = store.get("latest_complaints_month_label")
+    latest_fpa = store.get("latest_fpa_month_label")
 
-
-def _run_question(match: IntentMatch, store, user_text: Optional[str]):
-    """
-    Given a semantic match, import and run the corresponding question module.
-    """
-    slug = match.slug
-    params = match.params or {}
-
-    try:
-        mod = _import_question_module(slug)
-    except ModuleNotFoundError as e:
-        st.error(f"Sorry—couldn't load question module '{slug}'.")
-        st.exception(e)
-        return
-
-    # A little UX: show parsed filters for transparency
-    with st.expander("Parsed filters", expanded=False):
-        if not params:
-            st.write("None")
-        else:
-            # pretty print the normalized params
-            nice = {k: (str(v) if v is not None else v) for k, v in params.items()}
-            st.write(nice)
-
-    # And run it, letting the module render into the page
-    try:
-        _safe_call_run(mod, store, params, user_text)
-    except Exception as e:
-        st.error("This question failed (signature mismatch or runtime error).")
-        st.exception(e)
-
-
-# -------------------------------
-# Page UI
-# -------------------------------
-
-def _data_status(store) -> None:
-    # Left rail: quick data stats
     st.sidebar.subheader("Data status")
-    st.sidebar.write(f"Cases rows: **{store['cases_rows']:,}**")
-    st.sidebar.write(f"Complaints rows: **{store['complaints_rows']:,}**")
-    st.sidebar.write(f"FPA rows: **{store['fpa_rows']:,}**")
+    st.sidebar.write(f"Cases rows: **{cases_rows:,}**")
+    st.sidebar.write(f"Complaints rows: **{complaints_rows:,}**")
+    st.sidebar.write(f"FPA rows: **{fpa_rows:,}**")
 
-    latest_cases = store.get("latest_cases_month_label", "—")
-    latest_complaints = store.get("latest_complaints_month_label", "—")
-    latest_fpa = store.get("latest_fpa_month_label", "—")
-
-    st.sidebar.markdown(
-        f"Latest Month — Cases: **{latest_cases}** | "
-        f"Complaints: **{latest_complaints}** | "
-        f"FPA: **{latest_fpa}**"
-    )
+    if any([latest_cases, latest_complaints, latest_fpa]):
+        st.sidebar.markdown(
+            f"Latest Month — Cases: **{latest_cases or '—'}** | "
+            f"Complaints: **{latest_complaints or '—'}** | "
+            f"FPA: **{latest_fpa or '—'}**"
+        )
 
     st.sidebar.markdown("---")
     st.sidebar.caption("Tip: Ask things like:")
@@ -196,63 +66,165 @@ def _data_status(store) -> None:
     )
 
 
-def _suggestion_chips():
-    cols = st.columns(3)
-    with cols[0]:
-        if st.button("complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"):
-            st.session_state["free_text"] = "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"
-    with cols[1]:
-        if st.button("show rca1 by portfolio for process Member Enquiry last 3 months"):
-            st.session_state["free_text"] = "show rca1 by portfolio for process Member Enquiry last 3 months"
-    with cols[2]:
-        if st.button("unique cases by process and portfolio Apr 2025 to Jun 2025"):
-            st.session_state["free_text"] = "unique cases by process and portfolio Apr 2025 to Jun 2025"
+def _import_question_module(slug: str):
+    """Import questions.<slug> with a clear error if missing."""
+    try:
+        return importlib.import_module(f"questions.{slug}")
+    except ModuleNotFoundError as e:
+        raise RuntimeError(f"Question module not found: questions.{slug}") from e
+
+
+def _call_question_run(mod, store: Dict[str, Any], params: Dict[str, Any], user_text: str):
+    """
+    Call `mod.run(...)` in a way that works across slightly different signatures:
+      - run(store, params, user_text)
+      - run(store, params)
+      - run(store, **params)
+      - run(store, user_text=...)
+      - run(**kwargs) where kwargs includes store/params fields
+    """
+    func = getattr(mod, "run", None)
+    if not callable(func):
+        raise RuntimeError(f"`run` function not found in {mod.__name__}")
+
+    sig = inspect.signature(func)
+    names = list(sig.parameters.keys())
+
+    # Build the most-compatible kwargs first
+    kwargs: Dict[str, Any] = {}
+    if "store" in names:
+        kwargs["store"] = store
+    if "user_text" in names:
+        kwargs["user_text"] = user_text
+
+    # Prefer passing a single `params` dict if the function expects it;
+    # otherwise expand the dict into keyword args.
+    if "params" in names:
+        kwargs["params"] = params or {}
+        try:
+            return func(**kwargs)
+        except TypeError:
+            # Some modules may still want expanded kwargs; try that path.
+            kwargs.pop("params", None)
+            kwargs.update(params or {})
+            return func(**kwargs)
+    else:
+        kwargs.update(params or {})
+        try:
+            return func(**kwargs)
+        except TypeError:
+            # As a final fallback, try giving params as a single dict
+            # if the function happens to accept **kwargs but expects `params`.
+            kwargs.pop("store", None)
+            kwargs.pop("user_text", None)
+            return func(store, params, user_text)  # last-resort
+            
+
+def _parsed_filters_block(params: Dict[str, Any]) -> None:
+    """Small expander to show how the query was interpreted."""
+    if not params:
+        return
+    with st.expander("Parsed filters", expanded=False):
+        # Show a compact, stable order if present
+        priority = [
+            "relative_months",
+            "start_month",
+            "end_month",
+            "portfolio",
+            "process",
+            "process_filter",
+            "range_label",
+        ]
+        shown = set()
+        lines = []
+
+        for k in priority:
+            if k in params:
+                lines.append(f"- **{k}**: {params[k]}")
+                shown.add(k)
+        # Any remaining keys
+        for k, v in params.items():
+            if k not in shown:
+                lines.append(f"- **{k}**: {v}")
+
+        st.markdown("\n".join(lines))
+
+
+# -----------------------------
+# UI & main flow
+# -----------------------------
+
+def _pills():
+    # Example suggestions as "chips"
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        if st.button("complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025", use_container_width=True):
+            st.session_state.free_text = "complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025"
+    with col2:
+        if st.button("show rca1 by portfolio for process Member Enquiry last 3 months", use_container_width=True):
+            st.session_state.free_text = "show rca1 by portfolio for process Member Enquiry last 3 months"
+    with col3:
+        if st.button("unique cases by process and portfolio Apr 2025 to Jun 2025", use_container_width=True):
+            st.session_state.free_text = "unique cases by process and portfolio Apr 2025 to Jun 2025"
 
 
 def main():
     st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
-    st.title("Halo Quality — Chat")
+    st.markdown("# Halo Quality — Chat")
     st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
 
-    # Load data store
-    try:
+    # Load data
+    with st.spinner("Loading data store…"):
         store = load_store()
-    except Exception as e:
-        st.error("Failed to load data store.")
-        st.exception(e)
-        return
 
-    # Sidebar status
+    # Sidebar status (safe)
     _data_status(store)
 
-    # Suggestion buttons
-    _suggestion_chips()
+    # Suggestion “chips”
+    _pills()
 
-    # Free text input
-    free_text = st.session_state.get("free_text", "")
-    free_text = st.text_input(
+    # Query input
+    default_text = st.session_state.get("free_text", "")
+    user_text = st.text_input(
         "Type your question (e.g., 'complaints per 1000 by process last 3 months')",
-        value=free_text,
-        key="free_text",
-        placeholder="e.g., complaints per 1000 by process last 3 months",
-    ).strip()
+        value=default_text,
+        label_visibility="collapsed",
+        placeholder="Type your question (e.g., 'complaints per 1000 by process last 3 months')",
+    )
+    # Clear the chip value after rendering the input
+    st.session_state.free_text = ""
 
-    if not free_text:
-        st.stop()
+    if not user_text.strip():
+        return
 
-    # Route the query
-    match = match_query(free_text)
+    # Route
+    match: Optional[IntentMatch] = match_query(user_text)
 
-    if match is None:
+    if not match or not match.slug:
         st.error("Sorry—couldn't understand that question.")
-        st.info("Try something like: 'complaints per 1000 by process for portfolio London Jun 2025 to Aug 2025'.")
-        st.stop()
+        return
 
-    # Section title mirrors the matched intent title
-    st.header(match.title or "Results")
+    # Header for the selected question
+    st.markdown(f"## {match.title or 'Question'}")
 
-    # Run matched question
-    _run_question(match, store, user_text=free_text)
+    # Show parsed filters
+    _parsed_filters_block(match.params or {})
+
+    # Run the question module
+    try:
+        mod = _import_question_module(match.slug)
+        _call_question_run(mod, store, match.params or {}, user_text=user_text)
+    except RuntimeError as e:
+        st.error(str(e))
+    except TypeError as e:
+        # Signature mismatch safety net
+        st.error("This question failed: (signature mismatch).")
+        with st.expander("Traceback"):
+            st.exception(e)
+    except Exception as e:
+        st.error("This question failed.")
+        with st.expander("Traceback"):
+            st.exception(e)
 
 
 if __name__ == "__main__":
