@@ -1,173 +1,145 @@
-# semantic_router.py
-from __future__ import annotations
-
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Optional, Dict
 
-import pandas as pd
-from rapidfuzz import process, fuzz
-
-# ----- intents & surfaces -----------------------------------------------------
-
-LEXICON: Dict[str, List[str]] = {
-    # complaints per 1,000 cases
-    "complaints_per_thousand": [
-        "complaints per 1000",
-        "complaints per thousand",
-        "complaints/1000",
-        "complaint rate per 1000",
-        "per 1000 complaints",
-        "complaint rate",
-        "complaint index",
-    ],
-    # rca1 by portfolio x process
-    "rca1_portfolio_process": [
-        "show rca1 by portfolio for process",
-        "rca1 by portfolio by process",
-        "rca by portfolio process",
-        "drivers by portfolio and process",
-        "top drivers by portfolio and process",
-    ],
-    # unique cases by month
-    "unique_cases_mom": [
-        "unique cases by process and portfolio",
-        "unique cases month on month",
-        "unique cases mom",
-        "cases unique per month",
-        "distinct cases per month",
-    ],
+# Months map for parsing "Apr 2025", "June 2025", etc.
+_MMAP = {
+    "jan": "01", "january": "01",
+    "feb": "02", "february": "02",
+    "mar": "03", "march": "03",
+    "apr": "04", "april": "04",
+    "may": "05",
+    "jun": "06", "june": "06",
+    "jul": "07", "july": "07",
+    "aug": "08", "august": "08",
+    "sep": "09", "sept": "09", "september": "09",
+    "oct": "10", "october": "10",
+    "nov": "11", "november": "11",
+    "dec": "12", "december": "12",
 }
 
-TITLES = {
-    "complaints_per_thousand": "Complaints per 1,000 cases",
-    "rca1_portfolio_process": "RCA1 by Portfolio × Process — last 3 months",
-    "unique_cases_mom": "Unique cases (MoM)",
-}
-
-IntentMatch(
-    slug="complaints_dashboard",
-    description="Portfolio-level complaints per 1000 with a monthly trend and a reasons deep-dive for the selected month.",
-    patterns=[
-        r"complaints analysis",
-        r"complaints dashboard",
-        r"show monthly complaints and reasons",
-        r"complaints 1000 by portfolio .* reasons",
-    ],
-    module="questions.complaints_dashboard",
-)
-
-
-# ----- small data structure ---------------------------------------------------
 
 @dataclass
 class IntentMatch:
     slug: str
-    title: str
-    args: Dict[str, Any]
+    params: Dict
+    title: Optional[str] = None
 
-# ----- argument parsing helpers ----------------------------------------------
 
-_MONTH_RX = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+20\d{2}"
-RANGE_RX = re.compile(
-    rf"(?P<s>{_MONTH_RX})\s*(to|-|→)\s*(?P<e>{_MONTH_RX})",
+# ---- helpers to parse ranges -------------------------------------------------
+
+# e.g. "Apr 2025 to Jun 2025" or "Apr 25 to Jun 25"
+RANGE_RE = re.compile(
+    r"\b(?P<m1>[A-Za-z]{3,9})\.?\s*(?P<y1>\d{2,4})\s*(?:to|-|–|—)\s*(?P<m2>[A-Za-z]{3,9})\.?\s*(?P<y2>\d{2,4})\b",
     re.IGNORECASE,
 )
+# e.g. "last 3 months"
+LAST_N_RE = re.compile(r"\blast\s*(?P<n>\d{1,2})\s*months?\b", re.IGNORECASE)
+# e.g. "portfolio London", "for portfolio London"
+PORT_RE = re.compile(r"(?:for\s+)?portfolio\s+(?P<p>[\w\s&'\-]+)", re.IGNORECASE)
+# e.g. "process Member Enquiry", "for process Member Enquiry"
+PROC_RE = re.compile(r"(?:for\s+)?process\s+(?P<p>[\w\s&'\-]+)", re.IGNORECASE)
 
-def _find_months(text: str) -> Tuple[Optional[str], Optional[str]]:
+
+def _ym(m: str, y: str) -> Optional[str]:
+    m = (m or "").strip().lower()
+    y = (y or "").strip()
+    if not m or not y:
+        return None
+    if len(y) == 2:
+        # assume 20xx for '25'
+        y = "20" + y
+    mm = _MMAP.get(m[:3])
+    if not mm:
+        return None
+    return f"{y}-{mm}"
+
+
+def _parse_time(text: str) -> Dict:
     """
-    Return (start_month, end_month) as 'YYYY-MM' strings if found, else (None, None).
-    Supports 'Apr 2025 to Jun 2025' or a single month 'Aug 2025'.
+    Returns either {'relative_months': N} or {'start_ym': 'YYYY-MM', 'end_ym': 'YYYY-MM'} or {}.
     """
-    m = RANGE_RX.search(text)
+    text = text or ""
+    m = LAST_N_RE.search(text)
     if m:
-        s = pd.to_datetime(m.group("s")).strftime("%Y-%m")
-        e = pd.to_datetime(m.group("e")).strftime("%Y-%m")
-        return s, e
+        try:
+            n = int(m.group("n"))
+            return {"relative_months": n}
+        except Exception:
+            pass
 
-    single = re.search(_MONTH_RX, text, re.IGNORECASE)
-    if single:
-        s = pd.to_datetime(single.group(0)).strftime("%Y-%m")
-        return s, s
-
-    return None, None
-
-def _find_relative_months(text: str) -> Optional[int]:
-    m = re.search(r"last\s+(\d{1,2})\s+months?", text, re.IGNORECASE)
+    m = RANGE_RE.search(text)
     if m:
-        return int(m.group(1))
-    return None
+        s = _ym(m.group("m1"), m.group("y1"))
+        e = _ym(m.group("m2"), m.group("y2"))
+        if s and e:
+            return {"start_ym": s, "end_ym": e}
 
-def _find_portfolio(text: str) -> Optional[str]:
-    # examples: "for portfolio London", "portfolio: Member Services"
-    m = re.search(r"(?:for\s+)?portfolio[:\s]+([A-Za-z0-9 &/_-]{2,})", text, re.IGNORECASE)
+    return {}
+
+
+def _parse_dims(text: str) -> Dict:
+    out = {}
+    m = PORT_RE.search(text or "")
     if m:
-        return m.group(1).strip()
-    return None
-
-def _find_process(text: str) -> Optional[str]:
-    # examples: "for process Member Enquiry", "process: Billing"
-    m = re.search(r"(?:for\s+)?process[:\s]+([A-Za-z0-9 &/_-]{2,})", text, re.IGNORECASE)
+        out["portfolio_text"] = m.group("p").strip()
+    m = PROC_RE.search(text or "")
     if m:
-        return m.group(1).strip()
-    return None
+        out["process_text"] = m.group("p").strip()
+    return out
 
-def _parse_args(slug: str, text: str) -> Dict[str, Any]:
+
+# ---- Main matcher ------------------------------------------------------------
+
+def match_query(text: str) -> Optional[IntentMatch]:
     """
-    Extract a clean argument dict for the question `slug`.
-    Only keys that questions commonly support are returned.
+    Very lightweight router: recognizes 3 intents we have modules for.
+    Returns IntentMatch(slug, params, title) or None if not understood.
     """
-    args: Dict[str, Any] = {}
-
-    # time windows
-    start, end = _find_months(text)
-    rel = _find_relative_months(text)
-    if start and end:
-        args["start_month"] = start
-        args["end_month"] = end
-    elif rel is not None:
-        args["relative_months"] = rel
-    else:
-        # good default for RCA and unique-cases is last 3 months
-        if slug in {"rca1_portfolio_process"}:
-            args["relative_months"] = 3
-
-    # entities
-    port = _find_portfolio(text)
-    proc = _find_process(text)
-    if port:
-        args["portfolio"] = port
-    if proc:
-        args["process"] = proc
-
-    return args
-
-# ----- main matcher -----------------------------------------------------------
-
-def match_query(text: str, *, cutoff: int = 70) -> Optional[IntentMatch]:
-    """
-    Return best (slug, args, title) for a query or None if nothing is good enough.
-    """
-    text_norm = " ".join(text.lower().split())
-
-    # score every surface form of every intent
-    candidates: List[Tuple[str, str, int]] = []
-    for slug, surfaces in LEXICON.items():
-        # RapidFuzz top score among surfaces for this intent
-        choice = process.extractOne(text_norm, surfaces, scorer=fuzz.token_set_ratio)
-        if choice:
-            score = choice[1]
-            candidates.append((slug, choice[0], score))
-
-    if not candidates:
+    if not text:
         return None
 
-    # pick highest-scoring intent if it clears the cutoff
-    slug, _, score = max(candidates, key=lambda x: x[2])
-    if score < cutoff:
-        return None
+    t = text.lower().strip()
 
-    args = _parse_args(slug, text_norm)
-    title = TITLES.get(slug, slug.replace("_", " ").title())
+    # Complaints per thousand
+    if re.search(r"\bcomplaints?\s+per\s+(1,?000|thousand)\b", t):
+        params = {}
+        params.update(_parse_time(t))
+        params.update(_parse_dims(t))
+        title = "Complaints per 1,000 cases"
+        # If no explicit time found, default to a sensible 3-month window
+        if not any(k in params for k in ("relative_months", "start_ym", "end_ym")):
+            params["relative_months"] = 3
+        return IntentMatch(slug="complaints_per_thousand", params=params, title=title)
 
-    return IntentMatch(slug=slug, title=title, args=args)
+    # RCA1 portfolio × process
+    if re.search(r"\brca1\b|\broot\s*cause\b", t):
+        params = {}
+        params.update(_parse_time(t))
+        params.update(_parse_dims(t))
+        title = "RCA1 by Portfolio × Process"
+        if not any(k in params for k in ("relative_months", "start_ym", "end_ym")):
+            params["relative_months"] = 3
+        return IntentMatch(slug="rca1_portfolio_process", params=params, title=title)
+
+    # Unique cases (MoM)
+    if re.search(r"\bunique\s+cases?\b", t):
+        params = {}
+        params.update(_parse_time(t))
+        params.update(_parse_dims(t))
+        title = "Unique cases (MoM)"
+        # If no time, assume last 3 months for a compact MoM
+        if not any(k in params for k in ("relative_months", "start_ym", "end_ym")):
+            params["relative_months"] = 3
+        return IntentMatch(slug="unique_cases_mom", params=params, title=title)
+
+    # Friendly aliases → default complaints view
+    if re.search(r"\bcomplaint(s)?\s+(dashboard|analysis|overview)\b", t):
+        params = {}
+        params.update(_parse_time(t))
+        params.update(_parse_dims(t))
+        if not any(k in params for k in ("relative_months", "start_ym", "end_ym")):
+            params["relative_months"] = 3
+        return IntentMatch(slug="complaints_per_thousand", params=params, title="Complaints dashboard")
+
+    return None
