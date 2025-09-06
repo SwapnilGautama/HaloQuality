@@ -45,6 +45,19 @@ TITLES = {
     "unique_cases_mom": "Unique cases (MoM)",
 }
 
+IntentMatch(
+    slug="complaints_dashboard",
+    description="Portfolio-level complaints per 1000 with a monthly trend and a reasons deep-dive for the selected month.",
+    patterns=[
+        r"complaints analysis",
+        r"complaints dashboard",
+        r"show monthly complaints and reasons",
+        r"complaints 1000 by portfolio .* reasons",
+    ],
+    module="questions.complaints_dashboard",
+)
+
+
 # ----- small data structure ---------------------------------------------------
 
 @dataclass
