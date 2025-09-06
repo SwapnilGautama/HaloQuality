@@ -45,4 +45,4 @@ with col3:
 
 # Query box
 default_q = st.session_state.get("q", "complaint analysis for June 2025 by portfolio")
-q = st.text_input("Type your question (e.g., 'complaint analysis for June 2025 by portfolio')
+q = st.text_input("Type your question (e.g., 'complaint analysis for June 2025 by portfolio')")
