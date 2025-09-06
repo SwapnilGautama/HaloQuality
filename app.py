@@ -1,73 +1,200 @@
 # app.py
 import sys
 from pathlib import Path
+import importlib
+import importlib.util
+from types import ModuleType
+from typing import Callable, Dict, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
 
 # -----------------------------------------------------------------------------
-# Robust imports (works whether files are in project root, core/, or package)
+# Paths
 # -----------------------------------------------------------------------------
 HERE = Path(__file__).resolve().parent
-for extra in [HERE, HERE / "core", HERE.parent, HERE.parent / "core"]:
-    sys.path.insert(0, str(extra))
+CANDIDATE_DIRS = [
+    HERE,
+    HERE / "questions",
+    HERE / "core",
+    HERE / "core" / "questions",
+    HERE.parent,
+    HERE.parent / "questions",
+    HERE.parent / "core",
+    HERE.parent / "core" / "questions",
+]
 
-# data_store import shim
-_load_store_err = None
-try:
-    from data_store import load_store  # root
-except ModuleNotFoundError as e1:
-    try:
-        from core.data_store import load_store  # ./core
-    except ModuleNotFoundError as e2:
-        try:
-            from haloquality.core.data_store import load_store  # package path
-        except ModuleNotFoundError as e3:
-            _load_store_err = (e1, e2, e3)
+for p in CANDIDATE_DIRS:
+    sys.path.insert(0, str(p))
 
-# semantic_router import shim
-_router_err = None
-try:
-    from semantic_router import match_query, IntentMatch  # root
-except Exception as r1:
+# -----------------------------------------------------------------------------
+# Utilities: robust import (module-or-file), then get a function (default: run)
+# -----------------------------------------------------------------------------
+def _try_import_module(modname: str) -> Tuple[Optional[ModuleType], Optional[Exception]]:
     try:
-        from core.semantic_router import match_query, IntentMatch  # ./core
-    except Exception as r2:
-        try:
-            from haloquality.core.semantic_router import match_query, IntentMatch  # package
-        except Exception as r3:
-            _router_err = (r1, r2, r3)
-
-# question handlers (import after path setup)
-_q_errs = {}
-def _safe_import(label, modname, funcname="run"):
-    try:
-        m = __import__(modname, fromlist=[funcname])
-        return getattr(m, funcname)
+        return importlib.import_module(modname), None
     except Exception as e:
-        _q_errs[label] = e
-        return None
+        return None, e
 
-q_complaints_per_thousand = _safe_import(
-    "complaints_per_thousand", "complaints_per_thousand", "run"
-)
-q_rca1_portfolio_process = _safe_import(
-    "rca1_portfolio_process", "rca1_portfolio_process", "run"
-)
-q_unique_cases_mom = _safe_import(
-    "unique_cases_mom", "unique_cases_mom", "run"
-)
+def _try_import_file(filepath: Path, modname_hint: str) -> Tuple[Optional[ModuleType], Optional[Exception]]:
+    try:
+        if not filepath.exists():
+            return None, FileNotFoundError(str(filepath))
+        spec = importlib.util.spec_from_file_location(modname_hint, str(filepath))
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader  # type: ignore
+        spec.loader.exec_module(module)  # type: ignore
+        sys.modules[modname_hint] = module
+        return module, None
+    except Exception as e:
+        return None, e
 
-QUESTIONS = {
-    "complaints_per_thousand": q_complaints_per_thousand,
-    "rca1_portfolio_process": q_rca1_portfolio_process,
-    "unique_cases_mom": q_unique_cases_mom,
-}
+def load_callable(
+    base: str,
+    func: str = "run",
+) -> Tuple[Optional[Callable], Dict[str, Exception], Optional[str]]:
+    """
+    Try many module names & file locations, then return callable.
+    Returns (callable, errors_by_candidate, where_loaded)
+    """
+    errors: Dict[str, Exception] = {}
+    loaded_from: Optional[str] = None
+
+    module_candidates = [
+        base,
+        f"questions.{base}",
+        f"core.{base}",
+        f"core.questions.{base}",
+        f"haloquality.{base}",
+        f"haloquality.questions.{base}",
+    ]
+
+    for cand in module_candidates:
+        m, err = _try_import_module(cand)
+        if m:
+            fn = getattr(m, func, None)
+            if callable(fn):
+                return fn, errors, f"module:{cand}"
+            errors[cand] = AttributeError(f"Function '{func}' not found in {cand}")
+        else:
+            errors[cand] = err  # type: ignore
+
+    # Try direct file paths if module import failed
+    file_candidates = []
+    for d in CANDIDATE_DIRS:
+        file_candidates.append(d / f"{base}.py")
+    # Deduplicate while preserving order
+    seen = set()
+    unique_files = []
+    for f in file_candidates:
+        if f not in seen:
+            unique_files.append(f)
+            seen.add(f)
+
+    for f in unique_files:
+        m, err = _try_import_file(f, f"__dyn__{base}__{abs(hash(str(f)))}")
+        if m:
+            fn = getattr(m, func, None)
+            if callable(fn):
+                return fn, errors, f"file:{f}"
+            errors[str(f)] = AttributeError(f"Function '{func}' not found in file {f}")
+        else:
+            errors[str(f)] = err  # type: ignore
+
+    return None, errors, None
+
+# -----------------------------------------------------------------------------
+# Import data_store & semantic_router with strong fallbacks
+# -----------------------------------------------------------------------------
+def load_load_store():
+    fn, errs, where = load_callable("data_store", func="load_store")
+    if fn:
+        return fn, errs, where
+    # additional package paths
+    for extra in ("core.data_store", "haloquality.core.data_store"):
+        m, err = _try_import_module(extra)
+        if m:
+            fn2 = getattr(m, "load_store", None)
+            if callable(fn2):
+                return fn2, errs, f"module:{extra}"
+    return None, errs, None
+
+def load_router():
+    # expect match_query, IntentMatch in a module named semantic_router
+    try_candidates = [
+        "semantic_router",
+        "core.semantic_router",
+        "haloquality.core.semantic_router",
+        "questions.semantic_router",  # just in case
+    ]
+    errs: Dict[str, Exception] = {}
+    for cand in try_candidates:
+        m, err = _try_import_module(cand)
+        if m:
+            mq = getattr(m, "match_query", None)
+            IM = getattr(m, "IntentMatch", None)
+            if callable(mq) and IM is not None:
+                return mq, IM, errs, f"module:{cand}"
+            errs[cand] = AttributeError(f"'match_query'/'IntentMatch' missing in {cand}")
+        else:
+            errs[cand] = err  # type: ignore
+
+    # try file path loads too
+    m, err = _try_import_file(HERE / "semantic_router.py", "__dyn__semantic_router")
+    if m:
+        mq = getattr(m, "match_query", None)
+        IM = getattr(m, "IntentMatch", None)
+        if callable(mq) and IM is not None:
+            return mq, IM, errs, f"file:{HERE/'semantic_router.py'}"
+        errs["semantic_router.py"] = AttributeError("'match_query'/'IntentMatch' missing in file")
+    return None, None, errs, None
+
+load_store, ds_errs, ds_where = load_load_store()
+match_query, IntentMatch, router_errs, router_where = load_router()
+
+# Question handlers
+complaints_run, c_errs, c_where = load_callable("complaints_per_thousand", "run")
+rca_run, r_errs, r_where = load_callable("rca1_portfolio_process", "run")
+ucm_run, u_errs, u_where = load_callable("unique_cases_mom", "run")
 
 # -----------------------------------------------------------------------------
 # Streamlit page
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
+
+def _import_gate():
+    ok = True
+    if not load_store:
+        ok = False
+        st.error("Could not import `data_store.load_store`.")
+        with st.expander("data_store import attempts & errors"):
+            for k, v in ds_errs.items():
+                st.write(k)
+                st.exception(v)
+    if not match_query:
+        ok = False
+        st.error("Could not import `semantic_router`.")
+        with st.expander("semantic_router import attempts & errors"):
+            for k, v in router_errs.items():
+                st.write(k)
+                st.exception(v)
+    if not complaints_run or not rca_run or not ucm_run:
+        ok = False
+        st.error("One or more question modules failed to import.")
+        with st.expander("question import attempts & errors"):
+            st.markdown("**complaints_per_thousand**")
+            for k, v in c_errs.items():
+                st.write(k)
+                st.exception(v)
+            st.markdown("---\n**rca1_portfolio_process**")
+            for k, v in r_errs.items():
+                st.write(k)
+                st.exception(v)
+            st.markdown("---\n**unique_cases_mom**")
+            for k, v in u_errs.items():
+                st.write(k)
+                st.exception(v)
+    return ok
 
 @st.cache_data(show_spinner=False)
 def _load_store_cached():
@@ -77,12 +204,6 @@ def _data_status(store):
     st.sidebar.subheader("Data status")
     st.sidebar.write(f"Cases rows: **{store.get('cases_rows', 0)}**")
     st.sidebar.write(f"Complaints rows: **{store.get('complaints_rows', 0)}**")
-    lm = store.get("last_case_month")
-    if lm is not None:
-        st.sidebar.write(f"Latest Month — Cases: **{lm.strftime('%b %y')}**")
-    lm2 = store.get("last_complaint_month")
-    if lm2 is not None:
-        st.sidebar.write(f"Complaints: **{lm2.strftime('%b %y')}**")
 
 def _parsed_filters_box(title: str, params: dict):
     with st.expander(title, expanded=False):
@@ -93,49 +214,44 @@ def _parsed_filters_box(title: str, params: dict):
             st.dataframe(df, hide_index=True, use_container_width=True)
 
 def _run_question(slug: str, params: dict, store: dict, user_text: str):
-    mod = QUESTIONS.get(slug)
-    if mod is None:
-        err = _q_errs.get(slug)
-        st.error("That question module failed to import.")
-        if err:
-            with st.expander("Import error details"):
-                st.exception(err)
+    if slug == "complaints_per_thousand":
+        runner = complaints_run
+        st.subheader("Complaints per 1,000 cases")
+    elif slug == "rca1_portfolio_process":
+        runner = rca_run
+        st.subheader("RCA1 by Portfolio × Process — last 3 months")
+    elif slug == "unique_cases_mom":
+        runner = ucm_run
+        st.subheader("Unique cases (MoM)")
+    else:
+        st.warning("Sorry—couldn't understand that question.")
         return
+
+    if runner is None:
+        st.error("That question module failed to import.")
+        return
+
     try:
-        df = mod(store, params=params, user_text=user_text)
-        st.dataframe(df, use_container_width=True)
+        df = runner(store, params=params, user_text=user_text)
+        if isinstance(df, pd.DataFrame):
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.write(df)
     except Exception as e:
         st.error("This question failed.")
         st.exception(e)
 
-def _import_gate():
-    """Surface helpful errors in the UI if imports failed."""
-    if _load_store_err:
-        st.error("Could not import `data_store.load_store`.")
-        with st.expander("Import attempts & errors"):
-            for i, err in enumerate(_load_store_err, 1):
-                st.write(f"Attempt {i}:")
-                st.exception(err)
-        st.stop()
-    if _router_err:
-        st.error("Could not import `semantic_router`.")
-        with st.expander("Import attempts & errors"):
-            for i, err in enumerate(_router_err, 1):
-                st.write(f"Attempt {i}:")
-                st.exception(err)
-        st.stop()
-
 def main():
-    _import_gate()
-
     st.title("Halo Quality — Chat")
     st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
+
+    if not _import_gate():
+        st.stop()
 
     with st.status("Reading Excel / parquet sources", expanded=True):
         store = _load_store_cached()
     _data_status(store)
 
-    # Quick action buttons (your pinned phrases)
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         if st.button(
@@ -162,8 +278,6 @@ def main():
                 "unique cases by process and portfolio apr 2025 to jun 2025"
             )
 
-    st.write("")  # spacing
-
     q = st.text_input(
         "Type your question (e.g., 'complaints per 1000 by process last 3 months')",
         value=st.session_state.get("free_text", ""),
@@ -176,15 +290,8 @@ def main():
         st.exception(e)
         st.stop()
 
-    slug = match.slug
-    params = match.params or {}
-
-    if slug == "complaints_per_thousand":
-        st.subheader("Complaints per 1,000 cases")
-    elif slug == "rca1_portfolio_process":
-        st.subheader("RCA1 by Portfolio × Process — last 3 months")
-    elif slug == "unique_cases_mom":
-        st.subheader("Unique cases (MoM)")
+    slug = getattr(match, "slug", None)
+    params = getattr(match, "params", {}) or {}
 
     _parsed_filters_box("Parsed filters", params)
     _run_question(slug, params, store, q)
