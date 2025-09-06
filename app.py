@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import importlib
-import sys
-from pathlib import Path
 import traceback
-import streamlit as st
-import pandas as pd
+from pathlib import Path
 
-# ---------- tolerant imports (works whether files live in root or core/) ----------
+import pandas as pd
+import streamlit as st
+
+
+# -----------------------------
+# Tolerant dynamic import helper
+# -----------------------------
 def _try_import(module_name: str, attr: str | None = None):
     try:
         mod = importlib.import_module(module_name)
@@ -16,44 +19,69 @@ def _try_import(module_name: str, attr: str | None = None):
     except Exception:
         return None
 
+
+# -----------------------------
+# Resolve data_store.load_store
+# (works whether file is in root or core/)
+# -----------------------------
 load_store = None
 for cand in ("data_store", "core.data_store"):
     load_store = _try_import(cand, "load_store")
     if load_store:
         break
-if load_store is None:
-    st.stop()  # Will show the red box from Streamlit with ModuleNotFound
 
+if load_store is None:
+    st.error("Could not import load_store from data_store or core.data_store.")
+    st.stop()
+
+
+# -----------------------------
+# Resolve semantic_router.match_query
+# -----------------------------
 match_query = None
 for cand in ("semantic_router", "core.semantic_router"):
     match_query = _try_import(cand, "match_query")
     if match_query:
         break
+
 if match_query is None:
+    st.error("Could not import match_query from semantic_router or core.semantic_router.")
     st.stop()
 
-# ---------- UI ----------
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
 st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
 st.title("Halo Quality — Chat")
 st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
 
+
+# -----------------------------
+# Load the data store (SAFE)
+# -----------------------------
+with st.spinner("Loading data store…"):
+    try:
+        # Preferred: pass the assumption for complaints month-only files
+        store = load_store(assume_year_for_complaints=2025)
+    except TypeError:
+        # Fallback: your current load_store doesn't accept the kwarg
+        store = load_store()
+
+# Sidebar data status
 with st.sidebar:
     st.subheader("Data status")
-
-# Load data (cache handled inside data_store)
-with st.spinner("Loading data store…"):
-    store = load_store(assume_year_for_complaints=2025)  # <— assume 2025 if only ‘Month’
-
-# Sidebar counts
-with st.sidebar:
     cases_rows = len(store.get("cases", pd.DataFrame()))
-    cmpl_rows = len(store.get("complaints", pd.DataFrame()))
+    compl_rows = len(store.get("complaints", pd.DataFrame()))
     fpa_rows = len(store.get("fpa", pd.DataFrame()))
     st.write(f"Cases rows: **{cases_rows:,}**")
-    st.write(f"Complaints rows: **{cmpl_rows:,}**")
+    st.write(f"Complaints rows: **{compl_rows:,}**")
     st.write(f"FPA rows: **{fpa_rows:,}**")
 
-# Quick chips
+
+# -----------------------------
+# Quick action chips
+# -----------------------------
 st.write("")
 cols = st.columns(3)
 with cols[0]:
@@ -81,27 +109,29 @@ with cols[2]:
         ),
     )
 
+
+# -----------------------------
+# Query input
+# -----------------------------
 query = st.text_input(
     "Type your question (e.g., 'complaints per 1000 by process last 3 months')",
     value=st.session_state.get("q", ""),
     key="q_input",
 )
 
+
+# -----------------------------
+# Runner for questions/<slug>.py
+# -----------------------------
 def _run_question(slug: str, params: dict, user_text: str):
     """
-    Dynamically import and execute a question in questions/<slug>.py
-    Returns (title, df, notes)
+    Imports questions/<slug>.py and calls its run(store, params, user_text)
+    Returns: (title, dataframe, notes[list[str]])
     """
-    mod = None
-    err = None
     try:
-        # NOTE: questions live in the root 'questions' directory
         mod = importlib.import_module(f"questions.{slug}")
     except Exception as e:
-        err = f"Could not import questions.{slug}: {e}"
-
-    if err:
-        return None, None, [err]
+        return None, None, [f"Could not import questions.{slug}: {e}"]
 
     try:
         return mod.run(store, params=params or {}, user_text=user_text)
@@ -109,9 +139,13 @@ def _run_question(slug: str, params: dict, user_text: str):
         tb = traceback.format_exc()
         return None, None, [f"{e}", tb]
 
-# Route + run
+
+# -----------------------------
+# Route & execute
+# -----------------------------
 if query:
     match = match_query(query)
+
     with st.expander("Parsed filters", expanded=False):
         st.json(match.params or {})
 
@@ -125,6 +159,7 @@ if query:
         title, df, notes = None, None, ["Sorry—couldn't understand that question."]
 
     st.subheader(title or "Result")
+
     if notes:
         for n in notes:
             st.info(n)
