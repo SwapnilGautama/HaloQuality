@@ -87,6 +87,20 @@ PORTFOLIO_ALIASES = {
     "london": "London",
 }
 
+# in the LEXICON for the rca question:
+"rca1_portfolio_process": [
+    "rca1 by portfolio for process * last * months",
+    "show rca1 by portfolio for process * last * months",
+    "top rca drivers by portfolio for * last * months",
+    ...
+],
+# and for unique cases:
+"unique_cases_mom": [
+    "unique cases by process and portfolio * to *",
+    "unique cases month over month * to *",
+    ...
+],
+
 
 # ---------- Date parsing utilities ----------
 
