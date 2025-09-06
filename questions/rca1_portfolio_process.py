@@ -1,91 +1,97 @@
 # questions/rca1_portfolio_process.py
 from __future__ import annotations
+
 import pandas as pd
 import streamlit as st
 
-from ._utils import pick_col, ensure_month_series, fuzzy_pick, available_values
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cl = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower()
+        if key in cl:
+            return cl[key]
+        for lc, original in cl.items():
+            if key == lc or key in lc:
+                return original
+    return None
 
-# column fallbacks for complaints data
-PROC_COLS = ["Process", "Process Name", "Primary Process"]
-PORT_COLS = ["Portfolio", "Portfolio Name", "LOB", "Business Unit"]
-DATE_COLS = ["month_dt", "Report Date", "Report_Date", "ReportDate",
-             "Date Complaint Received - DD/MM/YY"]
+def _ensure_month_col(df: pd.DataFrame, date_candidates: list[str]) -> str:
+    if "month_dt" in df.columns:
+        return "month_dt"
+    col = _find_col(df, date_candidates)
+    if not col:
+        raise ValueError(f"Could not find a date column among: {date_candidates}")
+    df["month_dt"] = pd.to_datetime(df[col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    return "month_dt"
 
-def run(store, relative_months: int = 3,
-        start_month: str | None = None,
-        end_month: str | None = None,
-        portfolio: str | None = None,
-        process: str | None = None,
-        user_text: str | None = None):
-    df = store["complaints"].copy()
+def run(store: dict, params: dict | None = None, args: dict | None = None, user_text: str = ""):
+    p = (params or args or {}).copy()
 
-    procc = pick_col(df, PROC_COLS)
-    portc = pick_col(df, PORT_COLS)
-    if procc is None or portc is None:
+    complaints = store.get("complaints")
+    if complaints is None:
+        st.error("Complaints data not loaded.")
+        return
+
+    # Columns
+    c_process   = _find_col(complaints, ["Process", "Process Name", "Department", "Function"])
+    c_portfolio = _find_col(complaints, ["Portfolio", "Product", "LOB", "Line of Business", "Account", "Brand"])
+    c_rca1      = _find_col(complaints, ["RCA1", "RCA 1", "Root Cause 1", "Primary Cause"])
+    month_col   = _ensure_month_col(complaints, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Complaint Date", "Created Date"])
+
+    if c_process is None or c_portfolio is None:
         st.warning("Required columns not found in complaints (need Process and Portfolio).")
         return
 
-    # normalize month series
-    month_s = ensure_month_series(df, DATE_COLS)
-    df["_month"] = month_s
+    if c_rca1 is None:
+        st.info("RCA labels not found. Please run the complaints labeller so 'RCA1' exists.")
+        return
 
-    # resolve time window
-    if end_month:
-        end = pd.to_datetime(end_month)  # yyyy-mm
-        end = pd.Timestamp(end.year, end.month, 1)
-    else:
-        end = df["_month"].max()
+    df = complaints.copy()
+    df[c_process]   = df[c_process].astype(str).str.strip()
+    df[c_portfolio] = df[c_portfolio].astype(str).str.strip()
+    df[c_rca1]      = df[c_rca1].astype(str).str.strip()
 
-    if start_month:
-        start = pd.to_datetime(start_month)
-        start = pd.Timestamp(start.year, start.month, 1)
-    else:
-        start = (end - pd.offsets.MonthBegin(relative_months-1))
+    # Filters
+    flt_process   = p.get("process")      # e.g., "Member Enquiry"
+    flt_portfolio = p.get("portfolio")
+    rel_months    = p.get("months") or p.get("relative_months") or 3  # default last 3
 
-    # apply time filter
-    df = df[(df["_month"] >= start) & (df["_month"] <= end)]
+    # Month range (last N months up to max available)
+    maxm = df[month_col].max()
+    if pd.isna(maxm):
+        st.info("No dates in complaints to calculate last months range.")
+        return
+    startm = (maxm.to_period("M") - (int(rel_months) - 1)).to_timestamp()
+    df = df[(df[month_col] >= startm) & (df[month_col] <= maxm)]
 
-    # fuzzy portfolio/process
-    avail = available_values(df, PROC_COLS, PORT_COLS, DATE_COLS)
+    if flt_process:
+        df = df[df[c_process].str.contains(str(flt_process), case=False, na=False)]
+    if flt_portfolio:
+        df = df[df[c_portfolio].str.contains(str(flt_portfolio), case=False, na=False)]
 
-    port_sel, port_score = (None, 0)
-    if portfolio and portfolio.lower() not in {"all", "for"}:
-        port_sel, port_score = fuzzy_pick(portfolio, avail["portfolios"], cutoff=75)
-
-    proc_sel, proc_score = (None, 0)
-    if process:
-        proc_sel, proc_score = fuzzy_pick(process, avail["processes"], cutoff=75)
-
-    if proc_sel:
-        df = df[df[procc] == proc_sel]
-    if port_sel:
-        df = df[df[portc] == port_sel]
-
-    st.caption(f"relative_months: {relative_months}")
-    st.caption(f"start_month: {start.date()} | end_month: {end.date()}")
-    st.caption(f"portfolio: {port_sel or 'All'} (match {port_score}%)")
-    st.caption(f"process: {proc_sel or 'All'} (match {proc_score}%)")
+    st.subheader(f"RCA1 by Portfolio × Process — last {int(rel_months)} months")
+    st.caption(f"start_month: {startm.date()} | end_month: {maxm.date()}")
 
     if df.empty:
-        st.info(
-            "No complaints after filters.\n\n"
-            f"Available months in window: "
-            f"{pd.Series(avail['months']).dt.strftime('%b %y').tolist()}\n\n"
-            f"Try one of these processes: {avail['processes'][:10]}\n"
-            f"and portfolios: {avail['portfolios'][:10]}"
-        )
+        st.info("No complaints for the current filters.")
         return
 
-    # RCA1: show top drivers by Portfolio x Process (count of complaints)
-    grp = (df.groupby([portc, procc])
-             .size()
-             .reset_index(name="count")
-             .sort_values("count", ascending=False))
+    # Aggregate: counts of RCA1; show table by Process × Portfolio
+    agg = (
+        df.groupby([c_process, c_portfolio])[c_rca1]
+        .count()
+        .reset_index(name="rca1_count")
+        .sort_values("rca1_count", ascending=False)
+    )
 
-    if grp.empty:
-        st.info("No grouped results.")
-        return
+    # Pivot for display
+    pivot = agg.pivot_table(
+        index=c_process,
+        columns=c_portfolio,
+        values="rca1_count",
+        aggfunc="sum",
+        fill_value=0,
+        dropna=False,
+    )
 
-    # simple pivot for readability
-    pivot = grp.pivot_table(index=portc, columns=procc, values="count", fill_value=0)
     st.dataframe(pivot, use_container_width=True)
