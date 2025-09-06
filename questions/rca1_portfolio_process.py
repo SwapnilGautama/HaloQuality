@@ -1,181 +1,91 @@
 # questions/rca1_portfolio_process.py
 from __future__ import annotations
-import re
-from typing import Iterable, Optional
 import pandas as pd
-import numpy as np
 import streamlit as st
 
+from ._utils import pick_col, ensure_month_series, fuzzy_pick, available_values
 
-def _canon(s: str) -> str:
-    """lower + strip non-alnum to match columns flexibly."""
-    return re.sub(r"[^a-z0-9]+", "", s.lower())
+# column fallbacks for complaints data
+PROC_COLS = ["Process", "Process Name", "Primary Process"]
+PORT_COLS = ["Portfolio", "Portfolio Name", "LOB", "Business Unit"]
+DATE_COLS = ["month_dt", "Report Date", "Report_Date", "ReportDate",
+             "Date Complaint Received - DD/MM/YY"]
 
+def run(store, relative_months: int = 3,
+        start_month: str | None = None,
+        end_month: str | None = None,
+        portfolio: str | None = None,
+        process: str | None = None,
+        user_text: str | None = None):
+    df = store["complaints"].copy()
 
-def _pick_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    canon_cols = {_canon(c): c for c in df.columns}
-    for want in candidates:
-        c = canon_cols.get(_canon(want))
-        if c:
-            return c
-    return None
-
-
-def _ensure_month_cols(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
-    dt = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
-    df = df.copy()
-    df["month_dt"] = dt.dt.to_period("M").dt.to_timestamp()
-    df["month_label"] = df["month_dt"].dt.strftime("%b %y")
-    return df
-
-
-def _extract_process(params: dict, user_text: Optional[str]) -> Optional[str]:
-    proc = None
-    if params:
-        # parser may have put it under 'process' or 'process_name'
-        proc = params.get("process") or params.get("process_name")
-    if not proc and user_text:
-        m = re.search(r"\bprocess\s+([A-Za-z0-9 &/_-]+?)(?:\slast|\sin\b|\sfor\b|$)", user_text, flags=re.I)
-        if m:
-            proc = m.group(1).strip()
-    return proc
-
-
-def run(store: dict, params: dict, user_text: Optional[str] = None):
-    """
-    Show RCA1 distribution by Portfolio for a given Process over the last 3 months.
-    Requires complaints to have an RCA1 column (from your complaints labeller).
-    """
-    if "complaints" not in store or store["complaints"] is None or len(store["complaints"]) == 0:
-        st.info("Complaints data not loaded.")
+    procc = pick_col(df, PROC_COLS)
+    portc = pick_col(df, PORT_COLS)
+    if procc is None or portc is None:
+        st.warning("Required columns not found in complaints (need Process and Portfolio).")
         return
 
-    df = store["complaints"]
+    # normalize month series
+    month_s = ensure_month_series(df, DATE_COLS)
+    df["_month"] = month_s
 
-    # --- flexible column picking ---
-    process_col = _pick_col(df, ["Process", "Process Name", "ProcessName", "Parent case type", "Parent_Case_Type"])
-    portfolio_col = _pick_col(df, ["Portfolio", "Portfolio_std", "Portfolio Name", "PortfolioName"])
-    date_col = _pick_col(
-        df,
-        [
-            "month_dt",  # already prepared
-            "Date Complaint Received - DD/MM/YY",
-            "Date Complaint Received",
-            "Report Date",
-            "Report_Date",
-            "Date",
-        ],
-    )
-    rca_col = _pick_col(df, ["RCA1", "rca1", "RCA_1"])
-
-    missing_bits = []
-    if not process_col:
-        missing_bits.append("Process")
-    if not portfolio_col:
-        missing_bits.append("Portfolio")
-    if not date_col:
-        missing_bits.append("a Date")
-    if missing_bits:
-        st.info(f"Required columns not found in complaints (need {', '.join(missing_bits)}).")
-        return
-
-    if not rca_col:
-        st.info("RCA labels not found. Please run the complaints labeller so 'RCA1' exists.")
-        return
-
-    # Standardise month fields
-    if _canon(date_col) != _canon("month_dt"):
-        df = _ensure_month_cols(df, date_col)
+    # resolve time window
+    if end_month:
+        end = pd.to_datetime(end_month)  # yyyy-mm
+        end = pd.Timestamp(end.year, end.month, 1)
     else:
-        # month_dt already present — also make label
-        out = df.copy()
-        if "month_label" not in out.columns:
-            out["month_label"] = out["month_dt"].dt.strftime("%b %y")
-        df = out
+        end = df["_month"].max()
 
-    # --- process selection ---
-    wanted_process = _extract_process(params, user_text)
-    if not wanted_process:
-        st.info("Please specify a process (e.g., *process Member Enquiry*).")
-        return
+    if start_month:
+        start = pd.to_datetime(start_month)
+        start = pd.Timestamp(start.year, start.month, 1)
+    else:
+        start = (end - pd.offsets.MonthBegin(relative_months-1))
 
-    # case-insensitive match on process
-    proc_l = wanted_process.lower().strip()
-    mask = df[process_col].astype(str).str.lower().str.strip() == proc_l
-    got = df.loc[mask].copy()
+    # apply time filter
+    df = df[(df["_month"] >= start) & (df["_month"] <= end)]
 
-    if got.empty:
-        st.info(f"No complaints for process **{wanted_process}**.")
-        return
+    # fuzzy portfolio/process
+    avail = available_values(df, PROC_COLS, PORT_COLS, DATE_COLS)
 
-    # last 3 months by month_dt
-    last3 = (
-        got[["month_dt"]]
-        .dropna()
-        .drop_duplicates()
-        .sort_values("month_dt")
-        .tail(3)
-        .squeeze()
-        .tolist()
-    )
-    if not last3:
-        st.info("No months available after date parsing.")
-        return
+    port_sel, port_score = (None, 0)
+    if portfolio and portfolio.lower() not in {"all", "for"}:
+        port_sel, port_score = fuzzy_pick(portfolio, avail["portfolios"], cutoff=75)
 
-    got = got[got["month_dt"].isin(last3)]
-    if got.empty:
-        st.info("No complaints in the last 3 months for the selected process.")
-        return
+    proc_sel, proc_score = (None, 0)
+    if process:
+        proc_sel, proc_score = fuzzy_pick(process, avail["processes"], cutoff=75)
 
-    # Group to shares by portfolio × RCA1
-    counts = (
-        got.groupby([portfolio_col, rca_col], dropna=False)
-        .size()
-        .rename("count")
-        .reset_index()
-    )
-    total_by_portfolio = counts.groupby(portfolio_col)["count"].transform("sum")
-    counts["share_%"] = (counts["count"] / total_by_portfolio * 100).round(1)
+    if proc_sel:
+        df = df[df[procc] == proc_sel]
+    if port_sel:
+        df = df[df[portc] == port_sel]
 
-    # Pivot for a clean table
-    table = (
-        counts.pivot(index=portfolio_col, columns=rca_col, values="share_%")
-        .fillna(0.0)
-        .sort_index()
-    )
-    table = table.reset_index().rename(columns={portfolio_col: "Portfolio"})
+    st.caption(f"relative_months: {relative_months}")
+    st.caption(f"start_month: {start.date()} | end_month: {end.date()}")
+    st.caption(f"portfolio: {port_sel or 'All'} (match {port_score}%)")
+    st.caption(f"process: {proc_sel or 'All'} (match {proc_score}%)")
 
-    st.subheader(f"RCA1 by Portfolio — **{wanted_process}** (last 3 months)")
-    st.dataframe(table, use_container_width=True)
-
-    # Simple stacked bar chart summary of top 6 portfolios
-    try:
-        import altair as alt
-
-        melted = counts.copy()
-        melted = melted.rename(columns={portfolio_col: "Portfolio", rca_col: "RCA1"})
-        # Keep top portfolios by total volume (over last 3 months)
-        top_ports = (
-            got.groupby(portfolio_col)
-            .size()
-            .sort_values(ascending=False)
-            .head(6)
-            .index
-            .tolist()
+    if df.empty:
+        st.info(
+            "No complaints after filters.\n\n"
+            f"Available months in window: "
+            f"{pd.Series(avail['months']).dt.strftime('%b %y').tolist()}\n\n"
+            f"Try one of these processes: {avail['processes'][:10]}\n"
+            f"and portfolios: {avail['portfolios'][:10]}"
         )
-        melted = melted[melted["Portfolio"].isin(top_ports)]
+        return
 
-        chart = (
-            alt.Chart(melted)
-            .mark_bar()
-            .encode(
-                x=alt.X("sum(share_%):Q", title="Share %"),
-                y=alt.Y("Portfolio:N", sort="-x"),
-                color=alt.Color("RCA1:N"),
-                tooltip=["Portfolio", "RCA1", "share_%"]
-            )
-        )
-        st.altair_chart(chart, use_container_width=True)
-    except Exception:
-        # Altair not mandatory
-        pass
+    # RCA1: show top drivers by Portfolio x Process (count of complaints)
+    grp = (df.groupby([portc, procc])
+             .size()
+             .reset_index(name="count")
+             .sort_values("count", ascending=False))
+
+    if grp.empty:
+        st.info("No grouped results.")
+        return
+
+    # simple pivot for readability
+    pivot = grp.pivot_table(index=portc, columns=procc, values="count", fill_value=0)
+    st.dataframe(pivot, use_container_width=True)
