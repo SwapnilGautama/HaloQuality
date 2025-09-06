@@ -1,127 +1,117 @@
 # questions/complaints_per_thousand.py
 from __future__ import annotations
+import re
 import pandas as pd
+from datetime import datetime
+from typing import Dict, Any, Tuple
 
-def _lower(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.strip().str.lower()
+def _to_month(dt_like) -> pd.Series:
+    return pd.to_datetime(dt_like, errors="coerce").dt.to_period("M").dt.to_timestamp()
 
-def _parse_month_range(params: dict) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """
-    Returns (start_month_dt, end_month_dt) inclusive (both month starts).
-    Accepts params like {'start_month': '2025-06-01', 'end_month': '2025-08-01'} or last_n_months.
-    """
-    start = params.get("start_month")
-    end = params.get("end_month")
-    if start and end:
-        s = pd.to_datetime(start, errors="coerce")
-        e = pd.to_datetime(end, errors="coerce")
-        # normalize to month-start
-        return s.to_period("M").to_timestamp(), e.to_period("M").to_timestamp()
-    # Fallback: last_n_months
-    n = params.get("last_n_months")
-    if n:
-        try:
-            n = int(n)
-        except Exception:
-            n = 3
-        e = pd.Timestamp.today().to_period("M").to_timestamp()
-        s = (e - pd.offsets.MonthBegin(n-1))
-        return s, e
-    return None, None
+def _proc_key(s: pd.Series) -> pd.Series:
+    # normalize process labels so complaints & cases match even if minor wording differs
+    x = s.astype(str).str.lower()
+    # remove punctuation -> spaces
+    x = x.str.replace(r"[^a-z0-9]+", " ", regex=True)
+    # common tidies (extend if needed)
+    x = x.str.replace(r"\b(enquiryqa|enquiry qa)\b", "enquiry", regex=True)
+    x = x.str.replace(r"\s+", " ", regex=True).str.strip()
+    return x
 
-def run(store: dict, params: dict, user_text: str):
-    """
-    Compute complaints per 1,000 cases by process for a portfolio over a month range.
-    - Cases date: Create Date (normalized to _month_dt)
-    - Complaints date: Date Complaint Received - DD/MM/YY -> _month_dt
-      or fallback 'Month' text -> assume year handled in data_store
-    - Join key: (process, portfolio, month) — no per-case ID join required
-    """
+def _window_from_params(params: Dict[str, Any], fallback_last_n=3) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
+    if "start_month" in params and "end_month" in params:
+        sm = pd.to_datetime(params["start_month"])  # normalized to YYYY-MM-01
+        em = pd.to_datetime(params["end_month"])
+        title = f"{sm.strftime('%b %Y')} to {em.strftime('%b %Y')}"
+        return sm, em, title
+    if "last_n_months" in params:
+        n = int(params["last_n_months"])
+        end = pd.Timestamp.today().to_period("M").to_timestamp()
+        start = (end.to_period("M") - n + 1).to_timestamp()
+        title = f"last {n} months"
+        return start, end, title
+    # default = last 3 months
+    end = pd.Timestamp.today().to_period("M").to_timestamp()
+    start = (end.to_period("M") - fallback_last_n + 1).to_timestamp()
+    title = "last 3 months"
+    return start, end, title
+
+def run(store: Dict[str, pd.DataFrame], params: Dict[str, Any] | None = None, user_text: str = ""):
+    params = params or {}
     cases = store.get("cases", pd.DataFrame()).copy()
-    cmpl = store.get("complaints", pd.DataFrame()).copy()
+    cmpl  = store.get("complaints", pd.DataFrame()).copy()
 
     notes = []
+    portfolio = (params.get("portfolio") or "all").strip().lower()
 
-    if cases.empty:
-        notes.append("Cases data is empty.")
-    if cmpl.empty:
-        notes.append("Complaints data is empty.")
+    # date window
+    start_m, end_m, range_title = _window_from_params(params)
 
-    # Portfolio from params or default to 'London'
-    portfolio = (params or {}).get("portfolio")
-    if not portfolio:
-        portfolio = "London"
-    portfolio_norm = str(portfolio).strip().lower()
+    # safety: required columns
+    need_cases = {"id", "portfolio", "process", "_month_dt"}
+    miss_cases = sorted(list(need_cases - set(cases.columns)))
+    if miss_cases:
+        return ("Complaints per 1,000 cases", pd.DataFrame(), [f"Missing columns in cases: {miss_cases}"])
 
-    # Month range
-    s_month, e_month = _parse_month_range(params or {})
-    if s_month is None or e_month is None:
-        # If not provided, try to infer from data: use min/max overlap
-        if cases["_month_dt"].notna().any() and cmpl["_month_dt"].notna().any():
-            s_month = max(cases["_month_dt"].min(), cmpl["_month_dt"].min())
-            e_month = min(cases["_month_dt"].max(), cmpl["_month_dt"].max())
-        else:
-            notes.append("Could not infer month range; please specify.")
-            s_month = None
-            e_month = None
+    need_cmpl = {"portfolio", "process", "_month_dt"}
+    miss_cmpl = sorted(list(need_cmpl - set(cmpl.columns)))
+    if miss_cmpl:
+        return ("Complaints per 1,000 cases", pd.DataFrame(), [f"Missing columns in complaints: {miss_cmpl}"])
 
-    title = f"Complaints per 1,000 cases"
-    if s_month is not None and e_month is not None:
-        title += f" — {portfolio} — {s_month.strftime('%b %Y')} to {e_month.strftime('%b %Y')}"
+    # normalize
+    cases["portfolio"] = cases["portfolio"].astype(str).str.strip().str.lower()
+    cmpl["portfolio"]  = cmpl["portfolio"].astype(str).str.strip().str.lower()
 
-    # Filter by portfolio + month range
-    if "portfolio" in cases:
-        cases["portfolio"] = _lower(cases["portfolio"])
-    if "portfolio" in cmpl:
-        cmpl["portfolio"] = _lower(cmpl["portfolio"])
+    cases["_month_dt"] = _to_month(cases["_month_dt"])
+    cmpl["_month_dt"]  = _to_month(cmpl["_month_dt"])
 
-    if s_month is not None and e_month is not None:
-        cases = cases[(cases["_month_dt"] >= s_month) & (cases["_month_dt"] <= e_month)]
-        cmpl = cmpl[(cmpl["_month_dt"] >= s_month) & (cmpl["_month_dt"] <= e_month)]
+    cases["proc_key"] = _proc_key(cases["process"])
+    cmpl["proc_key"]  = _proc_key(cmpl["process"])
 
-    cases = cases[cases["portfolio"] == portfolio_norm]
-    cmpl = cmpl[cmpl["portfolio"] == portfolio_norm]
+    # filter by portfolio (if supplied)
+    if portfolio != "all":
+        cases = cases[cases["portfolio"] == portfolio]
+        cmpl  = cmpl[cmpl["portfolio"] == portfolio]
 
-    # Sanity messages
-    if cases.empty or cmpl.empty:
+    # filter by month window
+    cases = cases[(cases["_month_dt"] >= start_m) & (cases["_month_dt"] <= end_m)]
+    cmpl  = cmpl[(cmpl["_month_dt"] >= start_m) & (cmpl["_month_dt"] <= end_m)]
+
+    # diagnostics
+    notes.append(
+        f"Filtered cases rows: {len(cases)} | complaints rows: {len(cmpl)} "
+        f"| months: {start_m.strftime('%b %Y')} → {end_m.strftime('%b %Y')} | portfolio: {portfolio}"
+    )
+    if len(cases):
+        topc = cases["proc_key"].value_counts().head(5).to_dict()
+        notes.append(f"Top case processes (normalized): {topc}")
+    if len(cmpl):
+        topm = cmpl["proc_key"].value_counts().head(5).to_dict()
+        notes.append(f"Top complaint processes (normalized): {topm}")
+
+    # aggregate
+    den = (cases.groupby(["proc_key", "_month_dt"], dropna=False)["id"]
+                 .count()
+                 .rename("cases")
+                 .reset_index())
+    num = (cmpl.groupby(["proc_key", "_month_dt"], dropna=False)
+                .size()
+                .rename("complaints")
+                .reset_index())
+
+    out = pd.merge(num, den, on=["proc_key", "_month_dt"], how="outer")
+    out["cases"] = out["cases"].fillna(0).astype("Int64")
+    out["complaints"] = out["complaints"].fillna(0).astype("Int64")
+    out["per_1000"] = (out["complaints"] / out["cases"].replace({0: pd.NA})) * 1000
+
+    # if absolutely no overlap on (proc_key, month), warn explicitly
+    if out[["complaints", "cases"]].sum(numeric_only=True).sum() == 0:
         notes.append("No overlapping data for cases and complaints.")
-        return title, pd.DataFrame(), notes
+        return (f"Complaints per 1,000 cases — {portfolio.title()} — {range_title}", pd.DataFrame(), notes)
 
-    # Group by process + month
-    if "process" not in cases or "process" not in cmpl:
-        notes.append("Missing process columns (cases['process'] or complaints['process']).")
-        return title, pd.DataFrame(), notes
+    # prettier columns
+    out = out.sort_values(["_month_dt", "proc_key"])
+    out = out.rename(columns={"proc_key": "process_key", "_month_dt": "month"})
 
-    cases_g = (
-        cases
-        .dropna(subset=["process", "_month_dt"])
-        .groupby(["process", "_month_dt"], as_index=False)
-        .agg(cases=("id", "count"))
-    )
-
-    cmpl_g = (
-        cmpl
-        .dropna(subset=["process", "_month_dt"])
-        .groupby(["process", "_month_dt"], as_index=False)
-        .agg(complaints=("process", "count"))
-    )
-
-    out = pd.merge(
-        cases_g,
-        cmpl_g,
-        on=["process", "_month_dt"],
-        how="outer",
-        validate="one_to_one"
-    ).fillna({"cases": 0, "complaints": 0})
-
-    # Per-1000
-    out["per_1000"] = out.apply(
-        lambda r: (r["complaints"] * 1000.0 / r["cases"]) if r["cases"] else 0.0,
-        axis=1
-    )
-
-    # Friendly month label
-    out["month"] = out["_month_dt"].dt.strftime("%b %y")
-    out = out[["month", "process", "cases", "complaints", "per_1000"]].sort_values(["month", "process"]).reset_index(drop=True)
-
+    title = f"Complaints per 1,000 cases — {portfolio.title()} — {range_title}"
     return title, out, notes
