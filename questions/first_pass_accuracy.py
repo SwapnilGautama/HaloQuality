@@ -1,196 +1,297 @@
 # -*- coding: utf-8 -*-
 # questions/first_pass_accuracy.py
-#
-# Renders First Pass Accuracy analysis (Jan-2025 .. latest).
-# - Loads the *real* file from data/first_pass_accuracy/
-#   by globbing for "FirstPassAccuracy*.*" (apostrophes OK)
-# - Fast via st.cache_data
-# - Charts are clean (no gridlines / y-axis)
-# - Robust column handling
-#
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict
+
+import re
+from io import BytesIO
+from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 
-# ---------- file discovery ----------
-def _find_fpa_workbook(root: Path) -> Path:
-    folder = root / "data" / "first_pass_accuracy"
-    if not folder.exists():
-        raise FileNotFoundError(f"Folder missing: {folder}")
+# -------------------------------------------------------------------
+# Config / constants
+# -------------------------------------------------------------------
 
-    # Prefer "FirstPassAccuracy*.*"
-    cand = sorted(folder.glob("FirstPassAccuracy*.*"),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
-    if not cand:
-        # Fallback to any .xlsx
-        cand = sorted(folder.glob("*.xlsx"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-
-    if not cand:
-        raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.*).")
-
-    return cand[0]
-
-# ---------- load & prepare ----------
-@st.cache_data(show_spinner=False)
-def _load_fpa(root: Path) -> pd.DataFrame:
-    f = _find_fpa_workbook(root)
-    df = pd.read_excel(f, engine="openpyxl")
-
-    # case-insensitive mapping
-    cols = {c.lower().strip(): c for c in df.columns}
-
-    def _col(*cands: str) -> str:
-        for c in cands:
-            key = c.lower().strip()
-            if key in cols:
-                return cols[key]
-        raise KeyError(f"Missing required column; tried {cands}")
-
-    col_date     = _col("Activity Date", "Activity_Date", "ActivityDate", "Date")
-    col_result   = _col("Review Result", "Result", "Review_Result")
-    col_comment  = _col("Case Comment", "Comment", "Case_Comment")
-    col_portfolio= _col("Portfolio", "portfolio")
-    col_scheme   = _col("Scheme", "scheme", "Scheme Name")
-
-    df["_date"] = pd.to_datetime(df[col_date], errors="coerce")
-    df = df[~df["_date"].isna()].copy()
-    df["_ym"]  = df["_date"].dt.to_period("M").astype(str)  # YYYY-MM
-
-    rr = df[col_result].astype(str).str.strip().str.lower()
-    df["_pass"] = rr.isin(["pass", "passed", "p", "ok", "correct"])
-
-    keep = [col_portfolio, col_scheme, col_comment, "_date", "_ym", "_pass"]
-    return df[keep].rename(columns={
-        col_portfolio: "portfolio",
-        col_scheme:    "scheme",
-        col_comment:   "comment",
-    })
-
-# ---------- reason buckets (expanded) ----------
-_PATTERNS = [
-    ("Incorrect form",       ["incorrect form","incomplete","missing field","signature","form"]),
-    ("Bank / payment",       ["bank","bacs","payment","standing order","account","sort code"]),
-    ("Waiting on member/TPA",["await","waiting","member reply","chaser","tpa reply","response"]),
-    ("Manual calculation",   ["manual calc","calculation","calc error","recalc"]),
-    ("Postal delay",         ["post","postal","mail","royal mail"]),
-    ("Data entry error",     ["data entry","keying","typo","transposed"]),
-    ("System",               ["system","it issue","workflow","bug","outage","latency"]),
+# Data locations we auto-discover (kept as in your working version)
+CANDIDATE_FPA_PATHS = [
+    # your canonical folder
+    "data/first_pass_accuracy/FirstPassAccuracy_Aug25.xlsx",
+    # older / alternate names people have uploaded
+    "data/first_pass_accuracy/FirstPassAccuracy_Aug'25.xlsx",
+    "data/first_pass_accuracy/FirstPassAccuracy_Aug’25.xlsx",
+    "data/first_pass_accuracy/FirstPassAccuracy.xlsx",
 ]
 
-def _label_reason(series: pd.Series) -> pd.Series:
-    text = series.fillna("").astype(str).str.lower()
-    out  = pd.Series(np.full(len(text), "Other"), index=text.index)
-    for bucket, kws in _PATTERNS:
-        hit = False
-        for kw in kws:
-            hit = hit | text.str.contains(rf"\b{pd.re.escape(kw)}\b", regex=True)
-        out[hit] = bucket
-    return out
+MONTH_FMT = "%b-%y"  # MMM-YY on charts
 
-# ---------- chart helpers ----------
-def _clean_axis(ax: plt.Axes):
-    ax.grid(False)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_visible(False)
-    ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=False))
-    ax.set_yticklabels([])          # hide y labels
-    ax.tick_params(axis="y", left=False)
+# Reason patterns (RCA for fails) – extend freely
+REASON_KEYWORDS: Dict[str, List[str]] = {
+    "Document missing": [
+        "missing form", "missing document", "doc missing", "no form", "incomplete form",
+        "unsent form", "not received form", "id missing", "proof missing"
+    ],
+    "Data entry / setup": [
+        "data entry", "keying error", "typo", "miskey", "wrong field", "wrong entry",
+        "incorrect entry", "set up", "setup", "set-up", "scheme setup", "pension set up"
+    ],
+    "Bank / payment": [
+        "bank", "sort code", "account number", "payment", "bacs", "returned payment",
+        "cheque", "check", "bank detail"
+    ],
+    "Waiting on member/TPA": [
+        "waiting on member", "awaiting member", "waiting on tpa", "awaiting tpa",
+        "chaser sent", "member yet to respond", "no response", "awaiting documents"
+    ],
+    "Postal / dispatch": [
+        "post", "postal", "dispatch", "sent by mail", "royal mail", "courier", "returned mail"
+    ],
+    "Manual calculation": [
+        "manual calc", "manual calculation", "calc error", "recalc", "re-calculation"
+    ],
+    "Trustee / AVC": [
+        "trustee", "avc", "additional voluntary contribution"
+    ],
+    "System": [
+        "system", "workflow", "it issue", "technical issue", "system error", "system down"
+    ],
+}
 
-# ---------- view ----------
-def run(store: Dict, params: Dict, q: str):
-    # tolerate store without 'root'
-    root = Path(store["root"]) if isinstance(store, dict) and "root" in store else Path(".").resolve()
-    df = _load_fpa(root)
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 
-    # Months Jan-2025 to latest (show 0 for gaps)
-    start  = pd.Period("2025-01", freq="M")
-    end    = pd.Period(df["_ym"].max(), freq="M")
-    months = pd.period_range(start, end, freq="M").astype(str)
+def _find_workbook() -> Optional[str]:
+    """Return the first existing workbook path from known candidates."""
+    for p in CANDIDATE_FPA_PATHS:
+        try:
+            with open(p, "rb"):
+                return p
+        except Exception:
+            continue
+    return None
 
-    mon = (df.groupby("_ym")["_pass"].mean() * 100.0).round(1)
-    mon = mon.reindex(months, fill_value=0.0)
 
-    st.header(f"First-Pass Accuracy — Jan–{pd.to_datetime(end.start_time).strftime('%b %y')}")
+def _load_data(path: str) -> pd.DataFrame:
+    """
+    Expected columns:
+      - 'Activity Date' (date)
+      - 'Review Result' ('Pass'/'Fail' or similar)
+      - 'Portfolio'
+      - 'Scheme'
+      - 'Case Comment'  (free text, optional)
+    """
+    df = pd.read_excel(path, engine="openpyxl")
+    # Normalise column names (case-insensitive)
+    cols = {c: c.strip() for c in df.columns}
+    df.rename(columns=cols, inplace=True)
 
-    # MoM line
-    left, right = st.columns([1.15, 1])
-    with left:
-        fig, ax = plt.subplots(figsize=(7.5, 2.5))
-        ax.plot(pd.to_datetime(mon.index), mon.values, marker="o", linewidth=2.0, color="#5B8DEF")
-        _clean_axis(ax)
-        ax.axhline(0, color="#E5E7EB", linewidth=1.2)
-        ax.set_xticks(pd.to_datetime(mon.index))
-        ax.set_xticklabels([pd.to_datetime(x).strftime("%b-%y") for x in mon.index], rotation=0)
-        ax.set_title("Pass % — MoM", loc="left")
-        for x, y in zip(pd.to_datetime(mon.index), mon.values):
-            ax.text(x, y + 1.5, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color="#374151")
-        st.pyplot(fig, use_container_width=True)
+    # Be tolerant to various spellings
+    col_date = next((c for c in df.columns if c.lower().startswith("activity date")), None)
+    col_result = next((c for c in df.columns if "review" in c.lower() and "result" in c.lower()), None)
+    col_portfolio = next((c for c in df.columns if c.lower() == "portfolio"), None)
+    col_scheme = next((c for c in df.columns if c.lower() == "scheme"), None)
+    col_comment = next((c for c in df.columns if "comment" in c.lower()), None)
 
-    # Pass % by portfolio × scheme (latest month)
-    with right:
-        latest = months[-1]
-        df_latest = df[df["_ym"] == latest].copy()
-        if df_latest.empty:
-            st.info("No rows for the latest month in this file.")
-        else:
-            grp = df_latest.groupby(["portfolio", "scheme"])["_pass"].mean().mul(100).round(1)
-            tbl = (grp.reset_index()
-                      .sort_values(["portfolio", "_pass"], ascending=[True, False])
-                      .rename(columns={"_pass": "pass_%"}))
-            st.subheader(f"Pass % by Portfolio × Scheme — {pd.to_datetime(latest+'-01').strftime('%b-%y')}")
-            st.dataframe(tbl, hide_index=True, use_container_width=True)
+    if not all([col_date, col_result]):
+        raise ValueError("Required columns missing (need at least 'Activity Date' and 'Review Result').")
 
-    st.divider()
+    # Keep known columns only
+    keep = [col_date, col_result, col_portfolio, col_scheme, col_comment]
+    df = df[[c for c in keep if c is not None]].copy()
 
-    # RCA1 Pareto (latest month) + RCA2 (top 80%)
-    left, right = st.columns([1.05, 1])
+    df[col_date] = pd.to_datetime(df[col_date], errors="coerce")
+    df["month"] = df[col_date].dt.to_period("M").dt.to_timestamp()
 
-    df_latest = df[df["_ym"] == months[-1]].copy()
-    reasons   = _label_reason(df_latest["comment"])
-    rc1       = (reasons.value_counts().sort_values(ascending=False)).rename("count")
-    if rc1.empty:
-        st.info("No fails detected for the latest month.")
+    # Normalize result
+    df["result"] = df[col_result].astype(str).str.strip().str.lower()
+    df["is_pass"] = df["result"].isin(["pass", "passed", "p", "true", "1", "yes"])
+
+    # Friendly names
+    if col_portfolio:
+        df.rename(columns={col_portfolio: "portfolio"}, inplace=True)
+    else:
+        df["portfolio"] = "(Unknown)"
+
+    if col_scheme:
+        df.rename(columns={col_scheme: "scheme"}, inplace=True)
+    else:
+        df["scheme"] = "(Unknown)"
+
+    if col_comment:
+        df.rename(columns={col_comment: "comment"}, inplace=True)
+    else:
+        df["comment"] = ""
+
+    # Filter sensible window: Jan-2025 -> latest (keeps your requirement)
+    df = df[df["month"] >= pd.Timestamp("2025-01-01")]
+    return df
+
+
+def _pass_mom(df: pd.DataFrame) -> pd.DataFrame:
+    by_m = df.groupby("month", dropna=False).agg(
+        total=("is_pass", "size"),
+        passed=("is_pass", "sum"),
+    )
+    by_m["pass_pct"] = np.where(by_m["total"] > 0, by_m["passed"] / by_m["total"] * 100.0, 0.0)
+    # Ensure all months Jan..latest exist
+    idx = pd.period_range(by_m.index.min(), by_m.index.max(), freq="M").to_timestamp()
+    by_m = by_m.reindex(idx, fill_value=0)
+    by_m["label"] = by_m.index.strftime(MONTH_FMT)
+    return by_m.reset_index(drop=True)
+
+
+def _build_reason_patterns(keywords_map: Dict[str, List[str]]) -> Dict[str, str]:
+    """
+    Build case-insensitive regex patterns with word boundaries for each reason.
+    """
+    pats: Dict[str, str] = {}
+    for reason, kws in keywords_map.items():
+        kws = [k.strip() for k in kws if k and isinstance(k, str)]
+        if not kws:
+            continue
+        # Escape each kw, then join with alternation. Use word boundaries.
+        escaped = [re.escape(k) for k in kws]
+        pats[reason] = r"(?i)\b(?:%s)\b" % "|".join(escaped)
+    return pats
+
+
+def _label_reason(series_comment: pd.Series) -> pd.DataFrame:
+    """
+    Vectorised classification of fail reasons on the *latest month* comments.
+    Returns a summary table with count/percent/cum_percent.
+    """
+    s = series_comment.fillna("").astype(str).str.strip().str.lower()
+
+    patterns = _build_reason_patterns(REASON_KEYWORDS)
+
+    # Start with 'Other', then override when a reason matches (first-hit wins in the declared order)
+    labels = pd.Series("Other", index=s.index)
+
+    for reason, pat in patterns.items():
+        hit = s.str.contains(pat, regex=True, na=False)
+        labels = np.where((labels == "Other") & (hit), reason, labels)
+
+    # Summary
+    total = max(len(labels), 1)
+    summary = (
+        pd.Series(labels, name="reason")
+        .value_counts(dropna=False)
+        .sort_values(ascending=False)
+        .rename_axis("reason")
+        .reset_index(name="count")
+    )
+    summary["percent"] = (summary["count"] / total * 100.0).round(1)
+    summary["cum_percent"] = summary["percent"].cumsum().round(1)
+
+    # Keep only top 80% (like your complaints flow)
+    summary = summary[summary["cum_percent"] <= 80.0].reset_index(drop=True)
+    if summary.empty:
+        # fall back to top 10 if cumulative cut-off excludes all
+        summary = (
+            pd.Series(labels, name="reason")
+            .value_counts(dropna=False)
+            .head(10)
+            .rename_axis("reason")
+            .reset_index(name="count")
+        )
+        summary["percent"] = (summary["count"] / total * 100.0).round(1)
+        summary["cum_percent"] = summary["percent"].cumsum().round(1)
+
+    return summary
+
+
+# -------------------------------------------------------------------
+# Streamlit render
+# -------------------------------------------------------------------
+
+def run(store: Dict, params: Dict, q: str) -> None:
+    """
+    Render First Pass Accuracy analysis (Jan-25 -> latest).
+    """
+    # Load workbook
+    path = _find_workbook()
+    if not path:
+        st.error("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
         return
 
-    pareto = rc1.copy()
-    cum    = pareto.cumsum() / pareto.sum() * 100.0
+    df = _load_data(path)
 
-    with left:
-        fig, ax = plt.subplots(figsize=(7.5, 3.2))
-        bars = ax.bar(pareto.index, pareto.values,
-                      color=["#9ECBF7", "#90D494", "#C1C1C1", "#F6B98A", "#B9B9DF", "#E5A3A3", "#C9F0FF"])
-        _clean_axis(ax)
-        ax.set_xticklabels(pareto.index, rotation=90)
-        ax.axhline(0, color="#E5E7EB", linewidth=1.2)
-        ax.set_title(f"RCA1 — {pd.to_datetime(months[-1]+'-01').strftime('%b %Y')} (Pareto)", loc="left")
+    st.markdown("### First-Pass Accuracy — Jan–{}"
+                .format(df["month"].max().strftime("%b %y")))
 
-        # cumulative %
-        ax2 = ax.twinx()
-        ax2.plot(range(len(cum)), cum.values, marker="o", linewidth=2, color="#5B8DEF")
-        ax2.set_ylim(0, 105)
-        ax2.set_yticklabels([])
-        ax2.grid(False)
-        ax2.spines["top"].set_visible(False)
-        ax2.spines["right"].set_visible(False)
-        for i, (b, cp) in enumerate(zip(bars, cum.values)):
-            ax2.text(i, cp + 2, f"{cp:.0f}%", ha="center", va="bottom", fontsize=9, color="#374151")
-        st.pyplot(fig, use_container_width=True)
+    # Pass% MoM (Jan..latest)
+    by_m = _pass_mom(df)
 
-    with right:
-        rc2 = (reasons.value_counts(normalize=False)
-                        .rename_axis("RCA2")
-                        .reset_index(name="count"))
-        rc2["percent"]     = (rc2["count"] / rc2["count"].sum() * 100).round(1)
-        rc2["cum_percent"] = rc2["percent"].cumsum().round(1)
-        rc2 = rc2[rc2["cum_percent"] <= 80.0].copy()
-        st.subheader(f"RCA2 — Top 80% ({pd.to_datetime(months[-1]+'-01').strftime('%b %Y')})")
-        st.dataframe(rc2, hide_index=True, use_container_width=True)
+    c1, c2 = st.columns([2, 2], gap="large")
 
-    return "ok", None
+    with c1:
+        st.caption("Pass % — MoM")
+        fig, ax = plt.subplots(figsize=(6.8, 3.0), dpi=110)
+        ax.plot(by_m["label"], by_m["pass_pct"], marker="o", linewidth=2.5)
+        for x, y in zip(by_m["label"], by_m["pass_pct"]):
+            ax.text(x, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9)
+        # Aesthetics as requested: soft x-axis, no grid, no y-axis
+        ax.grid(False)
+        ax.set_yticks([])
+        ax.spines["left"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["bottom"].set_color("#D0D0D0")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        plt.xticks(rotation=0)
+        st.pyplot(fig, clear_figure=True)
+
+    # Pass % by portfolio × scheme for the latest month
+    latest_m = df["month"].max()
+    df_latest = df[df["month"] == latest_m].copy()
+    g = df_latest.groupby(["portfolio", "scheme"], dropna=False).agg(
+        total=("is_pass", "size"),
+        passed=("is_pass", "sum"),
+    ).reset_index()
+    g["pass_%"] = np.where(g["total"] > 0, g["passed"] / g["total"] * 100.0, 0.0).round(0)
+    g = g.sort_values(["portfolio", "scheme"]).rename(columns={"pass_%": "pass_%"})
+
+    with c2:
+        st.caption(f"Pass % by Portfolio × Scheme — {latest_m.strftime('%b-%y')}")
+        st.dataframe(
+            g[["portfolio", "scheme", "pass_%"]],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+
+    # Fail reasons (latest month only, top 80%)
+    st.caption(f"Reasons for Fail — {latest_m.strftime('%b %Y')} (counts)")
+    fails = df_latest[~df_latest["is_pass"]].copy()
+
+    if fails.empty:
+        st.info("No fail cases found in the latest month.")
+        return
+
+    summary = _label_reason(fails["comment"])
+
+    # Chart
+    fig2, ax2 = plt.subplots(figsize=(6.8, 3.0), dpi=110)
+    ax2.bar(summary["reason"], summary["count"])
+    # Aesthetics
+    ax2.grid(False)
+    ax2.set_yticks([])
+    ax2.spines["left"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["bottom"].set_color("#D0D0D0")
+    plt.xticks(rotation=90)
+    ax2.set_xlabel("")
+    ax2.set_ylabel("")
+    for i, v in enumerate(summary["count"].tolist()):
+        ax2.text(i, v + max(summary["count"].max() * 0.02, 0.5), str(v), ha="center", va="bottom", fontsize=9)
+    st.pyplot(fig2, clear_figure=True)
+
+    # Table
+    st.caption("Reason breakdown (top 80%) — {}".format(latest_m.strftime("%b-%y")))
+    st.dataframe(summary, hide_index=True, use_container_width=True)
