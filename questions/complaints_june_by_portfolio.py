@@ -39,7 +39,20 @@ def _header(title: str) -> None:
         unsafe_allow_html=True,
     )
 
-def _style_table(df: pd.DataFrame, formats: Dict[str, str] | None = None) -> "pd.io.formats.style.Styler":
+def _hide_index(sty: "pd.io.formats.style.Styler") -> "pd.io.formats.style.Styler":
+    """Hide index for both pandas<2.0 and >=2.0."""
+    try:
+        return sty.hide(axis="index")
+    except Exception:
+        try:
+            return sty.hide_index()
+        except Exception:
+            return sty
+
+def _style_table(
+    df: pd.DataFrame,
+    formats: Dict[str, str] | None = None,
+) -> "pd.io.formats.style.Styler":
     sty = (
         df.style
         .set_table_styles(
@@ -50,6 +63,7 @@ def _style_table(df: pd.DataFrame, formats: Dict[str, str] | None = None) -> "pd
         )
         .set_properties(**{"color": _DARK_GREY})
     )
+    sty = _hide_index(sty)  # <- remove serial/index column
     if formats:
         sty = sty.format(formats)
     else:
@@ -354,10 +368,12 @@ def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.Dat
     out["complaints"] = out["complaints"].fillna(0).astype(int)
     with np.errstate(divide="ignore", invalid="ignore"):
         out["per_1000"] = (out["complaints"] * 1000 / out["cases"]).replace([np.inf, -np.inf], np.nan)
-    out["per_1000"] = out["per_1000"].round(3)
+    out["per_1000"] = out["per_1000"].round(1)  # <- single decimal
 
     out = out.sort_values(["complaints", "portfolio"], ascending=[False, True], kind="stable").reset_index(drop=True)
     out = _add_total_row(out, sum_cols=["cases", "complaints"], label_col="portfolio", label="Total")
+    # ensure per_1000 rounded after total
+    out["per_1000"] = out["per_1000"].round(1)
     return out
 
 
@@ -374,8 +390,7 @@ def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     want = [f"2025-{i:02d}" for i in range(1, 7)]
     cases_m = cases.loc[cases["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
     comp_m = comp.loc[comp["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
-    per_1000 = (comp_m * 1000 / cases_m.replace(0, np.nan)).fillna(0.0).round(2)
-    # pretty month labels MMM-YY
+    per_1000 = (comp_m * 1000 / cases_m.replace(0, np.nan)).fillna(0.0).round(1)  # <- single decimal
     pretty = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in want]
     return pd.DataFrame({"month": pretty, "per_1000": per_1000.values})
 
@@ -415,8 +430,7 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
     total = max(1, r2_counts["count"].sum())
     r2_counts["percent"] = (r2_counts["count"] * 100 / total)
     r2_counts["cum_percent"] = r2_counts["percent"].cumsum()
-    # one decimal for presentation
-    r2_counts["percent"] = r2_counts["percent"].round(1)
+    r2_counts["percent"] = r2_counts["percent"].round(1)       # one decimal
     r2_counts["cum_percent"] = r2_counts["cum_percent"].round(1)
     r2 = r2_counts.loc[r2_counts["cum_percent"] <= 80.0].reset_index(drop=True)
 
@@ -431,7 +445,7 @@ def _plot_mom_line(df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(6.0, 3.2))
     ax.plot(df["month"], df["per_1000"], marker="o", linewidth=2.5, color="#9ecae1")
     for x, y in zip(df["month"], df["per_1000"]):
-        ax.text(x, y + 0.03, f"{y:.2f}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+        ax.text(x, y + 0.03, f"{y:.1f}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)  # <- 1 decimal label
     ax.set_title("Complaints per 1,000 — MoM (Jan–Jun ’25)", pad=8, color=_DARK_BLUE)
     ax.set_ylim(bottom=0)
     # soften axes
@@ -449,7 +463,8 @@ def _plot_mom_line(df: pd.DataFrame):
 def _plot_rca1_pareto(df: pd.DataFrame):
     """
     Pareto chart: bars (descending counts) + cumulative percentage line.
-    Vertical x labels, no border (only soft bottom axis), pastel cumulative line.
+    Vertical x labels, no frame (only soft bottom axis), pastel cumulative line,
+    and **no visible secondary y-axis**.
     """
     data = df.copy()
     data = data.sort_values("count", ascending=False).reset_index(drop=True)
@@ -467,7 +482,7 @@ def _plot_rca1_pareto(df: pd.DataFrame):
 
     ax.set_title("RCA1 — June 2025 (Pareto)", pad=8, color=_DARK_BLUE)
 
-    # right-hand cumulative % line
+    # cumulative % line on hidden secondary axis
     ax2 = ax.twinx()
     ax2.plot(
         data["RCA1"],
@@ -491,12 +506,13 @@ def _plot_rca1_pareto(df: pd.DataFrame):
     ax.tick_params(axis="x", colors=_DARK_GREY)
     plt.setp(ax.get_xticklabels(), rotation=90, ha="center")
 
-    # right axis: hide frame as well, keep ticks 0-100
+    # hide secondary y-axis completely
     for sp in ["top", "right", "left", "bottom"]:
         ax2.spines[sp].set_visible(False)
     ax2.set_ylim(0, 100)
-    ax2.set_ylabel("")  # clean
-    ax2.tick_params(axis="y", colors=_DARK_GREY)
+    ax2.set_ylabel("")
+    ax2.tick_params(axis="y", length=0)  # remove ticks
+    ax2.get_yaxis().set_visible(False)   # <- no secondary y-axis visible
     ax2.grid(False)
 
     st.pyplot(fig)
@@ -511,14 +527,13 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     Row 1: Portfolio table + MoM line
     Row 2: RCA1 Pareto (left) + RCA2 Top-80 table (right)
     """
-    # Hide host “Parsed filters” + info bars + the left sidebar
+    # Hide host “Parsed filters”, info bars, and the left sidebar
     st.markdown(
         """
         <style>
         div[data-testid="stExpander"] {display: none;}
         div[data-testid="stAlert"] {display: none;}
         div[data-testid="stSidebar"] {display: none;}
-        /* widen main area when sidebar hidden */
         section[data-testid="stMain"] {padding-left: 1rem; padding-right: 1rem;}
         </style>
         """,
@@ -541,7 +556,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.dataframe(
                 _style_table(
                     table,
-                    formats={"per_1000": "{:.3f}", "cases": "{:,.0f}", "complaints": "{:,.0f}"},
+                    formats={"per_1000": "{:.1f}", "cases": "{:,.0f}", "complaints": "{:,.0f}"},  # <- 1 decimal
                 ),
                 use_container_width=True,
             )
@@ -549,7 +564,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not mom.empty:
             _plot_mom_line(mom)
 
-    # ----- Row 2 (RCA1 Pareto LEFT, RCA2 table RIGHT) -----
+    # ----- Row 2 -----
     use_ai = bool(os.getenv("OPENAI_API_KEY"))
     rca2, rca1 = _rca_tables_for_june(comp, use_ai=use_ai)
 
@@ -565,7 +580,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.dataframe(
                 _style_table(
                     rca2.rename(columns={"RCA2": "RCA2"}),
-                    formats={"count": "{:,.0f}", "percent": "{:.1f}", "cum_percent": "{:.1f}"},
+                    formats={"count": "{:,.0f}", "percent": "{:.1f}", "cum_percent": "{:.1f}"},  # <- 1 decimal
                 ),
                 use_container_width=True,
             )
