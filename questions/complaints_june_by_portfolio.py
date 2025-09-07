@@ -16,9 +16,7 @@ import matplotlib.pyplot as plt
 # -------------------------------
 _OPENAI_READY = False
 try:
-    # Prefer the classic API since it's widely available across deployments
     import openai  # type: ignore
-
     if os.getenv("OPENAI_API_KEY"):
         openai.api_key = os.getenv("OPENAI_API_KEY")
         _OPENAI_READY = True
@@ -45,13 +43,8 @@ def _find_first_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
 
 
 def _norm_month_from_series(s: pd.Series) -> pd.Series:
-    """
-    Return a series of 'YYYY-MM' (string) months from any date-ish column.
-    Accepts datetime, string, period; coerces errors to NaT.
-    """
     if pd.api.types.is_period_dtype(s):
         return s.astype(str)
-
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=False)
     return dt.dt.to_period("M").astype(str)
 
@@ -71,8 +64,45 @@ def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label=
 # RCA mappings (keyword fallback)
 # -------------------------------
 
-def _classify(text: str, patterns: Dict[str, List[str]], default: str) -> str:
+def _preclean(text: str) -> str:
+    """Light normalisation + common abbreviations to words to improve matching."""
     t = (text or "").lower()
+
+    # normalise separators
+    t = re.sub(r"[_/\\\-]+", " ", t)
+    t = re.sub(r"[^a-z0-9 %]", " ", t)  # keep main chars
+
+    # expand really common short forms / acronyms
+    replacements = {
+        r"\bbacs\b": " bank payment ",
+        r"\bchaps\b": " bank payment ",
+        r"\bdd\b": " direct debit ",
+        r"\bsoa\b": " statement of account ",
+        r"\btpa\b": " third party ",
+        r"\bifa\b": " third party ",
+        r"\bpoa\b": " power of attorney ",
+        r"\baddr\b": " address ",
+        r"\bni\b": " national insurance ",
+        r"\bsort\b": " sort code ",
+        r"\bacc\b": " account ",
+        r"\brecalc(ulate|ulation|)\b": " recalculation ",
+        r"\bcalc(ulate|ulation|)\b": " calculation ",
+        r"\bresp\b": " response ",
+        r"\bsig(n|)\b": " sign ",
+        r"\bid\b": " identification ",
+        r"\bkyc\b": " identification ",
+        r"\bcof\b": " change of fund ",
+    }
+    for pat, repl in replacements.items():
+        t = re.sub(pat, repl, t)
+
+    # compact spaces
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _classify(text: str, patterns: Dict[str, List[str]], default: str) -> str:
+    t = _preclean(text)
     for label, pats in patterns.items():
         for p in pats:
             if re.search(p, t):
@@ -84,16 +114,17 @@ def _rca1_keyword(text: str) -> str:
     patterns = {
         "Delay": [
             r"\bdelay(ed|s|ing)?\b", r"\btimes? ?scale\b", r"\bsla\b", r"\bbacklog\b",
-            r"\bqueue\b", r"\boverdue\b", r"\bawait(ing)?\b", r"\bchase|chaser|chasing\b",
+            r"\bqueue\b", r"\boverdue\b", r"\bawait(ing)?\b", r"\bchase(r|s|d|)?\b",
         ],
         "Procedure": [
             r"\bscheme rules?\b", r"\bprocedure\b", r"\bprocess\b",
             r"\btemplate\b", r"\bform\b", r"\bconsent form\b",
-            r"\bdocumentation (missing|not provided)\b", r"\bevidence\b",
+            r"\bdocument(ation)? (missing|not provided|not received)\b",
+            r"\bevidence (missing|not provided|not received)\b",
         ],
         "Communication": [
             r"\bcommunicat(e|ion|ions)\b", r"\bemail\b", r"\bletter\b",
-            r"\bphone|call\b", r"\bupdate\b", r"\b(not|no) response\b",
+            r"\bphone|call\b", r"\bupdate\b", r"\bno (reply|response)\b",
             r"\bunclear\b", r"\bmis-?communicat",
         ],
         "System": [
@@ -103,31 +134,63 @@ def _rca1_keyword(text: str) -> str:
         "Incorrect/Incomplete information": [
             r"\bincorrect\b", r"\bwrong\b", r"\bincomplete\b", r"\berror\b",
             r"\bmis-?key(ed)?\b", r"\btypo\b", r"\bmisallocat(ed|ion)\b",
-            r"\baddress\b", r"\bbank\b", r"\bdob\b", r"\bni number\b",
+            r"\baddress\b", r"\bbank\b", r"\bdob\b", r"\bnational insurance\b", r"\bsort code\b", r"\baccount\b",
         ],
     }
     return _classify(text, patterns, default="Other")
 
 
 def _rca2_keyword(text: str) -> str:
+    """Deeper / actionable categories (improved). Ordered by specificity."""
     patterns = {
-        "Manual calculation": [r"\bmanual calculat", r"\bre-?calculat"],
-        "Documentation missing": [r"\bdocument(s|ation)? (missing|not (provided|received))\b",
-                                  r"\bevidence (missing|not provided)\b"],
-        "Template/Form issue": [r"\bwrong form\b", r"\bincorrect form\b", r"\btemplate\b", r"\bform( not|) complete"],
-        "Data entry error": [r"\bmis-?key", r"\bkeying error\b", r"\btypo\b", r"\bduplicate( case|)\b", r"\bwrong entry\b"],
-        "Waiting on member/TPA": [r"\bawait(ing)?\b", r"\bchase|chaser|chasing\b", r"\bno response\b"],
-        "Bank/Payment issue": [r"\bbank\b", r"\bbacs\b", r"\bpayment\b", r"\brefund\b"],
-        "Address/Contact incorrect": [r"\baddress\b", r"\bcontact details?\b"],
+        # data/calculation
+        "Manual calculation": [r"\bmanual calculat", r"\bre-?calculat", r"\brecalculation\b"],
+        "Data entry error": [
+            r"\bmis-?key", r"\bkey(ing|ed) error\b", r"\btypo\b", r"\bwrong (amount|date|address|bank|ni|nino)\b",
+            r"\bincorrect (amount|date|address|bank|ni|nino)\b", r"\bduplicate( case|)\b",
+        ],
+
+        # documentation / forms
+        "Documentation missing": [
+            r"\bdocument(ation)? (missing|not provided|not received)\b",
+            r"\bevidence (missing|not provided|not received)\b",
+            r"\b(ids?|passport|birth|marriage|death) (cert|certificate)\b",
+            r"\bproof (of )?(address|id|identity)\b",
+        ],
+        "Template/Form issue": [
+            r"\bwrong form\b", r"\bincorrect form\b", r"\btemplate\b",
+            r"\bform (not|in) (complete|completed|signed)\b", r"\bmissing signature\b", r"\bunsigned\b",
+            r"\bcheckbox|tick box\b",
+        ],
+
+        # waiting / chasing
+        "Waiting on member/TPA": [
+            r"\bawait(ing)?\b", r"\bchase(r|s|d|ing)?\b", r"\bno (reply|response)\b",
+            r"\bthird party\b", r"\bifa\b", r"\binsurer\b",
+        ],
+
+        # payments
+        "Bank/Payment issue": [
+            r"\bbank\b", r"\b(bank )?payment\b", r"\brefund\b", r"\breturned\b",
+            r"\bbounced\b", r"\bchaps\b", r"\bbacs\b", r"\bcheque\b", r"\baccount\b", r"\bsort code\b",
+        ],
+        "Overpayment": [r"\boverpayment\b"],
+
+        # addresses / contact
+        "Address/Contact incorrect": [
+            r"\baddress (wrong|incorrect|incomplete|change|updated?)\b",
+            r"\bcontact (details|number|email) (wrong|incorrect|missing|change|updated?)\b",
+        ],
+
+        # processing specifics
         "Pension set up": [r"\b(pension|record) set ?up\b", r"\bsetup\b"],
         "Postal delay": [r"\bpost(al)?\b", r"\bmail\b"],
         "AVC": [r"\bavc\b"],
         "Case not created": [r"\bcase not created\b", r"\bnot created\b", r"\bnot raised\b"],
         "2nd review / QA": [r"\b(second|2nd) review\b", r"\bqa\b"],
         "Trustee": [r"\btrustee\b"],
-        "Death benefits payout": [r"\bdeath benefit", r"\bbeneficiar(y|ies)"],
-        "Overpayment": [r"\boverpayment\b"],
-        "Drop in value / factor change": [r"\bfactor change\b", r"\bdrop in value\b", r"\bmarket\b"],
+        "Death benefits payout": [r"\bdeath benefit", r"\bbeneficiar(y|ies)\b"],
+        "Drop in value / factor change": [r"\bfactor change\b", r"\bdrop in value\b", r"\bmarket\b", r"\bunit price\b"],
         "Scheme rules": [r"\bscheme rules?\b", r"\blegislation\b"],
         "Communication unclear": [r"\black of clarity\b", r"\bnot clear\b", r"\bconfus"],
     }
@@ -147,7 +210,6 @@ _RCA1_ALLOWED = [
     "Other",
 ]
 
-# Make RCA2 granular, but still human-readable and stable:
 _RCA2_ALLOWED = [
     "Manual calculation",
     "Documentation missing",
@@ -172,15 +234,9 @@ _RCA2_ALLOWED = [
 
 
 def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
-    """
-    Returns list of (rca1, rca2) for each text using OpenAI if available.
-    Falls back to keyword labels on any error.
-    """
     if not _OPENAI_READY:
         return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
-
     try:
-        # We prompt for JSON array of {"rca1": "...", "rca2": "..."} items
         prompt = (
             "You are classifying complaint root causes. "
             "For each 'Brief Description – RCA done by admin', return a JSON array of objects "
@@ -191,22 +247,18 @@ def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
             "Descriptions:\n"
             + "\n".join([f"- {t}" for t in texts])
         )
-
         resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",  # economical + reasoning
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You output concise JSON only."},
+                {"role": "system", "content": "Return only valid JSON."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
         )
-
         content = resp["choices"][0]["message"]["content"]
-        # very defensive parse
         out = []
         try:
             data = pd.read_json(content)
-            # If it's a dict, wrap; else expect list-like
             if isinstance(data, pd.DataFrame):
                 for _, row in data.iterrows():
                     r1 = row.get("rca1", "Other")
@@ -216,14 +268,10 @@ def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
                     out.append((r1, r2))
         except Exception:
             out = []
-
         if len(out) != len(texts):
-            # fallback if sizes mismatched
             return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
         return out
-
     except Exception:
-        # fallback on any API error
         return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
 
 
@@ -231,7 +279,7 @@ def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
 # field detection
 # -------------------------------
 
-def _detect_cases_fields(cases: pd.DataFrame) -> Tuple[str | None, str | None, str | None]:
+def _detect_cases_fields(cases: pd.DataFrame):
     id_col = _find_first_col(cases, ["Case ID", "CaseId", "ID"])
     port_col = _find_first_col(cases, ["Portfolio", "portfolio"])
     date_col = _find_first_col(
@@ -240,12 +288,11 @@ def _detect_cases_fields(cases: pd.DataFrame) -> Tuple[str | None, str | None, s
     return id_col, port_col, date_col
 
 
-def _detect_complaints_fields(comp: pd.DataFrame) -> Tuple[str | None, str | None, str | None]:
+def _detect_complaints_fields(comp: pd.DataFrame):
     id_col = _find_first_col(comp, ["Original Process Affected Case ID", "Case ID", "Parent Case ID"])
     port_col = _find_first_col(comp, ["Portfolio", "portfolio"])
     date_col = _find_first_col(
-        comp,
-        [
+        comp, [
             "Date Complaint Received - DD/MM/YY",
             "Date Complaint Received",
             "Complaint Date",
@@ -259,10 +306,8 @@ def _detect_complaints_fields(comp: pd.DataFrame) -> Tuple[str | None, str | Non
 def _build_month_column(df: pd.DataFrame, raw_col: str, assume_year: int | None = None) -> pd.Series:
     s = df[raw_col]
     m = _norm_month_from_series(s)
-    # if parse gave enough signal, keep
     if m.notna().sum() >= max(1, int(0.1 * len(m))):
         return m
-    # month-name fallback
     if assume_year is not None:
         try:
             coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", format="%B %Y", errors="coerce")
@@ -341,15 +386,12 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
     comp = comp.copy()
     comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
     june = comp.loc[comp["_month"] == "2025-06", [desc_col]].fillna("")
-
     texts = june[desc_col].astype(str).tolist()
 
-    # AI labelling if allowed and available, else keyword fallback
+    # AI or keyword
     if use_ai and _OPENAI_READY and len(texts) > 0:
-        # batch in chunks (safety)
-        r1_labels: List[str] = []
-        r2_labels: List[str] = []
-        batch = 80  # conservative
+        r1_labels, r2_labels = [], []
+        batch = 80
         for i in range(0, len(texts), batch):
             chunk = texts[i:i+batch]
             pairs = _ai_label_batch(chunk)
@@ -359,18 +401,21 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
         r1_labels = [_rca1_keyword(t) for t in texts]
         r2_labels = [_rca2_keyword(t) for t in texts]
 
-    # RCA1 counts for bar chart (ordered)
+    # RCA1 chart (ordered)
     r1 = pd.Series(r1_labels).value_counts(dropna=False).rename_axis("RCA1").reset_index(name="count")
     desired = ["Delay", "Procedure", "Communication", "System", "Incorrect/Incomplete information", "Other"]
     r1["order"] = r1["RCA1"].apply(lambda x: desired.index(x) if x in desired else len(desired))
     r1 = r1.sort_values(["order", "RCA1"]).drop(columns="order").reset_index(drop=True)
 
-    # RCA2 top 80%
-    r2 = pd.Series(r2_labels).value_counts(dropna=False).rename_axis("RCA2").reset_index(name="count")
-    total = max(1, r2["count"].sum())
-    r2["percent"] = (r2["count"] * 100 / total).round(2)
-    r2["cum_percent"] = r2["percent"].cumsum()
-    r2 = r2.loc[r2["cum_percent"] <= 80.0].reset_index(drop=True)
+    # RCA2 Top 80% (non-Other first so we surface actionable items)
+    r2_counts = pd.Series(r2_labels).value_counts(dropna=False).rename_axis("RCA2").reset_index(name="count")
+    r2_counts["order"] = np.where(r2_counts["RCA2"].eq("Other"), 1, 0)
+    r2_counts = r2_counts.sort_values(["order", "count"], ascending=[True, False]).drop(columns="order").reset_index(drop=True)
+
+    total = max(1, r2_counts["count"].sum())
+    r2_counts["percent"] = (r2_counts["count"] * 100 / total).round(2)
+    r2_counts["cum_percent"] = r2_counts["percent"].cumsum()
+    r2 = r2_counts.loc[r2_counts["cum_percent"] <= 80.0].reset_index(drop=True)
 
     return r2, r1
 
@@ -412,12 +457,9 @@ def _plot_rca1_bars(df: pd.DataFrame):
 
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     """
-    Render:
-      Row 1: Portfolio table (Total on top) + Jan–Jun line
-      Row 2: RCA2 Top-80 table + RCA1 bar chart
-
-    Return a blank slug and empty dataframe to stop host app
-    from rendering a duplicate third table.
+    Row 1: Portfolio table + MoM line
+    Row 2: RCA2 Top-80 + RCA1 bar
+    Returns ("", empty_df) so the app does not render a duplicate table.
     """
     cases: pd.DataFrame = store.get("cases", pd.DataFrame()).copy()
     comp: pd.DataFrame = store.get("complaints", pd.DataFrame()).copy()
@@ -454,6 +496,5 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not rca1.empty:
             _plot_rca1_bars(rca1)
 
-    # IMPORTANT: prevent host app from rendering a duplicate row
-    # by returning an empty dataframe and blank slug.
+    # prevent host app duplicate table
     return ("", pd.DataFrame())
