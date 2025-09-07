@@ -15,9 +15,12 @@ import streamlit as st
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
+
+# Optional: pastel line for MoM already exists in your app; bar color uses mpl defaults
+# Pareto / line accents if you later want to style further
 _PARETO = "#6ab6e1"
 
-# Optional: OpenAI to tighten 'Other' classification. Falls back to keyword rules.
+# Optional OpenAI assist to reduce "Other" (falls back to pure rules if no key)
 _OPENAI = False
 try:
     import openai  # type: ignore
@@ -116,15 +119,16 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
         cases="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
     ).reset_index()
     grp["pass_%"] = (grp["passed"] * 100.0 / grp["cases"]).round(0)
-    return grp[["portfolio", "scheme", "cases", "pass_%"]].sort_values(["portfolio", "pass_%", "scheme"], ascending=[True, False, True])
+    return grp[["portfolio", "scheme", "cases", "pass_%"]].sort_values(
+        ["portfolio", "pass_%", "scheme"], ascending=[True, False, True]
+    )
 
 
 # ---------------------------
 # Fail reason classification (IMPROVED)
 # ---------------------------
 
-# Expanded rulebook (synonyms + common phrases).
-# Order matters: earlier categories are preferred when multiple match.
+# Expanded, ordered rulebook — earlier matches take precedence
 _RULES = {
     "Bank / payment": [
         r"\b(bank|payment|refund|bacs|chaps|cheque|sort\s*code|iban|bic|account|transfer|credit|debit)\b",
@@ -166,12 +170,10 @@ _RULES = {
     ],
 }
 
-# Precompile patterns once for speed
 _COMPILED = [(label, [re.compile(p, re.I) for p in pats]) for label, pats in _RULES.items()]
 
 def _clean_text(t: str) -> str:
     t = str(t or "").lower()
-    # normalize separators and remove noise
     t = re.sub(r"[_/\\\-]+", " ", t)
     t = re.sub(r"[^a-z0-9\s]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
@@ -187,14 +189,13 @@ def _label_reason_rules(text: str) -> str:
 
 def _ai_label_many(texts: List[str]) -> List[str]:
     """
-    If OPENAI_API_KEY is present, ask the model to choose one label per item
-    from the RULES (+ 'Other'). We still post-validate each suggestion with
-    the rule engine to avoid 'creative' answers.
+    If OPENAI_API_KEY is available, ask the model to label items using our allowed set.
+    We still validate each suggestion against the rulebook to avoid creative answers.
     """
     if not _OPENAI or not texts:
         return [_label_reason_rules(t) for t in texts]
 
-    labels = [_label_reason_rules(t) for t in texts]  # sensible fallback defaults
+    labels = [_label_reason_rules(t) for t in texts]  # default fallback
     try:
         allowed = list(_RULES.keys()) + ["Other"]
         sys_msg = "You classify complaint review comments. Only return valid JSON array of labels."
@@ -215,14 +216,12 @@ def _ai_label_many(texts: List[str]) -> List[str]:
         raw = resp["choices"][0]["message"]["content"]
         ai = json.loads(raw)
         if isinstance(ai, list) and len(ai) == len(texts[:len(ai)]):
-            # post-validate each model label through our rulebook
             out = []
             for t, lab in zip(texts, ai):
                 lab = str(lab).strip()
                 if lab not in allowed:
                     lab = _label_reason_rules(t)
                 out.append(lab)
-            # if we truncated bullets, fill the remainder via rules
             if len(out) < len(texts):
                 out.extend(_label_reason_rules(t) for t in texts[len(out):])
             labels = out
@@ -245,15 +244,17 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
 
     texts = fails["comment"].astype(str).fillna("").tolist()
 
-    # 1) Try AI (if available), otherwise rules. We always normalize through rules.
+    # 1) AI (optional) then rulebook; force all labels through rule validation
     ai_labels = _ai_label_many(texts)
-    labels = [lab if lab in _RULES or lab == "Other" else _label_reason_rules(t)
-              for t, lab in zip(texts, ai_labels)]
+    labels = [
+        lab if lab in _RULES or lab == "Other" else _label_reason_rules(t)
+        for t, lab in zip(texts, ai_labels)
+    ]
 
     s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
 
-    # 2) Pareto: top 80% + Other (merge any existing 'Other' with the tail to avoid duplicates)
+    # 2) Pareto: Top 80% + Other (merge any pre-existing 'Other' into tail first)
     total = int(s["count"].sum()) or 1
     s["percent"] = (s["count"] * 100.0 / total)
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
@@ -262,7 +263,7 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     head = s[s["cum_percent"] <= 80.0].copy()
     tail = s[s["cum_percent"] > 80.0].copy()
 
-    # If a pre-labelled "Other" sits in head, peel it out to the tail to avoid it blocking signal.
+    # keep genuine categories in head; push any 'Other' to tail so it doesn't block signal
     if not head.empty and (head["reason"] == "Other").any():
         move = head[head["reason"] == "Other"]
         head = head[head["reason"] != "Other"]
@@ -276,9 +277,7 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
             "cum_percent": 100.0
         }])
         head = pd.concat([head, other_row], ignore_index=True)
-    else:
-        # When 100% lies in <=80%, we still leave as-is (no forced Other)
-        pass
+    # else: 100% already in <=80% bucket set; leave as-is
 
     head["percent"] = head["percent"].round(1)
     head["cum_percent"] = head["cum_percent"].round(1)
@@ -343,14 +342,21 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
-        st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).strftime('%b %y')}"))
+        # safer: Period -> Timestamp for formatting
+        st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
     with c2:
-        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Pass % by Portfolio × Scheme — {pd.Period(latest).strftime('%b-%y')}</h4>", unsafe_allow_html=True)
+        st.markdown(
+            f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>"
+            f"Pass % by Portfolio × Scheme — {pd.Period(latest).to_timestamp().strftime('%b-%y')}"
+            f"</h4>", unsafe_allow_html=True)
         if not table.empty:
             st.dataframe(table, use_container_width=True)
 
     reasons, lastp = _reasons_latest(df_raw)
-    st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).strftime('%b-%y')}</h4>", unsafe_allow_html=True)
+    st.markdown(
+        f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
+        f"Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}"
+        f"</h4>", unsafe_allow_html=True)
     r1, r2 = st.columns(2, gap="large")
     with r1:
         if not reasons.empty:
