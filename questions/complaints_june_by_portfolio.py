@@ -2,30 +2,36 @@
 # questions/complaints_june_by_portfolio.py
 from __future__ import annotations
 
-from typing import Optional, Dict, Tuple, Iterable
 import re
+from typing import Optional, Dict, Tuple, Iterable, List
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Column discovery helpers (robust to naming drift)
+# Utilities: robust column finding and normalization
 # ────────────────────────────────────────────────────────────────────────────────
 def _first_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    lc = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in lc:
-            return lc[c.lower()]
+    """Return the first present column among candidates (case-insensitive)."""
+    lower_to_actual = {c.lower(): c for c in df.columns}
+    for name in candidates:
+        if name.lower() in lower_to_actual:
+            return lower_to_actual[name.lower()]
     return None
 
+
 def _ensure_portfolio_series(s: pd.Series) -> pd.Series:
+    """Normalize portfolio series to strings with Unknown for blanks."""
     return (
         s.astype(str)
         .str.strip()
         .replace({"nan": np.nan, "": np.nan})
         .fillna("Unknown")
     )
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Month parsing (cases)
@@ -40,6 +46,7 @@ def _month_from_cases(df: pd.DataFrame) -> pd.Series:
 
     dt = pd.to_datetime(df[dcol], errors="coerce", dayfirst=True)
     return dt.dt.to_period("M")
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Month parsing (complaints)
@@ -58,6 +65,7 @@ def _month_from_complaints(df: pd.DataFrame) -> pd.Series:
         dt = pd.to_datetime(df[dcol], errors="coerce", dayfirst=True)
         return dt.dt.to_period("M")
 
+    # Fallback: a Month column (e.g., "June") -> assume 2025
     mcol = _first_col(df, ["Month"])
     if mcol is not None:
         raw = df[mcol].astype(str).str.strip()
@@ -65,7 +73,6 @@ def _month_from_complaints(df: pd.DataFrame) -> pd.Series:
         def _to_period(x: str) -> Optional[pd.Period]:
             if not x or x.lower() == "nan":
                 return pd.NaT
-            # Month word only -> assume 2025
             if re.fullmatch(r"[A-Za-z]{3,9}", x):
                 dt = pd.to_datetime(f"1 {x} 2025", errors="coerce", dayfirst=True)
                 return dt.to_period("M") if pd.notna(dt) else pd.NaT
@@ -76,11 +83,12 @@ def _month_from_complaints(df: pd.DataFrame) -> pd.Series:
 
     return pd.Series(pd.PeriodIndex([], freq="M"), index=df.index)
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# RCA bucketing
+# RCA mapping from "Brief Description - RCA done by admin"
 # ────────────────────────────────────────────────────────────────────────────────
 def _reason_rca2_map(text: str) -> str:
-    """Map 'Brief Description - RCA done by admin' into RCA2 buckets."""
+    """Map the free text into more concrete RCA2 buckets."""
     if not isinstance(text, str) or not text.strip():
         return "Other"
     t = text.lower()
@@ -125,8 +133,9 @@ def _reason_rca2_map(text: str) -> str:
 
     return "Other"
 
+
 def _rca1_from(rca2: str, text: Optional[str]) -> str:
-    """Consolidate to RCA1: Delay, Procedure, Communication, System, Incorrect/Incomplete info, Other."""
+    """Consolidate to RCA1 (Delay, Procedure, Communication, System, Incorrect/Incomplete info, Other)."""
     r = (rca2 or "").lower()
     t = (text or "").lower()
 
@@ -145,65 +154,68 @@ def _rca1_from(rca2: str, text: Optional[str]) -> str:
         "pension increase",
         "overpayment",
         "death benefits payout",
-        "drop in value"
+        "drop in value",
     ]):
         return "Procedure"
     return "Other"
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Aesthetics
+# Simple aesthetics helpers for the charts
 # ────────────────────────────────────────────────────────────────────────────────
-def _soft_line(ax):
+def _soft_axis(ax):
     for s in ["top", "right", "left", "bottom"]:
         ax.spines[s].set_visible(False)
     ax.grid(False)
     ax.set_ylabel("")
     ax.set_yticks([])
 
-def _pastel_colors(n: int) -> list[str]:
+
+def _pastel_colors(n: int) -> List[str]:
     palette = ["#8ecae6", "#bde0fe", "#cdeac0", "#ffd6a5", "#fbc4ab", "#cdb4db", "#b9fbc0"]
     return [palette[i % len(palette)] for i in range(n)]
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Main question
+# Main entry
 # ────────────────────────────────────────────────────────────────────────────────
 def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -> Tuple[str, pd.DataFrame]:
     params = params or {}
     june25 = pd.Period("2025-06", freq="M")
 
-    # Load
+    # Load data safely
     cases = getattr(store, "cases", None) or getattr(store, "raw_cases", None) or store.get("cases")
     complaints = getattr(store, "complaints", None) or getattr(store, "raw_complaints", None) or store.get("complaints")
     if cases is None or complaints is None:
         st.error("Missing data. Need both cases and complaints.")
         return "complaints_june_by_portfolio", pd.DataFrame()
 
-    # Case columns
-    case_id_col = _first_col(cases, ["Case ID", "id", "Original Process Affected Case ID"])
-    portfolio_cases_col = _first_col(cases, ["Portfolio", "Portfolio Name"])
-
     cases = cases.copy()
+    complaints = complaints.copy()
+
+    # --- Cases setup
+    case_id_col = _first_col(cases, ["Case ID", "id", "Original Process Affected Case ID"])
+    pf_cases_col = _first_col(cases, ["Portfolio", "Portfolio Name"])
     if case_id_col is None:
         cases["_cid"] = np.arange(len(cases))
         case_id_col = "_cid"
     cases["_month"] = _month_from_cases(cases)
     cases["_portfolio"] = _ensure_portfolio_series(
-        cases[portfolio_cases_col] if portfolio_cases_col else pd.Series("Unknown", index=cases.index)
+        cases[pf_cases_col] if pf_cases_col else pd.Series("Unknown", index=cases.index)
     )
 
-    # Complaint columns
+    # --- Complaints setup
     compl_case_id_col = _first_col(complaints, ["Original Process Affected Case ID", "Case ID", "id"])
-    portfolio_compl_col = _first_col(complaints, ["Portfolio", "Portfolio Name"])
+    pf_compl_col = _first_col(complaints, ["Portfolio", "Portfolio Name"])
     rca_text_col = _first_col(
         complaints,
         ["Brief Description - RCA done by admin", "RCA2", "RCA 2", "RCA", "RCA1", "Complaint Reason"],
     )
 
-    complaints = complaints.copy()
     complaints["_month"] = _month_from_complaints(complaints)
 
-    if portfolio_compl_col is None and compl_case_id_col and case_id_col:
-        # stitch portfolio from cases
+    # stitch portfolio if needed
+    if pf_compl_col is None and compl_case_id_col and case_id_col:
         tmp = complaints[[compl_case_id_col]].merge(
             cases[[case_id_col, "_portfolio"]],
             left_on=compl_case_id_col,
@@ -213,16 +225,17 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
         complaints["_portfolio"] = _ensure_portfolio_series(tmp["_portfolio"])
     else:
         complaints["_portfolio"] = _ensure_portfolio_series(
-            complaints[portfolio_compl_col] if portfolio_compl_col else pd.Series("Unknown", index=complaints.index)
+            complaints[pf_compl_col] if pf_compl_col else pd.Series("Unknown", index=complaints.index)
         )
 
-    # RCA2 + RCA1
+    # RCA2 and RCA1
     complaints["_rca2"] = complaints[rca_text_col].map(_reason_rca2_map) if rca_text_col else "Other"
     complaints["_rca1"] = complaints.apply(
-        lambda r: _rca1_from(r["_rca2"], r.get(rca_text_col) if rca_text_col else ""), axis=1
+        lambda r: _rca1_from(r["_rca2"], r.get(rca_text_col) if rca_text_col else ""),
+        axis=1,
     )
 
-    # ── Portfolio table (June) ──────────────────────────────────────────────────
+    # ── Portfolio table for June ────────────────────────────────────────────────
     cases_jun = cases.loc[cases["_month"] == june25]
     compl_jun = complaints.loc[complaints["_month"] == june25]
 
@@ -235,25 +248,20 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
     table["per_1000"] = np.where(table["cases"] > 0, table["complaints"] / (table["cases"] / 1000.0), np.nan)
     table = table.reset_index().rename(columns={"_portfolio": "portfolio"}).sort_values("portfolio")
 
+    total_cases = int(table["cases"].sum())
+    total_compl = int(table["complaints"].sum())
+    overall_per1000 = total_compl / (total_cases / 1000.0) if total_cases else np.nan
+    # top row (Total) + detail
     total_row = pd.DataFrame(
-        {
-            "portfolio": ["Total"],
-            "cases": [int(table["cases"].sum())],
-            "complaints": [int(table["complaints"].sum())],
-            "per_1000": [
-                table["complaints"].sum() / (table["cases"].sum() / 1000.0) if table["cases"].sum() else np.nan
-            ],
-        }
+        {"portfolio": ["Total"], "cases": [total_cases], "complaints": [total_compl], "per_1000": [overall_per1000]}
     )
     table_display = pd.concat([total_row, table], ignore_index=True)
 
     st.markdown("### Complaint analysis — Jun 2025 (by portfolio)")
-    st.caption(
-        f"Total: cases={int(table['cases'].sum()):,}, complaints={int(table['complaints'].sum()):,}, "
-        f"per_1000={table_display.loc[0, 'per_1000']:.3f if pd.notna(table_display.loc[0, 'per_1000']) else '–'}"
-    )
+    per1000_txt = f"{overall_per1000:.3f}" if pd.notna(overall_per1000) else "–"
+    st.caption(f"Total: cases={total_cases:,}, complaints={total_compl:,}, per_1000={per1000_txt}")
 
-    # ── Row 1: table + MoM line ────────────────────────────────────────────────
+    # ── Row 1: table + MoM line (Jan–Jun 2025) ─────────────────────────────────
     c1, c2 = st.columns([1.1, 1.2], gap="large")
     with c1:
         st.dataframe(table_display, use_container_width=True)
@@ -278,12 +286,12 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
             solid_capstyle="round",
             antialiased=True,
         )
-        # labels
+        # value labels
         offset = (max(per1000_m) * 0.04) if max(per1000_m) > 0 else 0.1
         for i, y in enumerate(per1000_m):
             ax.text(i, y + offset, f"{y:.2f}", ha="center", va="bottom", fontsize=9)
 
-        _soft_line(ax)
+        _soft_axis(ax)
         ax.set_xticks(range(len(months_2025)))
         ax.set_xticklabels(xlabels)
         ax.set_title("Complaints per 1,000 — Jan–Jun 2025", fontsize=11)
@@ -291,10 +299,10 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
 
     st.markdown("---")
 
-    # ── Row 2: RCA2 table + RCA1 bar ───────────────────────────────────────────
+    # ── Row 2: RCA2 Top-80 table + RCA1 bar ───────────────────────────────────
     c3, c4 = st.columns([1.0, 1.2], gap="large")
 
-    # RCA2 (Top 80%)
+    # RCA2 Top 80%
     reasons2 = (
         compl_jun["_rca2"]
         .value_counts(dropna=False)
@@ -316,6 +324,7 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
         else:
             st.dataframe(top80, use_container_width=True)
 
+    # RCA1 bar
     with c4:
         st.markdown("### RCA1 — June 2025")
         reasons1 = (
@@ -325,7 +334,6 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
             .to_frame("count")
             .reset_index()
         )
-        # Order by count desc, keep canonical names if present
         order = ["Delay", "Procedure", "Communication", "System", "Incorrect/Incomplete information", "Other"]
         cat = pd.Categorical(reasons1["rca1"], categories=order, ordered=True)
         reasons1 = reasons1.assign(rca1=cat).sort_values(["rca1", "count"], ascending=[True, False])
@@ -336,12 +344,18 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
         bars = ax2.bar(reasons1["rca1"].astype(str), reasons1["count"], color=cols, edgecolor="none")
         for b in bars:
             h = b.get_height()
-            ax2.text(b.get_x() + b.get_width() / 2, h + (max(reasons1["count"]) * 0.03 if len(reasons1) else 0.1),
-                     f"{int(h)}", ha="center", va="bottom", fontsize=9)
-        _soft_line(ax2)
+            ax2.text(
+                b.get_x() + b.get_width() / 2,
+                h + (max(reasons1["count"]) * 0.03 if len(reasons1) else 0.1),
+                f"{int(h)}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+        _soft_axis(ax2)
         ax2.set_xticklabels(reasons1["rca1"].astype(str), rotation=0, ha="center")
         ax2.set_title("June reasons (RCA1)", fontsize=11)
         st.pyplot(fig2, use_container_width=True)
 
-    # IMPORTANT: return empty df so no extra table is rendered by the host app
+    # Return empty DF so the host app doesn't render an extra table.
     return "complaints_june_by_portfolio", pd.DataFrame()
