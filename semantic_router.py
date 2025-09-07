@@ -1,71 +1,67 @@
 # semantic_router.py
 from __future__ import annotations
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Any, Optional
+
 import pandas as pd
 
-# --- helpers ---------------------------------------------------------------
 
-_MONTH_RE = re.compile(
-    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\-\/]*(\d{2,4})?",
-    re.I,
-)
-
-def _month_key_from_text(text: str) -> Tuple[str, str]:
+def _to_month_key(text: str) -> Optional[str]:
     """
-    Returns (month_key, month_label)
-    month_key -> 'YYYY-MM' (e.g., '2025-06')
-    month_label -> 'June 2025'
-    Defaults to June 2025 if not present.
+    Accept 'Jun', 'June', 'Jun 2025', 'June 2025' (case-insensitive).
+    If year missing, assume 2025. Return 'YYYY-MM' or None if parsing fails.
     """
-    m = _MONTH_RE.search(text or "")
+    m = re.search(
+        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{4})?",
+        text,
+        re.I,
+    )
     if not m:
-        dt = pd.Timestamp(2025, 6, 1)
-        return dt.strftime("%Y-%m"), dt.strftime("%B %Y")
+        return None
+    mon = m.group(1)
+    yr = int(m.group(2)) if m.group(2) else 2025
 
-    mon = m.group(1).lower()
-    yr  = m.group(2)
-    mon_num = {
-        "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-        "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12
-    }[mon[:3]]
-
-    if yr is None:
-        year = 2025
-    else:
-        yi = int(yr)
-        year = 2000 + yi if yi < 100 else yi
-
-    dt = pd.Timestamp(year, mon_num, 1)
-    return dt.strftime("%Y-%m"), dt.strftime("%B %Y")
+    # Build a scalar Timestamp safely and format ourselves (no .to_period on scalars)
+    dt = pd.to_datetime(f"1 {mon} {yr}", errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        return None
+    return f"{dt.year:04d}-{dt.month:02d}"
 
 
-# --- public API ------------------------------------------------------------
-
-def route(q: str) -> Tuple[Optional[str], Dict]:
+def _parse_portfolio(q: str) -> Dict[str, str]:
     """
-    Returns (slug, params)
-    slug ∈ {'complaints_june_by_portfolio', 'first_pass_accuracy', None}
-    params adds what Q1 needs when slug is Q1.
+    Try to extract a portfolio name if the query says 'portfolio <name>' or 'for <name> ...'.
     """
-    if not q:
-        return None, {}
+    p = re.search(r"\bportfolio\s+([a-z\s]+)", q, re.I)
+    if p:
+        return {"portfolio": p.group(1).strip().title()}
 
-    t = q.lower()
+    p2 = re.search(
+        r"\bfor\s+([a-z\s]+?)\s+(jun|jul|aug|sep|oct|nov|dec|\d{4}|to|last|month)",
+        q,
+        re.I,
+    )
+    if p2:
+        return {"portfolio": p2.group(1).strip().title()}
+    return {}
 
-    # Q1: complaints analysis
-    if ("complaint" in t and "portfolio" in t) or "complaints_june_by_portfolio" in t:
-        mk, ml = _month_key_from_text(q)
-        params = {
-            "month_key": mk,             # '2025-06'
-            "month_label": ml,           # 'June 2025'
-            "portfolio": None,           # overall
-        }
-        return "complaints_june_by_portfolio", params
 
-    # Q2: FPA analysis
-    if ("first pass" in t and "accuracy" in t) or "first_pass_accuracy" in t:
-        # FPA does its own month spans; no special params needed here.
-        return "first_pass_accuracy", {}
+def match(q: str) -> Dict[str, Any]:
+    """
+    Return a route dict with a slug and params. Default to the
+    complaints-by-portfolio month view.
+    """
+    ql = q.lower()
+    params: Dict[str, Any] = {}
 
-    return None, {}
+    mk = _to_month_key(ql)
+    if mk:
+        params["month"] = mk
+
+    params.update(_parse_portfolio(ql))
+
+    if "complaint analysis" in ql or "complaints dashboard" in ql:
+        return {"slug": "complaints_june_by_portfolio", "params": params}
+
+    # keep working default
+    return {"slug": "complaints_june_by_portfolio", "params": params}
