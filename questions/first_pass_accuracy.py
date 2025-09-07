@@ -1,19 +1,15 @@
-# -*- coding: utf-8 -*-
 # questions/first_pass_accuracy.py
 from __future__ import annotations
-
-import os, re, glob
+import os, glob, re
 from io import BytesIO
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-from matplotlib import patheffects as pe
 
-# Optional OpenAI labelling (used only if OPENAI_API_KEY is available)
+# Optional OpenAI assist
 _OPENAI_READY = False
 try:
     import openai  # type: ignore
@@ -23,321 +19,278 @@ try:
 except Exception:
     _OPENAI_READY = False
 
+# ------------------------------
+# Fast loaders (cached)
+# ------------------------------
+@st.cache_data(show_spinner=False)
+def _load_fpa() -> pd.DataFrame:
+    """Load FPA data quickly (selected columns), from repo folder or uploaded path."""
+    cols = ["Activity Date", "Review Result", "Portfolio", "Scheme", "Case Comment"]
+    frames = []
 
-# ---------- helpers ----------
+    # 1) project data folder
+    for path in glob.glob("data/first_pass_accuracy/*.xlsx"):
+        try:
+            frames.append(pd.read_excel(path, usecols=cols))
+        except Exception:
+            pass
 
-PASTELS = ["#9ecae1", "#a1d99b", "#bdbdbd", "#fdd0a2", "#bdb8ff", "#c7e9c0"]
+    # 2) uploaded dev file as fallback
+    alt_path = "/mnt/data/FirstPassAccuracy_Aug'25.xlsx"
+    if not frames and os.path.exists(alt_path):
+        try:
+            frames.append(pd.read_excel(alt_path, usecols=cols))
+        except Exception:
+            pass
 
+    if not frames:
+        return pd.DataFrame(columns=cols)
 
-def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
-    m = {c: re.sub(r"[^a-z0-9]+", "_", c.strip().lower()) for c in df.columns}
-    df = df.rename(columns=m)
-
-    # Flexible remap
-    alias = {
-        "portfolio": ["portfolio", "portfolios", "site", "region"],
-        "scheme": ["scheme", "scheme_name", "plan", "product"],
-        "activity_date": ["activity_date", "date", "created_date", "review_date"],
-        "review_result": ["review_result", "result", "review_outcome", "outcome"],
-        "case_comment": ["case_comment", "comment", "comments", "remarks", "notes"],
-        "case_id": ["case_id", "id", "reference", "ref", "ref_id"],
-    }
-    remap = {}
-    for want, candidates in alias.items():
-        for c in candidates:
-            if c in df.columns:
-                remap[c] = want
-                break
-    df = df.rename(columns=remap)
-
-    required = ["portfolio", "scheme", "activity_date", "review_result"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in FPA: {missing}")
-
+    df = pd.concat(frames, ignore_index=True)
+    # Normalize
+    df.rename(columns={
+        "Activity Date": "activity_date",
+        "Review Result": "review_result",
+        "Portfolio": "portfolio",
+        "Scheme": "scheme",
+        "Case Comment": "case_comment",
+    }, inplace=True)
+    df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
+    df.dropna(subset=["activity_date"], inplace=True)
+    df["review_result"] = df["review_result"].astype(str).str.strip().str.lower()
+    df["portfolio"] = df["portfolio"].astype(str).str.strip()
+    df["scheme"] = df["scheme"].astype(str).str.strip()
+    df["case_comment"] = df["case_comment"].astype(str).fillna("").str.strip()
     return df
 
+# ------------------------------
+# Helpers: pass flags & month index
+# ------------------------------
+def _is_pass(s: pd.Series) -> pd.Series:
+    # treat anything beginning with 'pass' as pass; else fail
+    return s.str.startswith("pass")
 
-def _read_fpa() -> pd.DataFrame:
-    """
-    Read First Pass Accuracy file from:
-      - data/first_pass_accuracy/FirstPassAccuracy*.xlsx  (preferred)
-      - /mnt/data/FirstPassAccuracy_Aug'25.xlsx          (fallback)
-    """
-    # Preferred: repo data folder
-    candidates = glob.glob("data/first_pass_accuracy/FirstPassAccuracy*.xlsx")
-    if not candidates:
-        # Any Excel in the subfolder
-        candidates = glob.glob("data/first_pass_accuracy/*.xlsx")
+def _month_span_2025_jan_jun() -> pd.PeriodIndex:
+    return pd.period_range("2025-01", "2025-06", freq="M")
 
-    # Fallback: uploaded path used during development
-    fallback = "/mnt/data/FirstPassAccuracy_Aug'25.xlsx"
-    path = candidates[0] if candidates else (fallback if os.path.exists(fallback) else None)
-    if not path:
-        raise FileNotFoundError(
-            "FPA source file not found. Place FirstPassAccuracy*.xlsx under data/first_pass_accuracy/"
-        )
-
-    df = pd.read_excel(path, engine="openpyxl")
-    return _clean_cols(df)
-
-
-def _month_key(dt: pd.Series) -> pd.Series:
-    s = pd.to_datetime(dt, errors="coerce")
-    return s.dt.to_period("M").astype(str)  # e.g., '2025-06'
-
-
-def _month_label(ym: str) -> str:
-    # '2025-06' -> 'Jun-25'
-    y, m = ym.split("-")
-    d = pd.to_datetime(f"{ym}-01")
-    return d.strftime("%b-%y")
-
-
-def _is_pass(val: str) -> bool:
-    s = str(val).strip().lower()
-    if s in ("pass", "passed", "p", "ok", "success", "true", "yes"):
-        return True
-    # Treat everything explicitly marked fail as fail
-    if "fail" in s:
-        return False
-    # Conservative default if ambiguous
-    return False
-
-
-# Simple fallback taxonomy for fail drivers
-_FALLBACK_RULES: List[Tuple[str, List[str]]] = [
-    ("Waiting on member/TPA", ["waiting", "chase", "await", "member reply", "no response", "outstanding"]),
-    ("Bank/Payment issue", ["bacs", "bank", "payment", "sort code", "account", "cheque"]),
-    ("Postal delay", ["post", "postal", "mail", "courier", "shipment", "delivered late"]),
-    ("Manual calculation", ["manual calc", "manual calculation", "calc error", "calculation error", "spreadsheet"]),
-    ("Data entry error", ["keyed", "typo", "data entry", "transposed", "mismatch", "input error"]),
-    ("Case not created", ["case not created", "not created", "missing case", "no case"]),
-    ("Trustee", ["trustee", "trustees"]),
-    ("AVC", ["avc"]),
-    ("Death benefits payout", ["death benefit", "death payout", "dbp"]),
-    ("Pension set up", ["set up", "setup", "onboarding", "pension set"]),
-    ("Scheme rules", ["scheme rule", "rule", "rules"]),
-    ("System", ["system", "it issue", "workflow", "bug", "outage"]),
+# ------------------------------
+# Keyword-based deeper reason mapping (robust fallback)
+# ------------------------------
+_RULES = [
+    ("Bank/Payment issue", r"bank|bacs|payment|direct debit|refund|remittance"),
+    ("Postal delay", r"post|postal|royal mail|mail delay"),
+    ("Manual calculation", r"manual calc|manual calculation|calc error|calculation"),
+    ("Data entry error", r"data entry|keying|typo|mis-key|miskey|mis-keyed"),
+    ("Case not created", r"case not created|case missing|no case|uncreated"),
+    ("Second review", r"second review|2nd review|review 2"),
+    ("Trustee", r"trustee"),
+    ("AVC", r"\bavc\b|additional voluntary"),
+    ("Pension set up", r"setup|set up|pension set up|initialise|initialization"),
+    ("Scheme Rules", r"scheme rule|rule breach|rules|scheme rules"),
+    ("Timescale", r"timescale|sla|service level|delay requirement|deadline"),
+    ("Holding Letter", r"holding letter"),
+    ("Incorrect/Incomplete information", r"incorrect|incomplete|missing info|lack of clarity|clarity|form incomplete"),
+    ("System", r"system|it issue|tech(nical)?|glitch"),
+    ("Overpayment", r"overpayment"),
 ]
 
-
-def _label_comment_openai(txts: List[str]) -> List[str]:
-    """
-    Only used if OPENAI_API_KEY present. We keep this simple and batch
-    friendly — if anything goes wrong we silently fall back to rules.
-    """
-    assert _OPENAI_READY
-    out = []
-    prompt = (
-        "You are classifying complaint review failure comments into a single best reason. "
-        "Choose one of: [Waiting on member/TPA, Bank/Payment issue, Postal delay, Manual calculation, "
-        "Data entry error, Case not created, Trustee, AVC, Death benefits payout, Pension set up, "
-        "Scheme rules, System, Other]. Only answer with the label.\n"
-        "Comment: "
-    )
-    try:
-        # small, inexpensive model
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": "You classify failure reasons."}]
-            + [{"role": "user", "content": prompt + t[:500]} for t in txts],
-            temperature=0.1,
-        )
-        for choice in resp["choices"]:
-            lab = (choice["message"]["content"] or "Other").strip()
-            # guardrail to known labels
-            if lab not in [r[0] for r in _FALLBACK_RULES] + ["Other"]:
-                lab = "Other"
-            out.append(lab)
-        # If API returns fewer (shouldn't), pad with Other
-        while len(out) < len(txts):
-            out.append("Other")
-        return out
-    except Exception:
-        return []  # signals caller to fallback
-
-
-def _label_comment_rules(txt: str) -> str:
-    s = str(txt or "").lower()
-    for label, keys in _FALLBACK_RULES:
-        if any(k in s for k in keys):
+def _map_reason_keyword(txt: str) -> str:
+    t = txt.lower()
+    for label, pat in _RULES:
+        if re.search(pat, t):
             return label
     return "Other"
 
+# Optional OpenAI-assisted classification for reason (batched)
+def _map_reasons_openai(texts: list[str]) -> Dict[str, str]:
+    """Return {original_text: label}. Only used when API key is present; otherwise empty."""
+    if not _OPENAI_READY or not texts:
+        return {}
+    system = (
+        "You are classifying complaint review failure reasons into high-level buckets. "
+        "Pick ONE label from this set (case-sensitive): "
+        "[Bank/Payment issue, Postal delay, Manual calculation, Data entry error, Case not created, "
+        "Second review, Trustee, AVC, Pension set up, Scheme Rules, Timescale, Holding Letter, "
+        "Incorrect/Incomplete information, System, Overpayment, Other]. "
+        "Return ONLY the label."
+    )
+    out: Dict[str, str] = {}
+    # Simple mini-batching to stay snappy
+    BATCH = 40
+    for i in range(0, len(texts), BATCH):
+        chunk = texts[i:i+BATCH]
+        try:
+            # One-shot: include short guidance + items as bullet points
+            prompt = "Classify each bullet point into ONE label:\n" + "\n".join(f"- {t}" for t in chunk)
+            rsp = openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"system","content":system},
+                          {"role":"user","content":prompt}],
+                temperature=0.0,
+            )
+            answer = rsp.choices[0].message.content.strip()
+            # Heuristic parsing: read back line-per-line labels
+            labels = [ln.strip("-• ").strip() for ln in answer.splitlines() if ln.strip()]
+            # Align by index; if mismatch, fall back to keyword
+            for j, txt in enumerate(chunk):
+                if j < len(labels) and labels[j] in [r[0] for r in _RULES] + ["Other"]:
+                    out[txt] = labels[j]
+                else:
+                    out[txt] = _map_reason_keyword(txt)
+        except Exception:
+            for txt in chunk:
+                out[txt] = _map_reason_keyword(txt)
+    return out
 
-def _label_fail_drivers(df: pd.DataFrame) -> pd.DataFrame:
-    fails = df.loc[~df["passed"].astype(bool)].copy()
+# ------------------------------
+# Precompute & cache processed outputs for speed
+# ------------------------------
+@st.cache_data(show_spinner=False)
+def _precompute(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      monthly_pass (PeriodIndex Jan-Jun 2025 with pass%), 
+      june_table (pass% by portfolio x scheme for June), 
+      reasons (reason counts for fails in June)
+    """
+    if df.empty:
+        months = _month_span_2025_jan_jun()
+        monthly_pass = pd.DataFrame({"month": months, "pass_pct": 0.0}).set_index("month")
+        return monthly_pass, pd.DataFrame(), pd.DataFrame()
+
+    df["is_pass"] = _is_pass(df["review_result"])
+    df["month"] = df["activity_date"].dt.to_period("M")
+    # Keep Jan-Jun 2025
+    wanted = _month_span_2025_jan_jun()
+    df = df[df["month"].isin(wanted)]
+
+    # Monthly pass% (0s for missing)
+    monthly = df.groupby("month", as_index=True)["is_pass"].mean().mul(100)
+    monthly = monthly.reindex(wanted, fill_value=0.0).to_frame("pass_pct")
+
+    # June pass% by portfolio x scheme
+    june = df[df["month"] == pd.Period("2025-06", freq="M")].copy()
+    if june.empty:
+        june_table = pd.DataFrame(columns=["portfolio","scheme","cases","pass_pct"])
+        reasons = pd.DataFrame(columns=["reason","count","percent","cum_percent"])
+        return monthly, june_table, reasons
+
+    grp = june.groupby(["portfolio","scheme"])
+    june_table = grp["is_pass"].agg(["count","mean"]).reset_index()
+    june_table.rename(columns={"count":"cases","mean":"pass_pct"}, inplace=True)
+    june_table["pass_pct"] = (june_table["pass_pct"] * 100).round(1)
+    june_table = june_table.sort_values(["portfolio","scheme"])
+
+    # Reasons (fails only, June)
+    fails = june.loc[~june["is_pass"], ["case_comment"]].copy()
     if fails.empty:
-        return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"])
+        reasons = pd.DataFrame(columns=["reason","count","percent","cum_percent"])
+        return monthly, june_table, reasons
 
-    reasons: List[str] = []
-    comments = fails.get("case_comment")
-    if comments is None:
-        comments = pd.Series([""] * len(fails))
+    uniq = fails["case_comment"].dropna().astype(str).str.strip().unique().tolist()
 
+    labels_map: Dict[str, str] = {}
+    # 1) OpenAI assist (optional)
     if _OPENAI_READY:
-        labs = _label_comment_openai(comments.fillna("").tolist())
-        if labs:
-            reasons = labs
-    if not reasons:
-        reasons = [ _label_comment_rules(x) for x in comments.fillna("").tolist() ]
+        try:
+            labels_map = _map_reasons_openai(uniq)
+        except Exception:
+            labels_map = {}
+    # 2) Keyword fallback
+    for t in uniq:
+        if t not in labels_map:
+            labels_map[t] = _map_reason_keyword(t)
 
-    fails["reason"] = reasons
-    agg = fails.groupby("reason", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
-    agg["percent"] = 100 * agg["count"] / agg["count"].sum()
-    agg["cum_percent"] = agg["percent"].cumsum()
-    # Pretty rounding (single decimal for percents)
-    agg["percent"] = agg["percent"].round(1)
-    agg["cum_percent"] = agg["cum_percent"].round(1)
-    return agg.reset_index(drop=True)
+    fails["reason"] = fails["case_comment"].map(labels_map).fillna("Other")
+    rc = fails.groupby("reason").size().reset_index(name="count").sort_values("count", ascending=False)
+    rc["percent"] = (rc["count"] / rc["count"].sum() * 100).round(1)
+    rc["cum_percent"] = rc["percent"].cumsum().round(1)
 
+    return monthly, june_table, rc
 
-def _style_table(df: pd.DataFrame, title: str):
-    st.markdown(f"<h4 style='color:#0b3d91;margin-top:0.75rem'>{title}</h4>", unsafe_allow_html=True)
-    st.dataframe(df, use_container_width=True)
-
-
-def _plot_mom_pass(mom: pd.DataFrame, title: str):
-    fig, ax = plt.subplots(figsize=(6.2, 3.8))
-    ax.plot(mom["label"], mom["pass_pct"], marker="o", linewidth=2.2, color="#9ecae1")
-    for i, r in mom.iterrows():
-        ax.text(
-            i, r["pass_pct"] + 0.8, f"{r['pass_pct']:.1f}%",
-            ha="center", va="bottom", color="#555", fontsize=9,
-            path_effects=[pe.withStroke(linewidth=3, foreground="white", alpha=.6)]
-        )
-    ax.set_ylim(0, max(100, np.ceil(mom["pass_pct"].max()/10)*10))
+# ------------------------------
+# Drawing helpers (charts with no grid & no y-axis)
+# ------------------------------
+def _style_axes(ax):
+    ax.grid(False)
     ax.set_ylabel("")
-    ax.set_xlabel("")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax.set_yticks([])
     ax.spines["left"].set_visible(False)
-    ax.spines["bottom"].set_visible(False)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
-    ax.grid(axis="y", alpha=.15)
-    # Soft grey x-axis line
-    ax.axhline(0, color="#e6e6e6", linewidth=1.5)
-    plt.xticks(rotation=0, color="#333")
-    ax.set_title(title, color="#0b3d91", fontsize=12, pad=6)
-    st.pyplot(fig, clear_figure=True)
+    ax.spines["right"].set_visible(False)
+    ax.spines["top"].set_visible(False)
+    # keep soft grey x axis
+    ax.spines["bottom"].set_color("#e0e0e0")
+    ax.spines["bottom"].set_linewidth(1.2)
 
+def _plot_monthly_pass(monthly: pd.DataFrame):
+    months = monthly.index.astype(str)  # '2025-01'...
+    # Pretty x labels MMM-YY
+    xlabels = pd.PeriodIndex(months, freq="M").to_timestamp().strftime("%b-%y")
 
-def _prepare(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Dates & month keys
-    df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
-    df["month"] = df["activity_date"].dt.to_period("M").astype(str)
-    # Pass flag
-    df["passed"] = df["review_result"].apply(_is_pass).astype(bool)
-    # Normalise text cols
-    for c in ["portfolio", "scheme"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
-    return df
+    fig, ax = plt.subplots(figsize=(7, 2.4))
+    ax.plot(range(len(months)), monthly["pass_pct"].values, marker="o", linewidth=2.5)
+    for i, v in enumerate(monthly["pass_pct"].values):
+        ax.text(i, v, f"{v:.1f}%", ha="center", va="bottom", fontsize=9)
+    _style_axes(ax)
+    ax.set_xticks(range(len(months)))
+    ax.set_xticklabels(xlabels, rotation=0)
+    st.pyplot(fig, use_container_width=True)
 
+def _plot_reasons(rc: pd.DataFrame):
+    if rc.empty:
+        st.info("No failed cases in June 2025.")
+        return
+    fig, ax = plt.subplots(figsize=(7, 3))
+    ax.bar(rc["reason"], rc["count"], width=0.6)
+    _style_axes(ax)
+    ax.set_xticklabels(rc["reason"], rotation=90)
+    st.pyplot(fig, use_container_width=True)
 
-# ---------- public entry point ----------
+# ------------------------------
+# Page run()
+# ------------------------------
+def run(store, params: Dict, user_q: str):
+    st.markdown("### First-Pass Accuracy — Jan–Jun 2025", unsafe_allow_html=False)
 
-def run(store: Dict, params: Dict, user_text: str):
-    """
-    Renders First-Pass Accuracy dashboard. Also returns a tuple to be friendly
-    with engines that expect (summary, df).
-    """
-    df_raw = _read_fpa()
-    df = _prepare(df_raw)
+    df = _load_fpa()
+    monthly, june_table, rc = _precompute(df)
 
-    # Month window: Jan–Jun 2025 (adjust here if you want dynamic)
-    want_months = pd.period_range("2025-01", "2025-06", freq="M").astype(str).tolist()
-    df_win = df[df["month"].isin(want_months)].copy()
+    # Summary row
+    rows = len(df)
+    passed = int(df["review_result"].str.startswith("pass").sum())
+    overall = (passed / rows * 100) if rows else 0.0
+    st.caption(f"Rows={rows:,} · Passed={passed:,} · Overall={overall:.1f}%")
 
-    total_rows = len(df_win)
-    total_pass = int(df_win["passed"].sum())
-    overall_pct = 100 * total_pass / max(1, total_rows)
+    left, right = st.columns([1.1, 1.2])
+    with left:
+        st.write("##### Pass % — MoM")
+        _plot_monthly_pass(monthly)
 
-    st.markdown("<h3 style='color:#0b3d91;margin:.25rem 0'>First-Pass Accuracy — Jan–Jun 2025</h3>", unsafe_allow_html=True)
-    st.caption(f"Rows={total_rows:,}  ·  Passed={total_pass:,}  ·  Overall={overall_pct:.1f}%")
-
-    # ---- Row 1: MoM + portfolio×scheme table (Jun-25) ----
-    col1, col2 = st.columns([1.05, 1.1], gap="large")
-
-    with col1:
-        mom = (
-            df_win.groupby("month")["passed"]
-            .mean()
-            .mul(100)
-            .reset_index(name="pass_pct")
-            .sort_values("month")
-        )
-        mom["label"] = mom["month"].apply(_month_label)
-        _plot_mom_pass(mom, "Pass % — MoM")
-
-    with col2:
-        # Pass % by Portfolio × Scheme (June 2025)
-        june_key = "2025-06"
-        june = df_win[df_win["month"] == june_key].copy()
-        if june.empty:
-            out = pd.DataFrame(columns=["portfolio", "scheme", "cases", "pass_pct"])
+    with right:
+        st.write("##### Pass % by Portfolio × Scheme — Jun-25")
+        if june_table.empty:
+            st.info("No June 2025 data.")
         else:
-            grp = june.groupby(["portfolio", "scheme"])["passed"].agg(["count", "mean"]).reset_index()
-            grp = grp.rename(columns={"count": "cases", "mean": "pass_pct"})
-            grp["pass_pct"] = (grp["pass_pct"] * 100).round(1)
-            out = grp.sort_values(["portfolio", "pass_pct"], ascending=[True, False])
-        _style_table(out, "Pass % by Portfolio × Scheme — Jun-25")
+            jt = june_table.rename(columns={"pass_pct":"pass_%"})
+            st.dataframe(
+                jt[["portfolio","scheme","cases","pass_%"]],
+                use_container_width=True,
+                hide_index=True
+            )
 
-    # ---- Row 2: RCA on fails (drivers) ----
-    st.markdown("<div style='height:.25rem'></div>", unsafe_allow_html=True)
-    col3, col4 = st.columns([1, 1.05], gap="large")
-
-    with col3:
-        # Pareto bars of RCA1-style (grouped reasons)
-        drivers = _label_fail_drivers(df_win)
-        if not drivers.empty:
-            # Order by count desc
-            drv = drivers.copy().sort_values("count", ascending=False).reset_index(drop=True)
-            # Make a pared-down bar chart in descending order
-            fig, ax = plt.subplots(figsize=(6.2, 3.8))
-            bars = ax.bar(drv["reason"], drv["count"], color=PASTELS, edgecolor="#ddd")
-            # cumulative line
-            ax2 = ax.twinx()
-            ax2.plot(drv["reason"], drv["cum_percent"], marker="o", color="#79a8d8", linewidth=2.0)
-            for i, r in drv.iterrows():
-                ax2.text(i, r["cum_percent"] + 1.2, f"{r['cum_percent']:.0f}%",
-                         ha="center", va="bottom", color="#555", fontsize=9,
-                         path_effects=[pe.withStroke(linewidth=3, foreground="white", alpha=.6)])
-            # cosmetics
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            ax.spines["left"].set_visible(False)
-            ax2.spines["top"].set_visible(False)
-            ax2.spines["left"].set_visible(False)
-            ax2.spines["right"].set_visible(False)
-            ax.grid(axis="y", alpha=.12)
-            ax.set_ylabel("Count", color="#555")
-            ax2.set_ylabel("Cum. %", color="#555")
-            ax2.set_ylim(0, 110)
-            plt.xticks(rotation=90)
-            ax.set_title("Fail drivers — Pareto", color="#0b3d91", fontsize=12, pad=6)
-            st.pyplot(fig, clear_figure=True)
+    st.write("---")
+    c1, c2 = st.columns([1.1, 1.2])
+    with c1:
+        st.write("##### Reasons for Fail — Jun 2025 (counts)")
+        _plot_reasons(rc)
+    with c2:
+        st.write("##### Reason breakdown (top 80%) — Jun 2025")
+        if rc.empty:
+            st.info("No failed cases.")
         else:
-            st.info("No fails in the selected window — nice!")
-
-    with col4:
-        if not drivers.empty:
-            tbl = drivers.rename(columns={
-                "reason": "RCA (label)",
-                "count": "count",
-                "percent": "percent",
-                "cum_percent": "cum_percent",
-            })
-            # Single-decimal for percents, no index col
-            tbl["percent"] = tbl["percent"].round(1)
-            tbl["cum_percent"] = tbl["cum_percent"].round(1)
-            _style_table(tbl[["RCA (label)", "count", "percent", "cum_percent"]], "Fail drivers — table")
-        else:
-            st.empty()
-
-    # Return a minimal tuple for engines that expect a value
-    # Provide the June portfolio×scheme table as the second element
-    summary = f"FPA Jan–Jun 2025. Overall pass={overall_pct:.1f}% on {total_rows:,} reviews."
-    return summary, out if "out" in locals() else pd.DataFrame()
+            top = rc.copy()
+            st.dataframe(
+                top[["reason","count","percent","cum_percent"]],
+                use_container_width=True,
+                hide_index=True
+            )
