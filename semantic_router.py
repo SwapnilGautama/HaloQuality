@@ -1,34 +1,54 @@
 # semantic_router.py
+from __future__ import annotations
+
 import re
-from typing import Dict
+from typing import Dict, Tuple, Optional
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s.lower()).strip()
+# --- simple month parser (optional; safe if no month present) ---
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
-def match(q: str) -> Dict:
+def _parse_month_key(q: str) -> Optional[str]:
     """
-    Extremely small router: picks between
-    - questions.complaints_june_by_portfolio
-    - questions.first_pass_accuracy
-    Returns {'slug': ..., 'params': {...}}
+    Extract something like 'June 2025' / 'Jun 2025' / 'jun-25' from the query and
+    return 'YYYY-MM' (e.g., '2025-06'). If nothing found, return None.
     """
-    text = _norm(q)
+    ql = q.lower()
+    m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[^0-9]{0,3}(\d{2,4})", ql)
+    if not m:
+        return None
+    mon = _MONTHS[m.group(1)[:3]]
+    yr = int(m.group(2))
+    if yr < 100:  # 25 -> 2025 (crude but fine for our scope)
+        yr = 2000 + yr
+    return f"{yr:04d}-{mon:02d}"
 
-    # FPA intent keywords
-    if any(k in text for k in [
-        "first pass accuracy", "first-pass accuracy", "fpa", "pass %", "pass percent", "pass rate"
-    ]):
-        return {"slug": "first_pass_accuracy", "params": {}}
+def route(q: str) -> Tuple[str, Dict]:
+    """
+    Decide which question to run and return (slug, params).
+    Slugs:
+      - 'first_pass_accuracy'                 -> questions/first_pass_accuracy.py
+      - 'complaints_june_by_portfolio'       -> questions/complaints_june_by_portfolio.py
+    """
+    ql = (q or "").lower().strip()
 
-    # Complaints intent keywords (default)
-    if any(k in text for k in [
-        "complaint analysis", "complaints analysis", "complaints —", "complaints -",
-        "complaints by portfolio", "rca", "reasons"
-    ]):
-        return {"slug": "complaints_june_by_portfolio", "params": {}}
+    # FPA intents
+    if any(k in ql for k in ["first pass", "first-pass", "fpa", "accuracy analysis", "firstpass"]):
+        params: Dict = {}
+        mk = _parse_month_key(ql)
+        if mk:
+            params["month_key"] = mk
+        return "first_pass_accuracy", params
 
-    # Fallback: prefer FPA if user typed 'pass'
-    if "pass" in text:
-        return {"slug": "first_pass_accuracy", "params": {}}
+    # Complaints intents (default)
+    if any(k in ql for k in ["complaint", "complaints", "rca", "portfolio"]):
+        params = {}
+        mk = _parse_month_key(ql)
+        if mk:
+            params["month_key"] = mk
+        return "complaints_june_by_portfolio", params
 
-    return {"slug": "complaints_june_by_portfolio", "params": {}}
+    # Fallback to complaints
+    return "complaints_june_by_portfolio", {}
