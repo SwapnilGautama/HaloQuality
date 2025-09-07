@@ -1,397 +1,340 @@
 # questions/complaints_june_by_portfolio.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
-import pandas as pd
 import numpy as np
-import streamlit as st
-import altair as alt
+import pandas as pd
+
+# Streamlit (if available; safe import so it won't break tests)
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover
+    st = None
+
+# Matplotlib (plots render only when Streamlit is available)
+try:
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover
+    plt = None
 
 
-# -----------------------------
-# Small helpers
-# -----------------------------
+# =========================
+#        Helpers
+# =========================
 
-def _section(title: str, caption: Optional[str] = None) -> None:
-    st.subheader(title)
-    if caption:
-        st.caption(caption)
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    """Return first existing column (case/space-insensitive) from candidate names."""
+    if df is None or df.empty:
+        return None
+    norm = {c.lower().strip(): c for c in df.columns}
+    tight = {k.replace(" ", ""): v for k, v in norm.items()}
+    for cand in candidates:
+        key = cand.lower().strip()
+        if key in norm:
+            return norm[key]
+        key_tight = key.replace(" ", "")
+        if key_tight in tight:
+            return tight[key_tight]
+    return None
 
 
-def _assumed_year(store) -> int:
+def _month_key_from_datetime(series: pd.Series) -> pd.Series:
+    """Convert any date-like series to 'YYYY-MM' (coercing errors)."""
+    s = pd.to_datetime(series, dayfirst=True, errors="coerce")
+    return s.dt.to_period("M").astype(str)
+
+
+def _month_key_from_month_name(series: pd.Series, year: int) -> pd.Series:
+    """Convert month name (e.g. 'June') to 'YYYY-MM' using the supplied year."""
+    s = series.astype(str).str.strip()
+    dt = pd.to_datetime("1 " + s + f" {year}", errors="coerce", dayfirst=True)
+    return dt.dt.to_period("M").astype(str)
+
+
+def _parse_month_from_params_or_text(params: Dict[str, Any],
+                                     user_text: Optional[str]) -> Tuple[str, int]:
     """
-    Read the assumed year for complaints if 'Month' (e.g. 'June') is used.
-    The app typically sets this in load_store(..., assume_year_for_complaints=2025).
+    Choose target month key and assumed year (for 'Month' name fallbacks).
+    Priority:
+      (1) params['month'] as 'YYYY-MM' or 'Month YYYY'
+      (2) user_text with 'Jun 2025' / 'June 2025' / 'June'
+      (3) default to '2025-06'
     """
-    default_year = 2025
-    try:
-        return int(getattr(store, "meta", {}).get("assume_year_for_complaints", default_year))
-    except Exception:
-        return default_year
+    # (1) params
+    if params and isinstance(params.get("month"), str):
+        m = params["month"].strip()
+        if re.match(r"^\d{4}-\d{2}$", m):
+            return m, int(m[:4])
+        m2 = re.match(r"^([A-Za-z]{3,})\s+(\d{4})$", m)
+        if m2:
+            year = int(m2.group(2))
+            mk = pd.to_datetime(f"1 {m2.group(1)} {year}", errors="coerce").to_period("M").astype(str)
+            return mk, year
+
+    # (2) user text
+    if user_text:
+        mt = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b(?:\s+(\d{4}))?",
+                       user_text, re.I)
+        if mt:
+            mon = mt.group(1)
+            year = int(mt.group(2)) if mt.group(2) else 2025
+            mk = pd.to_datetime(f"1 {mon} {year}", errors="coerce").to_period("M").astype(str)
+            return mk, year
+
+    # (3) default
+    return "2025-06", 2025
 
 
-def _clean_portfolio_series(s: pd.Series) -> pd.Series:
-    if s is None:
-        return s
-    s = s.astype(str).str.strip()
-    # collapse multiple spaces, title-case typical names
-    s = s.str.replace(r"\s+", " ", regex=True)
-    return s
+def _clean_portfolio(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.replace(r"\s+", " ", regex=True).str.title()
 
 
-def _find_cases_date_column(df_cases: pd.DataFrame) -> str:
+# ----- Light NLP for reasons -----
+
+_reason_order = [
+    "Delay",
+    "Procedure",
+    "Communication",
+    "System",
+    "Incorrect/Incomplete information",
+    "Other",
+]
+
+def _normalize_text(x: Any) -> str:
+    t = "" if pd.isna(x) else str(x)
+    t = t.lower()
+    t = re.sub(r"[^a-z0-9\s/+-]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _categorize_reason(t: str) -> Tuple[str, Optional[str]]:
+    # Coarse category
+    if re.search(r"\b(delay|late|overdue|sla|timescale|backlog|manual calc|manual calculation|set ?up|postal delay)\b", t):
+        cat = "Delay"
+    elif re.search(r"\b(procedure|process|form|paperwork|documentation|document)\b", t):
+        cat = "Procedure"
+    elif re.search(r"\b(communicat|call|email|letter|reply|response|clarity)\b", t):
+        cat = "Communication"
+    elif re.search(r"\b(system|portal|it issue|down|bug|glitch)\b", t):
+        cat = "System"
+    elif re.search(r"\b(incorrect|incomplete|wrong|missing|error)\b", t):
+        cat = "Incorrect/Incomplete information"
+    else:
+        cat = "Other"
+
+    # Sub-reasons for June deep-dive
+    sr = None
+    if re.search(r"\b(timescale|sla|standard time)\b", t):
+        sr = "Aptia standard Timescale"
+    elif "scheme rule" in t or re.search(r"\bscheme rules?\b", t):
+        sr = "Scheme Rules"
+    elif "drop in value" in t or "factor change" in t:
+        sr = "Drop in value/ factor change"
+    elif "death" in t:
+        sr = "Death benefits payout"
+    elif "overpayment" in t:
+        sr = "Overpayment"
+    elif "pension increase" in t or re.search(r"\bpi\b", t):
+        sr = "Pension Increase"
+    elif "transfer" in t and re.search(r"\b(doc|document|paper)\b", t):
+        sr = "Transfer Documentation"
+    elif "manual calc" in t or "manual calculation" in t:
+        sr = "Manual calculation"
+    elif "postal delay" in t:
+        sr = "Postal Delay"
+    elif "case not created" in t or "case not" in t:
+        sr = "Case not created"
+    elif "requirement not checked" in t or "not checked" in t:
+        sr = "Requirement not checked"
+    return cat, sr
+
+
+# =========================
+#          Main
+# =========================
+
+def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
     """
-    We standardise on 'Create Date'. If it doesn't exist, try a few common fallbacks.
+    Complaint analysis (single month) with the whole slide in one screen:
+
+      1) Portfolio table (cases, complaints, complaints/1,000)
+      2) MoM complaints/1,000 trend (12-month window ending at the target month)
+      3) June reasons (sub-reason) table with % (rule-based labels)
+      4) Reason Trend (Apr–Jun ’25) grouped bar (coarse categories)
+
+    Inputs expected in `store`:
+      - store["cases"]       : DataFrame with Portfolio and a date column (e.g. 'Create Date')
+      - store["complaints"]  : DataFrame with Portfolio and either
+                               'Date Complaint Received - DD/MM/YY' or 'Month' (assumes year)
+
+    Returns:
+      ((title:str, subtitle:str), DataFrame[portfolio, cases, complaints, per_1000])
     """
-    candidates = [
-        "Create Date",
-        "Start Date",
-        "Created Date",
-        "Report Date",
-        "Created",
-        "Date",
-    ]
-    for c in candidates:
-        if c in df_cases.columns:
-            return c
-    # last fallback: any datetime-like column
-    for c in df_cases.columns:
-        if pd.api.types.is_datetime64_any_dtype(df_cases[c]):
-            return c
-    # if nothing, return empty and let the caller error
-    return ""
+    cases: pd.DataFrame = store.get("cases", pd.DataFrame()).copy()
+    complaints: pd.DataFrame = store.get("complaints", pd.DataFrame()).copy()
 
+    if (cases is None or cases.empty) and (complaints is None or complaints.empty):
+        return ("No data loaded.", ""), pd.DataFrame()
 
-def _month_period(dt_like: pd.Series) -> pd.Series:
-    """
-    Convert a datetime-like series to 'YYYY-MM' string month keys.
-    """
-    return pd.to_datetime(dt_like, errors="coerce").dt.to_period("M").astype(str)
+    # Target month and assumed year for "Month" fallback in complaints
+    target_month_key, assumed_year = _parse_month_from_params_or_text(params, user_text)
 
+    # ---------- CASES ----------
+    port_c_cases = _find_col(cases, ["Portfolio", "portfolio"])
+    if not port_c_cases:
+        return ("Missing 'Portfolio' in cases.", ""), pd.DataFrame()
 
-def _month_from_cases(df_cases: pd.DataFrame) -> pd.Series:
-    col = _find_cases_date_column(df_cases)
-    if not col:
-        raise ValueError("Could not find a date column in cases (expected 'Create Date').")
-    return _month_period(df_cases[col])
+    date_c_cases = _find_col(cases, ["Create Date", "Create Dt", "CreateDate", "Start Date", "Start Dt", "StartDate"])
+    if not date_c_cases:
+        return ("Missing a usable date column in cases (e.g., 'Create Date').", ""), pd.DataFrame()
 
+    cases["_month_key"] = _month_key_from_datetime(cases[date_c_cases])
+    cases["_portfolio"] = _clean_portfolio(cases[port_c_cases])
 
-def _month_from_complaints(df_comp: pd.DataFrame, assume_year: int) -> pd.Series:
-    """
-    Complaints: accept either
-      - 'Date Complaint Received - DD/MM/YY' (parse), or
-      - 'Month' with names like 'June' (assume the given year), or
-      - any other date-like column that's present.
-    """
-    if "Date Complaint Received - DD/MM/YY" in df_comp.columns:
-        return _month_period(df_comp["Date Complaint Received - DD/MM/YY"])
-    if "Month" in df_comp.columns:
-        # build YYYY-MM from Month-name + assumed year
-        month_to_num = {
-            "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
-            "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"
-        }
-        m = (
-            df_comp["Month"]
-            .astype(str)
-            .str.strip()
-            .str[:3]
-            .str.lower()
-            .map(month_to_num)
-        )
-        return pd.Series([f"{assume_year}-{mm}" if pd.notna(mm) else np.nan for mm in m], index=df_comp.index)
-    # try any datetime-like column
-    for c in df_comp.columns:
-        if pd.api.types.is_datetime64_any_dtype(df_comp[c]):
-            return _month_period(df_comp[c])
-    raise ValueError(
-        "Could not find a usable date in complaints. "
-        "Expected 'Date Complaint Received - DD/MM/YY' or 'Month'."
-    )
+    cases_target = cases.loc[cases["_month_key"] == target_month_key].copy()
+    cases_by_port = cases_target.groupby("_portfolio", dropna=False).size().reset_index(name="cases")
 
+    # Keep monthly period for trend
+    cases["_month"] = pd.PeriodIndex(cases["_month_key"], freq="M")
 
-def _tag_reason(text: str) -> str:
-    """
-    Simple keyword-based mapper from free-text 'Brief Description - RCA done by admin'
-    to reason categories. Extend as needed.
-    """
-    if not text or not isinstance(text, str):
-        return "Other / Unclear"
-    t = text.lower()
+    # ---------- COMPLAINTS ----------
+    port_c_comp = _find_col(complaints, ["Portfolio", "portfolio"])
+    if not port_c_comp:
+        return ("Missing 'Portfolio' in complaints.", ""), pd.DataFrame()
 
-    rules: List[Tuple[str, str]] = [
-        (r"scheme\s*rule", "Scheme Rules"),
-        (r"timescale|sla|standard\s*timescale", "Aptia standard Timescale"),
-        (r"death\s*benefit", "Death benefits payout"),
-        (r"overpay", "Overpayment"),
-        (r"pension\s*increase|pi\b", "Pension Increase"),
-        (r"manual\s*calc|manual\s*calculation", "Manual calculation"),
-        (r"drop\s*in\s*value|factor\s*change", "Drop in value/ factor change"),
-        (r"case\s*not\s*created", "Case not created"),
-        (r"2nd\s*review|second\s*review", "2nd Review"),
-        (r"requirement\s*not\s*checked|doc\s*not\s*checked", "Requirement not checked"),
-        (r"incorrect|incomplete|wrong\s*info", "Incorrect/Incomplete information"),
-        (r"procedure|process", "Procedure"),
-        (r"communication|letter", "Communication"),
-        (r"system", "System"),
-        (r"delay", "Delay"),
-    ]
-    for pat, label in rules:
-        if re.search(pat, t):
-            return label
-    return "Other / Unclear"
+    comp_date_col = _find_col(complaints, ["Date Complaint Received - DD/MM/YY"])
+    if comp_date_col:
+        complaints["_month_key"] = _month_key_from_datetime(complaints[comp_date_col])
+    else:
+        month_name_col = _find_col(complaints, ["Month", "Report Month", "Complaint Month"])
+        if not month_name_col:
+            return ("Missing date in complaints. Provide 'Date Complaint Received - DD/MM/YY' or 'Month'.", ""), pd.DataFrame()
+        complaints["_month_key"] = _month_key_from_month_name(complaints[month_name_col], assumed_year)
 
+    complaints["_portfolio"] = _clean_portfolio(complaints[port_c_comp])
+    comp_target = complaints.loc[complaints["_month_key"] == target_month_key].copy()
+    comps_by_port = comp_target.groupby("_portfolio", dropna=False).size().reset_index(name="complaints")
 
-def _reason_df_for_june(df_comp_june: pd.DataFrame) -> pd.DataFrame:
-    col = None
-    for c in df_comp_june.columns:
-        if "brief" in c.lower() and "admin" in c.lower():
-            col = c
-            break
-    if col is None:
-        # try a few common columns that might hold a description / comment
-        for c in ["Comments", "Comment", "Description", "Details"]:
-            if c in df_comp_june.columns:
-                col = c
-                break
-    if col is None:
-        # If we can't find any text column, bail out with empty
-        return pd.DataFrame(columns=["reason", "count", "percent"])
+    # ---------- Join & table ----------
+    out = pd.merge(cases_by_port, comps_by_port, how="outer", on="_portfolio").fillna(0)
+    out["cases"] = out["cases"].astype("int64", errors="ignore")
+    out["complaints"] = out["complaints"].astype("int64", errors="ignore")
+    out["per_1000"] = (out["complaints"] / out["cases"].where(out["cases"] != 0, pd.NA)) * 1000
+    out["per_1000"] = out["per_1000"].round(2)
+    out = out.rename(columns={"_portfolio": "portfolio"})
+    out = out[["portfolio", "cases", "complaints", "per_1000"]].sort_values(
+        ["per_1000", "portfolio"], ascending=[False, True], na_position="last"
+    ).reset_index(drop=True)
 
-    reasons = df_comp_june[col].fillna("").map(_tag_reason)
-    out = (
-        reasons.value_counts(dropna=False)
-        .rename_axis("reason")
-        .reset_index(name="count")
-        .sort_values(["count", "reason"], ascending=[False, True])
-    )
-    total = out["count"].sum()
-    out["percent"] = (out["count"] * 100 / total).round(1) if total > 0 else 0
-    return out
+    tot_cases = int(out["cases"].sum()) if not out.empty else 0
+    tot_comps = int(out["complaints"].sum()) if not out.empty else 0
+    tot_per_1000 = round((tot_comps / tot_cases) * 1000, 2) if tot_cases else 0.0
 
+    # =========================
+    #       Streamlit UI
+    # =========================
+    if st is not None:
+        st.subheader(f"Complaint analysis — {pd.Period(target_month_key).strftime('%b %Y')} (by portfolio)")
+        st.caption(f"Total: cases={tot_cases:,}, complaints={tot_comps:,}, per_1000={tot_per_1000}")
 
-def _monthly_overall_per_1000(df_cases: pd.DataFrame, df_comp: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each month, compute complaints per 1,000 across all portfolios:
-        per_1000 = (sum complaints) / (sum cases) * 1000
-    Fill any missing months in the observed range with 0.
-    """
-    cases_m = (
-        df_cases.groupby("_month", dropna=False)[["Case ID"]]
-        .count()
-        .rename(columns={"Case ID": "cases"})
-        .reset_index()
-    )
-    comp_m = (
-        df_comp.groupby("_month", dropna=False)[["__comp_row__"]]
-        .count()
-        .rename(columns={"__comp_row__": "complaints"})
-        .reset_index()
-    )
-    m = pd.merge(cases_m, comp_m, on="_month", how="outer").fillna(0.0)
-    m["cases"] = m["cases"].astype(int)
-    m["complaints"] = m["complaints"].astype(int)
-    m = m.sort_values("_month")
+        # -------- Row 1: portfolio table | MoM line
+        c1, c2 = st.columns((1.1, 1))
+        with c1:
+            st.dataframe(out, use_container_width=True)
+        with c2:
+            if plt is not None:
+                # 12-month window ending at the target month
+                end = pd.Period(target_month_key, freq="M")
+                start = end - 12
+                rng = pd.period_range(start, end, freq="M")
 
-    # fill missing months in the observed span
-    if not m.empty:
-        idx = pd.period_range(m["_month"].min(), m["_month"].max(), freq="M").astype(str)
-        m = m.set_index("_month").reindex(idx, fill_value=0).rename_axis("_month").reset_index()
+                complaints["_month"] = pd.PeriodIndex(complaints["_month_key"], freq="M")
+                m_cases = cases.groupby("_month").size().reindex(rng, fill_value=0)
+                m_comps = complaints.groupby("_month").size().reindex(rng, fill_value=0)
+                per1000 = (m_comps / m_cases.replace(0, np.nan) * 1000).fillna(0).round(2)
 
-    m["per_1000"] = (m["complaints"] * 1000 / m["cases"]).replace([np.inf, -np.inf], 0).fillna(0).round(2)
-    return m
+                fig, ax = plt.subplots(figsize=(7.8, 3.8))
+                x = rng.astype(str)
+                ax.plot(x, per1000.values, marker="o", linewidth=2.0, alpha=0.9)
+                ax.set_title("Complaints per 1,000 — MoM Trend")
+                ax.set_ylabel("Complaints per 1,000")
+                ax.set_xlabel("Month")
+                ax.set_xticks(range(len(x)))
+                ax.set_xticklabels(x, rotation=35, ha="right")
+                ax.grid(alpha=0.15)
+                st.pyplot(fig, clear_figure=True)
 
+        # -------- Prep text for reasons labelling
+        text_cols = [
+            _find_col(complaints, ["Brief Description - RCA done by admin"]),
+            _find_col(complaints, ["RCA 1", "RCA1", "Root Cause 1"]),
+        ]
+        text_cols = [c for c in text_cols if c is not None]
 
-# -----------------------------
-# Core run
-# -----------------------------
-
-def run(store, params: Dict, user_text: str) -> None:
-    """
-    Complaint analysis — June 2025 (by portfolio)
-    Visual layout:
-      Row 1:  portfolio table  |  monthly per-1000 line chart
-      Row 2:  reasons table    |  reasons bar chart
-    """
-    assume_year = _assumed_year(store)
-
-    # --- Get dataframes from store (dict-like)
-    try:
-        df_cases = store["cases"].copy()
-        df_comp = store["complaints"].copy()
-    except Exception:
-        st.error("Could not access 'cases' and 'complaints' in the data store.")
-        return
-
-    # --- Basic presence checks
-    missing_cases_cols = [c for c in ["Case ID", "Portfolio"] if c not in df_cases.columns]
-    if missing_cases_cols:
-        st.warning(f"Missing columns in cases: {missing_cases_cols}")
-        return
-    if "Portfolio" not in df_comp.columns:
-        st.warning("Missing column 'Portfolio' in complaints.")
-        return
-
-    # --- Normalise months and portfolio text
-    try:
-        df_cases["_month"] = _month_from_cases(df_cases)
-    except Exception as e:
-        st.error(f"Failed to parse month from cases. {e}")
-        return
-
-    try:
-        df_comp["_month"] = _month_from_complaints(df_comp, assume_year)
-    except Exception as e:
-        st.error(f"Failed to parse month from complaints. {e}")
-        return
-
-    df_cases["Portfolio"] = _clean_portfolio_series(df_cases["Portfolio"])
-    df_comp["Portfolio"] = _clean_portfolio_series(df_comp["Portfolio"])
-
-    # helper column to count complaint rows
-    df_comp["__comp_row__"] = 1
-
-    # --- Target month: June 2025
-    target_month = "2025-06"
-    df_cases_june = df_cases.loc[df_cases["_month"] == target_month].copy()
-    df_comp_june = df_comp.loc[df_comp["_month"] == target_month].copy()
-
-    # --- Portfolio table
-    cases_by_port = (
-        df_cases_june.groupby("Portfolio", dropna=False)[["Case ID"]]
-        .count()
-        .rename(columns={"Case ID": "cases"})
-        .reset_index()
-    )
-    comp_by_port = (
-        df_comp_june.groupby("Portfolio", dropna=False)[["__comp_row__"]]
-        .count()
-        .rename(columns={"__comp_row__": "complaints"})
-        .reset_index()
-    )
-
-    port_tbl = (
-        pd.merge(cases_by_port, comp_by_port, on="Portfolio", how="outer")
-        .fillna(0.0)
-        .replace([np.inf, -np.inf], 0)
-    )
-    port_tbl["cases"] = port_tbl["cases"].astype(int)
-    port_tbl["complaints"] = port_tbl["complaints"].astype(int)
-    port_tbl["per_1000"] = (port_tbl["complaints"] * 1000 / port_tbl["cases"]).replace([np.inf, -np.inf], 0).fillna(0)
-    port_tbl["per_1000"] = port_tbl["per_1000"].round(2)
-    port_tbl = port_tbl.sort_values(["per_1000", "Portfolio"], ascending=[False, True]).reset_index(drop=True)
-    port_tbl = port_tbl.rename(columns={"Portfolio": "portfolio"})
-
-    # --- Monthly per-1000 overall (last ~13 months)
-    monthly = _monthly_overall_per_1000(
-        df_cases[["_month", "Case ID"]],
-        df_comp[["_month", "__comp_row__"]],
-    )
-
-    # Prepare a readable month label (e.g., 'Jun 2025')
-    if not monthly.empty:
-        monthly["_label"] = pd.PeriodIndex(monthly["_month"], freq="M").strftime("%b %Y")
-        # keep last 13 months to mirror slide feel (Apr'24–Jun'25 style)
-        monthly = monthly.tail(13)
-
-    # --- June reasons from comments
-    reasons_tbl = _reason_df_for_june(df_comp_june)
-
-    # -----------------------------
-    # Rendering
-    # -----------------------------
-    total_cases = int(port_tbl["cases"].sum())
-    total_complaints = int(port_tbl["complaints"].sum())
-    overall_per_1000 = (total_complaints * 1000 / total_cases) if total_cases else 0
-    overall_per_1000 = round(overall_per_1000, 2)
-
-    st.markdown("### Complaint analysis — Jun 2025 (by portfolio)")
-    st.caption(f"Total: cases={total_cases:,}, complaints={total_complaints:,}, per_1000={overall_per_1000}")
-
-    # ---- Row 1: portfolio table | monthly line
-    c1, c2 = st.columns([1.05, 1.00])
-
-    with c1:
-        st.dataframe(
-            port_tbl,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with c2:
-        if monthly.empty:
-            st.info("No monthly data available to plot.")
+        comp_for_reason = complaints.copy()
+        if text_cols:
+            comp_for_reason["__text"] = (
+                comp_for_reason[text_cols[0]].astype(str).fillna("")
+                + " "
+                + (comp_for_reason[text_cols[1]].astype(str).fillna("") if len(text_cols) > 1 else "")
+            ).apply(_normalize_text)
         else:
-            # Pastel line, smooth, points
-            line_chart = (
-                alt.Chart(monthly)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("_label:N", title="Month"),
-                    y=alt.Y("per_1000:Q", title="Complaints per 1,000"),
-                    tooltip=[
-                        alt.Tooltip("_label:N", title="Month"),
-                        alt.Tooltip("per_1000:Q", title="Per 1,000")
-                    ],
-                )
-                .properties(height=300)
-                .configure_mark(strokeWidth=3, color="#5DA5DA")  # soft blue
-            )
-            # gentle theme adjustments
-            line_chart = (
-                line_chart
-                .configure_axis(labelColor="#666", titleColor="#666")
-                .configure_view(stroke="#eee")
-                .configure_point(size=60, filled=True, color="#AEC7E8")  # pastel marker
-            )
-            st.altair_chart(line_chart, use_container_width=True)
+            comp_for_reason["__text"] = ""
 
-    # ---- Row 2: reasons table | bar chart
-    st.markdown("### June reasons — contribution")
-    c3, c4 = st.columns([1.00, 1.00])
+        cats, subs = [], []
+        for t in comp_for_reason["__text"]:
+            c, s = _categorize_reason(t)
+            cats.append(c)
+            subs.append(s)
+        comp_for_reason["__cat"] = cats
+        comp_for_reason["__sub"] = subs
+        comp_for_reason["_month"] = pd.PeriodIndex(comp_for_reason["_month_key"], freq="M")
 
-    with c3:
-        st.dataframe(
-            reasons_tbl,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with c4:
-        if reasons_tbl.empty:
-            st.info("No reasons found in June complaints.")
-        else:
-            top_reasons = reasons_tbl.head(10).copy()
-            bar = (
-                alt.Chart(top_reasons)
-                .mark_bar()
-                .encode(
-                    x=alt.X("percent:Q", title="Percent"),
-                    y=alt.Y("reason:N", sort="-x", title="Reason"),
-                    tooltip=[
-                        alt.Tooltip("reason:N", title="Reason"),
-                        alt.Tooltip("count:Q", title="Count"),
-                        alt.Tooltip("percent:Q", title="%")
-                    ],
-                    color=alt.value("#FFBB78"),  # pastel orange
-                )
-                .properties(height=320)
+        # -------- Row 2: June sub-reasons table | Reason trend (Apr–Jun'25) bars
+        c3, c4 = st.columns((1.05, 1))
+        with c3:
+            june_mask = comp_for_reason["_month"] == pd.Period("2025-06", "M")
+            june_sub = (
+                comp_for_reason.loc[june_mask, "__sub"]
+                .value_counts(dropna=True)
+                .rename_axis("reason")
+                .reset_index(name="count")
             )
-            bar = (
-                bar
-                .configure_axis(labelColor="#666", titleColor="#666")
-                .configure_view(stroke="#eee")
-            )
-            st.altair_chart(bar, use_container_width=True)
+            if not june_sub.empty:
+                june_sub["percent"] = (june_sub["count"] / june_sub["count"].sum() * 100).round(1)
+                st.subheader("June reasons — contribution")
+                st.dataframe(june_sub, use_container_width=True)
+            else:
+                st.subheader("June reasons — contribution")
+                st.info("No June sub-reasons could be derived from the available comment fields.")
+        with c4:
+            if plt is not None:
+                months_amj = [pd.Period("2025-04", "M"), pd.Period("2025-05", "M"), pd.Period("2025-06", "M")]
+                counts = {}
+                for p in months_amj:
+                    tmp = comp_for_reason.loc[comp_for_reason["_month"] == p, "__cat"].value_counts()
+                    counts[str(p)] = tmp.reindex(_reason_order, fill_value=0)
 
-    # Footer notes for traceability
-    with st.expander("Parsed filters", expanded=False):
-        st.json({
-            "month": target_month,
-            "assume_year_for_complaints": assume_year,
-            "cases_rows_jun": int(len(df_cases_june)),
-            "complaints_rows_jun": int(len(df_comp_june)),
-        })
+                labels = _reason_order
+                x = np.arange(len(labels))
+                width = 0.27
+                fig2, ax2 = plt.subplots(figsize=(7.8, 3.8))
+                ax2.bar(x - width, counts[str(months_amj[0])].values, width, label="Apr '25")
+                ax2.bar(x,         counts[str(months_amj[1])].values, width, label="May '25")
+                ax2.bar(x + width, counts[str(months_amj[2])].values, width, label="Jun '25")
+                ax2.set_xticks(x, labels)
+                for label in ax2.get_xticklabels():
+                    label.set_rotation(20)
+                    label.set_ha("right")
+                ax2.set_title("Reason Trend (Apr–Jun '25)")
+                ax2.set_ylabel("Count")
+                ax2.grid(axis="y", alpha=0.15)
+                ax2.legend()
+                st.pyplot(fig2, clear_figure=True)
+
+    # Final return (backwards-compatible)
+    title = f"Complaint analysis — {pd.Period(target_month_key).strftime('%b %Y')} (by portfolio)"
+    subtitle = f"Total: cases={tot_cases:,}, complaints={tot_comps:,}, per_1000={tot_per_1000}"
+    return (title, subtitle), out
