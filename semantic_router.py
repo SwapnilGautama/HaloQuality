@@ -1,67 +1,27 @@
 # semantic_router.py
 from __future__ import annotations
 import re
-from typing import Dict, Any, Optional
+from typing import Dict
 
-import pandas as pd
+_MONTH_RX = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{2,4})?"
 
+def _norm_q(q: str) -> str:
+    return (q or "").strip().lower()
 
-def _to_month_key(text: str) -> Optional[str]:
+def match(q: str) -> Dict:
     """
-    Accept 'Jun', 'June', 'Jun 2025', 'June 2025' (case-insensitive).
-    If year missing, assume 2025. Return 'YYYY-MM' or None if parsing fails.
+    Very small, safe router that only returns a slug + lightweight params.
+    Q1: complaints_june_by_portfolio
+    Q2: first_pass_accuracy
     """
-    m = re.search(
-        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{4})?",
-        text,
-        re.I,
-    )
-    if not m:
-        return None
-    mon = m.group(1)
-    yr = int(m.group(2)) if m.group(2) else 2025
+    text = _norm_q(q)
 
-    # Build a scalar Timestamp safely and format ourselves (no .to_period on scalars)
-    dt = pd.to_datetime(f"1 {mon} {yr}", errors="coerce", dayfirst=True)
-    if pd.isna(dt):
-        return None
-    return f"{dt.year:04d}-{dt.month:02d}"
+    # Q2 trigger phrases
+    if any(p in text for p in ["first pass", "fpa", "first-pass accuracy"]):
+        # optional: pick a month if the user mentions one; Q2 still handles full-range internally
+        m = re.search(_MONTH_RX, text)
+        params = {"hint_month": m.group(0)} if m else {}
+        return {"slug": "first_pass_accuracy", "params": params}
 
-
-def _parse_portfolio(q: str) -> Dict[str, str]:
-    """
-    Try to extract a portfolio name if the query says 'portfolio <name>' or 'for <name> ...'.
-    """
-    p = re.search(r"\bportfolio\s+([a-z\s]+)", q, re.I)
-    if p:
-        return {"portfolio": p.group(1).strip().title()}
-
-    p2 = re.search(
-        r"\bfor\s+([a-z\s]+?)\s+(jun|jul|aug|sep|oct|nov|dec|\d{4}|to|last|month)",
-        q,
-        re.I,
-    )
-    if p2:
-        return {"portfolio": p2.group(1).strip().title()}
-    return {}
-
-
-def match(q: str) -> Dict[str, Any]:
-    """
-    Return a route dict with a slug and params. Default to the
-    complaints-by-portfolio month view.
-    """
-    ql = q.lower()
-    params: Dict[str, Any] = {}
-
-    mk = _to_month_key(ql)
-    if mk:
-        params["month"] = mk
-
-    params.update(_parse_portfolio(ql))
-
-    if "complaint analysis" in ql or "complaints dashboard" in ql:
-        return {"slug": "complaints_june_by_portfolio", "params": params}
-
-    # keep working default
-    return {"slug": "complaints_june_by_portfolio", "params": params}
+    # Default to Q1
+    return {"slug": "complaints_june_by_portfolio", "params": {}}
