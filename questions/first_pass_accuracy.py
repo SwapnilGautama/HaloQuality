@@ -167,3 +167,55 @@ def run(store: Dict, params: Dict, q: str):
                .assign(cum_percent=lambda d: d["percent"].cumsum()))
         st.markdown(f"#### Reason breakdown — {months[-1].strftime('%b-%y')}")
         st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+# --- utilities that are safe for Q2 only -----------------------------------
+def _matplotlib_sandbox():
+    """Context manager to isolate Matplotlib state inside Q2."""
+    import contextlib, matplotlib as mpl, matplotlib.pyplot as plt
+    @contextlib.contextmanager
+    def _ctx():
+        old = mpl.rcParams.copy()
+        try:
+            mpl.rcParams.update(mpl.rcParamsDefault)  # reset to defaults
+            yield plt
+        finally:
+            mpl.rcParams.update(old)
+    return _ctx()
+
+def _bar_with_labels(ax, x, y, **bar_kw):
+    container = ax.bar(x, y, **bar_kw)  # BarContainer
+    ax.bar_label(container, labels=[f"{int(v)}" for v in y], padding=3)
+    return container
+
+def _contains_any(text_series, keywords):
+    import re
+    patt = "|".join(re.escape(k) for k in keywords if k)
+    if not patt:
+        return text_series*False
+    return text_series.str.contains(rf"\b({patt})\b", case=False, regex=True)
+
+# --- Stable entrypoint shim for Q2 (paste at bottom of first_pass_accuracy.py) ---
+def _call_first_existing(_names, *args, **kwargs):
+    for _n in _names:
+        _f = globals().get(_n)
+        if callable(_f):
+            return _f(*args, **kwargs)
+    raise RuntimeError(
+        "Q2 entrypoint not found. Expected one of: "
+        "'run_q2','entry','render','main','build','page','render_page'."
+    )
+
+def run(store, params, q):
+    """
+    Stable entrypoint used by app.py. Do not rename or change the signature.
+    """
+    # Is there already a proper run()? If yes, call it.
+    if globals().get("run") and getattr(globals()["run"], "__name__", "") != "run":
+        return globals()["run"](store, params, q)  # an alternate run existed
+
+    # Otherwise, call your existing implementation.
+    return _call_first_existing(
+        ["run_q2", "entry", "render", "main", "build", "page", "render_page"],
+        store, params, q
+    )
+
