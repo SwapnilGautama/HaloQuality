@@ -1,127 +1,122 @@
-# -*- coding: utf-8 -*-
-# app.py — main entrypoint
-
-from __future__ import annotations
-import importlib
-from pathlib import Path
-from typing import Dict, Optional, Tuple
-
+# app.py
+import os, glob, importlib
+import pandas as pd
 import streamlit as st
 
-# local
-import semantic_router as sem_router
+# NEW: bring back the shared data store your question modules expect
+from core.data_store import load_store
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
+# --- Page config
+st.set_page_config(page_title="Quality Chat", page_icon="💬", layout="wide")
 
-# --------------------------------------------------------------------------------------
-# Styling (brand + permanently hide any sidebar)
-# --------------------------------------------------------------------------------------
-_BRAND_CSS = """
-<style>
-/* Hide Streamlit sidebar & hamburger entirely */
-section[data-testid="stSidebar"], div[data-testid="stToolbar"] { display: none !important; }
-button[kind="header"] { display: none !important; }
-
-/* Page padding a touch wider now that the left pane is gone */
-.block-container { padding-top: 1.5rem; max-width: 1280px; }
-
-/* Brand */
-.halo-badge{
-  display:inline-block;background:#FF7A00;color:#fff;
-  font-weight:800;border-radius:8px;padding:.25rem .6rem;margin-right:.5rem;
-  font-family: ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto;
-}
-.halo-word{color:#0E3B82;font-weight:800;}
-.halo-chat{color:#4B5563;font-weight:600;}
-h1,h2{color:#0E3B82;}
-h3,h4,h5,h6{color:#1F2937;}
-/* Chip buttons (suggested questions) */
-button.suggest-chip {
-  border-radius: 9999px !important;
-  border: 1px solid #E5E7EB !important;
-  background: #fff !important;
-  color: #111827 !important;
-  padding: .35rem .8rem !important;
-  margin-right:.5rem !important;
-}
-</style>
+# --- Branding (HALO orange pill + Quality dark blue)
+BRAND_HTML = """
+<h1 style="margin:.2rem 0 1rem 0; font-weight:700; letter-spacing:.2px;">
+  <span style="
+      background:#ff7a00;
+      color:#fff;
+      padding:.15rem .5rem .2rem .5rem;
+      border-radius:.40rem;
+      display:inline-block;">
+    HALO
+  </span>
+  <span style="color:#0b3d91;"> Quality</span>
+  <span style="color:#6c757d; font-weight:600;"> — Chat</span>
+</h1>
 """
+st.markdown(BRAND_HTML, unsafe_allow_html=True)
 
-def _brand_header() -> None:
-    st.markdown(_BRAND_CSS, unsafe_allow_html=True)
-    st.markdown(
-        '<div>'
-        '<span class="halo-badge">HALO</span>'
-        '<span class="halo-word" style="font-size:2rem">Quality</span>'
-        '<span class="halo-chat" style="font-size:2rem"> — Chat</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-# --------------------------------------------------------------------------------------
-# Question runner
-# --------------------------------------------------------------------------------------
-def _run_question(slug: str, params: Dict, q: str) -> Optional[Tuple[str, Optional["pd.DataFrame"]]]:
-    """
-    Dispatch into questions/<slug>.py and call run(store, params, q).
-    Every question module must expose run(store, params, q).
-    """
+# --- Sidebar Data status (best-effort)
+@st.cache_data(show_spinner=False)
+def _safe_len(path_patterns, read_excel=False):
+    total = 0
     try:
-        mod = importlib.import_module(f"questions.{slug}")
-    except Exception as e:
-        st.error(f"Could not import question module '{slug}'.\n{e}")
-        return None
+        files = []
+        for pat in path_patterns:
+            files += glob.glob(pat)
+        for f in files:
+            if f.lower().endswith((".xls", ".xlsx")) or read_excel:
+                df = pd.read_excel(f)
+            else:
+                df = pd.read_csv(f)
+            total += len(df)
+    except Exception:
+        pass
+    return total
 
+@st.cache_data(show_spinner=False)
+def sidebar_counts():
+    cases_rows = _safe_len(["data/cases/*.csv", "data/cases/*.xlsx"])
+    complaints_rows = _safe_len(["data/complaints/*.csv", "data/complaints/*.xlsx"])
+    fpa_rows = _safe_len(["data/first_pass_accuracy/*.xlsx"], read_excel=True)
+    # Also allow the uploaded dev file path for FPA
+    if fpa_rows == 0 and os.path.exists("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"):
+        try:
+            fpa_rows = len(pd.read_excel("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"))
+        except Exception:
+            pass
+    return cases_rows, complaints_rows, fpa_rows
+
+with st.sidebar:
+    st.subheader("Data status")
+    cr, cmpr, fpar = sidebar_counts()
+    st.caption(f"Cases rows: **{cr:,}**")
+    st.caption(f"Complaints rows: **{cmpr:,}**")
+    st.caption(f"FPA rows: **{fpar:,}**")
+
+# --- Chips (only two)
+st.write("")
+c1, c2 = st.columns([1.1, 1.1])
+with c1:
+    chip_complaints = st.button("complaint analysis — June 2025 (by portfolio)")
+with c2:
+    chip_fpa = st.button("first pass accuracy analysis")
+
+# --- Query box (autofill from chips)
+default_q = ""
+if chip_complaints:
+    default_q = "complaint analysis — June 2025 (by portfolio)"
+elif chip_fpa:
+    default_q = "first pass accuracy analysis"
+
+q = st.text_input(
+    "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
+    value=default_q,
+    placeholder="Ask about complaints or first pass accuracy…",
+)
+
+# --- Load the shared store (CACHED) so modules have data
+@st.cache_resource(show_spinner=False)
+def get_store():
+    # Keep your earlier default behavior: assume 2025 for complaints month-join
     try:
-        return mod.run({"root": ROOT, "data_dir": DATA_DIR}, params, q)
-    except TypeError as e:
-        # Helpful diagnostic when the run() signature is wrong
-        st.error(
-            "This question failed.\n\n"
-            "TypeError: " + str(e) + "\n\n"
-            "Expected signature: run(store: dict, params: dict, q: str)"
-        )
-        return None
+        return load_store(assume_year_for_complaints=2025)
+    except Exception:
+        # Graceful fallback if the function signature differs in some envs
+        return load_store()
+
+store = get_store()
+
+# --- Router → question module selection
+import semantic_router as _router
+
+if q.strip():
+    try:
+        route = _router.match(q)
+        slug = route.get("slug")
+        params = route.get("params", {})
+
+        if not slug:
+            st.warning("Sorry—couldn't figure out which analysis to run.")
+        else:
+            mod = importlib.import_module(f"questions.{slug}")
+            # Every question's run() draws to Streamlit; we don't need its return.
+            try:
+                _ = mod.run(store, params, q)
+            except Exception as e:
+                st.error("This question failed.")
+                st.exception(e)
+
     except Exception as e:
-        st.error(f"This question failed.\n\n{e}")
-        return None
-
-# --------------------------------------------------------------------------------------
-# UI
-# --------------------------------------------------------------------------------------
-def main():
-    _brand_header()
-
-    # Suggested question chips
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("complaint analysis — June 2025 (by portfolio)", key="chip1", help="Open complaints slide", type="secondary"):
-            st.session_state["q"] = "complaint analysis — June 2025 (by portfolio)"
-    with col2:
-        if st.button("first pass accuracy analysis", key="chip2", help="Open FPA analysis", type="secondary"):
-            st.session_state["q"] = "first pass accuracy analysis"
-
-    # Free-form input (pre-fill last used)
-    q_default = st.session_state.get("q", "complaint analysis — June 2025 (by portfolio)")
-    q = st.text_input(
-        "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
-        value=q_default,
-        placeholder="Type here…",
-    )
-    st.session_state["q"] = q
-
-    # Route to a question
-    match = sem_router.match(q)
-    if not match:
-        st.info("I couldn't recognise that question. Try one of the chips above.")
-        return
-
-    slug = match["slug"]
-    params = match.get("params", {})
-
-    _run_question(slug, params, q)
-
-
-if __name__ == "__main__":
-    main()
+        st.error("Sorry—couldn't run that question.")
+        st.exception(e)
