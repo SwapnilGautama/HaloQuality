@@ -42,6 +42,7 @@ _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 _PASTEL_LINE = "#88cde8"
+_PARETO_LINE = "#6ab6e1"  # smooth soft pastel
 
 def _header(title: str) -> None:
     st.markdown(
@@ -119,6 +120,11 @@ def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label=
             per = out["complaints"] * 1000 / out["cases"]
         out["per_1000"] = per.replace([np.inf, -np.inf], np.nan)
     return out
+
+def _months_13() -> List[str]:
+    # Jun-24 .. Jun-25 (13 points)
+    base = pd.period_range("2024-06", "2025-06", freq="M")
+    return [str(p) for p in base]
 
 
 # -------------------------------
@@ -247,7 +253,7 @@ _RCA2_ALLOWED = [
     "Scheme rules", "Communication unclear", "Other",
 ]
 
-# Map RCA2 -> higher-level RCA1 to reduce “Other”
+# RCA2 -> RCA1 mapping to strengthen RCA1 & enable delay splits
 RCA2_TO_RCA1_MAP = {
     "Manual calculation": "Delay",
     "Waiting on member/TPA": "Delay",
@@ -272,6 +278,15 @@ RCA2_TO_RCA1_MAP = {
     "Drop in value / factor change": "Incorrect/Incomplete information",
 }
 
+DELAY_RCA2 = {
+    "Manual calculation", "Waiting on member/TPA", "Postal delay",
+    "Case not created", "2nd review / QA", "Pension set up",
+    "Trustee", "AVC", "Overpayment", "Death benefits payout",
+    "Bank/Payment issue",
+}
+DELAY_EXTERNAL = {"Waiting on member/TPA", "Bank/Payment issue", "Postal delay", "Trustee", "AVC"}
+DELAY_APTIA = {"Manual calculation", "Case not created", "2nd review / QA", "Pension set up", "Overpayment", "Data entry error"}
+
 def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
     if not _OPENAI_READY:
         return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
@@ -282,9 +297,8 @@ def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
             "with keys 'rca1' and 'rca2'.\n\n"
             f"RCA1 must be one of: {', '.join(_RCA1_ALLOWED)}.\n"
             f"RCA2 must be one of: {', '.join(_RCA2_ALLOWED)}.\n"
-            "IMPORTANT: Choose 'Other' only when no label clearly applies. Prefer specific, plausible labels.\n\n"
-            "Descriptions:\n"
-            + "\n".join([f"- {t}" for t in texts])
+            "Prefer specific labels over 'Other'.\n\n"
+            "Descriptions:\n" + "\n".join([f"- {t}" for t in texts])
         )
         resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
@@ -333,16 +347,20 @@ def _detect_complaints_fields(comp: pd.DataFrame):
             "Month",
         ],
     )
-    return id_col, port_col, date_col
+    desc_col = _find_first_col(
+        comp,
+        ["Brief Description - RCA done by admin", "Brief Description", "RCA", "Admin Description", "Root Cause"],
+    )
+    return id_col, port_col, date_col, desc_col
 
 
 # -------------------------------
-# Core computations
+# Core computations (overall)
 # -------------------------------
 
 def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     id_c, port_c, date_c = _detect_cases_fields(cases)
-    id_k, port_k, date_k = _detect_complaints_fields(comp)
+    _, port_k, date_k, _ = _detect_complaints_fields(comp)
 
     missing = []
     if port_c is None: missing.append("Portfolio (cases)")
@@ -378,7 +396,7 @@ def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.Dat
 
 def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     _, _, date_c = _detect_cases_fields(cases)
-    _, _, date_k = _detect_complaints_fields(comp)
+    _, _, date_k, _ = _detect_complaints_fields(comp)
     if date_c is None or date_k is None:
         return pd.DataFrame(columns=["month", "per_1000"])
 
@@ -388,7 +406,7 @@ def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
 
     want = [f"2025-{i:02d}" for i in range(1, 7)]
     cases_m = cases.loc[cases["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
-    comp_m = comp.loc[cases["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
+    comp_m = comp.loc[comp["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
     per_1000 = (comp_m * 1000 / cases_m.replace(0, np.nan)).fillna(0.0).round(1)
     pretty = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in want]
     return pd.DataFrame({"month": pretty, "per_1000": per_1000.values})
@@ -403,11 +421,7 @@ def _repair_rca1_from_rca2(rca1: List[str], rca2: List[str]) -> List[str]:
     return out
 
 def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    _, _, date_k = _detect_complaints_fields(comp)
-    desc_col = _find_first_col(
-        comp,
-        ["Brief Description - RCA done by admin", "Brief Description", "RCA", "Admin Description", "Root Cause"],
-    )
+    _, _, date_k, desc_col = _detect_complaints_fields(comp)
     if date_k is None or desc_col is None:
         return pd.DataFrame(columns=["RCA2", "count", "percent", "cum_percent"]), pd.DataFrame(columns=["RCA1", "count"])
 
@@ -446,7 +460,7 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
 
 
 # -------------------------------
-# Plotting (with fig-return for PPT)
+# Plotting (overall visuals)
 # -------------------------------
 
 def _mom_line_fig(df: pd.DataFrame):
@@ -486,7 +500,7 @@ def _pareto_fig(df: pd.DataFrame):
     ax2.plot(
         data["RCA1"],
         data["cum_percent"],
-        color=_PASTEL_LINE,
+        color=_PARETO_LINE,
         marker="o",
         linewidth=2.5,
         solid_capstyle="round",
@@ -504,7 +518,7 @@ def _pareto_fig(df: pd.DataFrame):
     ax.tick_params(axis="x", colors=_DARK_GREY)
     plt.setp(ax.get_xticklabels(), rotation=90, ha="center")
 
-    # Hide secondary y-axis fully
+    # hide secondary y-axis
     for sp in ["top", "right", "left", "bottom"]:
         ax2.spines[sp].set_visible(False)
     ax2.set_ylim(0, 100)
@@ -520,23 +534,226 @@ def _plot_rca1_pareto(df: pd.DataFrame):
 
 
 # -------------------------------
-# PowerPoint export
+# Portfolio-tab computations & plots
+# -------------------------------
+
+def _portfolio_list(cases: pd.DataFrame, comp: pd.DataFrame) -> List[str]:
+    _, port_c, _ = _detect_cases_fields(cases)
+    _, port_k, _, _ = _detect_complaints_fields(comp)
+    ports = set()
+    if port_c and port_c in cases.columns:
+        ports |= set(cases[port_c].dropna().astype(str).unique().tolist())
+    if port_k and port_k in comp.columns:
+        ports |= set(comp[port_k].dropna().astype(str).unique().tolist())
+    return sorted([p for p in ports if p and p.lower() != "nan"])
+
+def _portfolio_mom_series(cases: pd.DataFrame, comp: pd.DataFrame, portfolio: str) -> pd.DataFrame:
+    _, port_c, date_c = _detect_cases_fields(cases)
+    _, port_k, date_k, _ = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_c, date_c, port_k, date_k]):
+        return pd.DataFrame(columns=["month", "per_1000"])
+
+    cases = cases.copy(); comp = comp.copy()
+    cases["_month"] = _build_month_column(cases, date_c)
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+
+    months = _months_13()
+    cs = cases.loc[(cases[port_c] == portfolio) & (cases["_month"].isin(months))].groupby("_month").size().reindex(months, fill_value=0)
+    cp = comp.loc[(comp[port_k] == portfolio) & (comp["_month"].isin(months))].groupby("_month").size().reindex(months, fill_value=0)
+    per = (cp * 1000 / cs.replace(0, np.nan)).fillna(0.0).values
+    pretty = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
+    return pd.DataFrame({"month": pretty, "per_1000": np.round(per, 1)})
+
+def _fig_portfolio_trend(df: pd.DataFrame, title: str):
+    # red line + dotted linear trend (as in screenshot)
+    fig, ax = plt.subplots(figsize=(6.8, 3.2))
+    ax.plot(df["month"], df["per_1000"], color="#d95f02", linewidth=2.5, marker="o")
+    # annotate
+    for x, y in zip(df["month"], df["per_1000"]):
+        ax.text(x, y + 0.15, f"{y:.1f}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+    # trendline
+    idx = np.arange(len(df))
+    z = np.polyfit(idx, df["per_1000"].astype(float), 1)
+    ax.plot(df["month"], z[0]*idx + z[1], linestyle=":", linewidth=1.8, color="#7f7f7f")
+    ax.set_title(title, color=_DARK_BLUE)
+    ax.set_ylim(bottom=0)
+    # soften axes
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    ax.tick_params(axis="x", rotation=0, colors=_DARK_GREY)
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+    return fig
+
+def _rca_labels_for_subset(df: pd.DataFrame, use_ai: bool) -> Tuple[List[str], List[str]]:
+    texts = df.astype(str).fillna("").tolist()
+    if use_ai and _OPENAI_READY and len(texts) > 0:
+        r1_labels, r2_labels = [], []
+        batch = 80
+        for i in range(0, len(texts), batch):
+            chunk = texts[i:i+batch]
+            pairs = _ai_label_batch(chunk)
+            r1_labels.extend([p[0] for p in pairs])
+            r2_labels.extend([p[1] for p in pairs])
+    else:
+        r1_labels = [_rca1_keyword(t) for t in texts]
+        r2_labels = [_rca2_keyword(t) for t in texts]
+    r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
+    return r1_labels, r2_labels
+
+def _reason_trend_df(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.DataFrame:
+    _, port_k, date_k, desc_col = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_k, date_k, desc_col]):
+        return pd.DataFrame()
+    comp = comp.copy()
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+    months = ["2025-04", "2025-05", "2025-06"]
+    lab_months = ["Apr’25", "May’25", "Jun’25"]
+
+    out = { "RCA1": ["Delay","Procedure","Communication","System","Incorrect/Incomplete information"] }
+    for m, label in zip(months, lab_months):
+        subset = comp.loc[(comp[port_k] == portfolio) & (comp["_month"] == m), [desc_col]]
+        if subset.empty:
+            out[label] = [0,0,0,0,0]
+            continue
+        r1, r2 = _rca_labels_for_subset(subset[desc_col], use_ai=use_ai)
+        s = pd.Series(r1).value_counts()
+        total = max(1, s.sum())
+        vals = [
+            round(100*s.get(k, 0)/total) for k in ["Delay","Procedure","Communication","System","Incorrect/Incomplete information"]
+        ]
+        out[label] = vals
+    return pd.DataFrame(out)
+
+def _fig_reason_trend(df: pd.DataFrame):
+    if df.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(6.6, 3.2))
+    x = np.arange(len(df["RCA1"]))
+    width = 0.26
+    colors = ["#74c476", "#a1d99b", "#9ecae1"]  # Apr, May, Jun
+    labels = [c for c in df.columns if c != "RCA1"]
+    for i, col in enumerate(labels):
+        ax.bar(x + (i-1)*width, df[col].values, width=width, label=col, color=colors[i % len(colors)])
+    ax.set_xticks(x)
+    ax.set_xticklabels(df["RCA1"], rotation=0, color=_DARK_GREY)
+    ax.set_ylim(0, 100)
+    ax.legend(frameon=False, loc="upper right")
+    ax.set_title("Reason Trend (Apr–Jun ’25) — % split", color=_DARK_BLUE)
+    # clean frame
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    ax.set_ylabel(""); ax.set_xlabel("")
+    return fig
+
+def _delay_split_df(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.DataFrame:
+    _, port_k, date_k, desc_col = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_k, date_k, desc_col]):
+        return pd.DataFrame()
+    comp = comp.copy()
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+    months = ["2025-04", "2025-05", "2025-06"]
+    labels = ["Apr’25", "May’25", "Jun’25"]
+
+    rows = []
+    for m, lab in zip(months, labels):
+        subset = comp.loc[(comp[port_k] == portfolio) & (comp["_month"] == m), [desc_col]]
+        if subset.empty:
+            rows.append((lab, 0.0, 0.0))
+            continue
+        r1, r2 = _rca_labels_for_subset(subset[desc_col], use_ai=use_ai)
+        # keep only Delay-related
+        delay_mask = [a == "Delay" or b in DELAY_RCA2 for a, b in zip(r1, r2)]
+        if not any(delay_mask):
+            rows.append((lab, 0.0, 0.0)); continue
+        r2_delay = [r2[i] for i, keep in enumerate(delay_mask) if keep]
+        total = len(r2_delay)
+        ext = sum(1 for v in r2_delay if v in DELAY_EXTERNAL)
+        apt = sum(1 for v in r2_delay if v in DELAY_APTIA)
+        ext_pct = round(100*ext/total, 0) if total else 0.0
+        apt_pct = round(100*apt/total, 0) if total else 0.0
+        rows.append((lab, ext_pct, apt_pct))
+    return pd.DataFrame(rows, columns=["month", "External delay %", "Aptia delay %"])
+
+def _fig_delay_split(df: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(6.6, 3.0))
+    x = np.arange(len(df["month"]))
+    width = 0.35
+    ax.bar(x - width/2, df["External delay %"], width=width, color="#74c476", label="External Delay")
+    ax.bar(x + width/2, df["Aptia delay %"], width=width, color="#9ecae1", label="Aptia Delay")
+    for i, (e, a) in enumerate(zip(df["External delay %"], df["Aptia delay %"])):
+        ax.text(i - width/2, e + 1, f"{e:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+        ax.text(i + width/2, a + 1, f"{a:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+    ax.set_xticks(x); ax.set_xticklabels(df["month"], color=_DARK_GREY)
+    ax.set_ylim(0, 100)
+    ax.legend(frameon=False, loc="upper right")
+    ax.set_title("Delay split — External vs Aptia (Apr–Jun ’25)", color=_DARK_BLUE)
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY); ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+    return fig
+
+def _table_delay_80(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.DataFrame:
+    _, port_k, date_k, desc_col = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_k, date_k, desc_col]):
+        return pd.DataFrame(columns=["Delay 80% Reason", "Percentage contribution"])
+    comp = comp.copy()
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+    subset = comp.loc[(comp[port_k] == portfolio) & (comp["_month"] == "2025-06"), [desc_col]]
+    if subset.empty:
+        return pd.DataFrame(columns=["Delay 80% Reason", "Percentage contribution"])
+    _, r2 = _rca_labels_for_subset(subset[desc_col], use_ai=use_ai)
+    r2 = [v for v in r2 if v in DELAY_RCA2]
+    if not r2:
+        return pd.DataFrame(columns=["Delay 80% Reason", "Percentage contribution"])
+    s = pd.Series(r2).value_counts().rename_axis("Delay 80% Reason").reset_index(name="count")
+    total = max(1, s["count"].sum())
+    s["Percentage contribution"] = (s["count"]*100/total).round(0)
+    s["cum"] = s["Percentage contribution"].cumsum()
+    s = s.loc[s["cum"] <= 80].drop(columns="cum")
+    return s[["Delay 80% Reason", "Percentage contribution"]]
+
+def _table_procedure_80(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.DataFrame:
+    _, port_k, date_k, desc_col = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_k, date_k, desc_col]):
+        return pd.DataFrame(columns=["Procedure", "Percentage contribution"])
+    comp = comp.copy()
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+    subset = comp.loc[(comp[port_k] == portfolio) & (comp["_month"] == "2025-06"), [desc_col]]
+    if subset.empty:
+        return pd.DataFrame(columns=["Procedure", "Percentage contribution"])
+    r1, r2 = _rca_labels_for_subset(subset[desc_col], use_ai=use_ai)
+    proc = [r2[i] for i in range(len(r2)) if r1[i] == "Procedure"]
+    if not proc:
+        return pd.DataFrame(columns=["Procedure", "Percentage contribution"])
+    s = pd.Series(proc).value_counts().rename_axis("Procedure").reset_index(name="count")
+    total = max(1, s["count"].sum())
+    s["Percentage contribution"] = (s["count"]*100/total).round(0)
+    s["cum"] = s["Percentage contribution"].cumsum()
+    s = s.loc[s["cum"] <= 80].drop(columns="cum")
+    return s[["Procedure", "Percentage contribution"]]
+
+
+# -------------------------------
+# PowerPoint export (Overall)
 # -------------------------------
 
 def _add_df_table_to_slide(slide, df: pd.DataFrame, left_in: float, top_in: float, width_in: float):
-    """Add a df as a real PowerPoint table; styling close to the app."""
     rows, cols = df.shape[0] + 1, df.shape[1]
     table = slide.shapes.add_table(rows, cols, Inches(left_in), Inches(top_in), Inches(width_in), Inches(0.8 + 0.3*rows)).table
-
-    # Header
     for j, col in enumerate(df.columns):
         cell = table.cell(0, j)
         cell.text = str(col)
         cell.text_frame.paragraphs[0].font.bold = True
         cell.text_frame.paragraphs[0].font.size = Pt(12)
-        cell.text_frame.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145)  # dark blue
-
-    # Body
+        cell.text_frame.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145)
     for i, (_, row) in enumerate(df.iterrows(), start=1):
         for j, col in enumerate(df.columns):
             val = row[col]
@@ -544,48 +761,42 @@ def _add_df_table_to_slide(slide, df: pd.DataFrame, left_in: float, top_in: floa
                 if col == "per_1000" or col.endswith("percent"):
                     text = f"{val:.1f}"
                 else:
-                    text = f"{val:.3f}".rstrip('0').rstrip('.') if '.' in f"{val:.3f}" else f"{val:.0f}"
+                    s = f"{val:.3f}"
+                    text = s.rstrip('0').rstrip('.') if '.' in s else f"{val:.0f}"
             else:
                 text = str(val)
             cell = table.cell(i, j)
             cell.text = text
             p = cell.text_frame.paragraphs[0]
             p.font.size = Pt(11)
-            p.font.color.rgb = RGBColor(51, 51, 51)  # dark grey
+            p.font.color.rgb = RGBColor(51, 51, 51)
             p.alignment = PP_ALIGN.LEFT
     return table
 
 def _build_ppt(table_df: pd.DataFrame, mom_df: pd.DataFrame, rca1_df: pd.DataFrame, rca2_df: pd.DataFrame) -> bytes:
     prs = Presentation()
-    # Slide 1: Title
     title_slide = prs.slides.add_slide(prs.slide_layouts[5])
-    title = title_slide.shapes.title if title_slide.shapes.title else title_slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.8)).text_frame
+    title = title_slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.8)).text_frame
     title.text = "Complaint analysis — Jun 2025"
     title.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145)
     title.paragraphs[0].font.size = Pt(28)
 
-    # Slide 1 content: table (left) + MoM chart (right)
     _add_df_table_to_slide(title_slide, table_df, left_in=0.5, top_in=1.2, width_in=5.0)
     fig_mom = _mom_line_fig(mom_df)
     buf_mom = BytesIO(); fig_mom.savefig(buf_mom, format="png", dpi=220, bbox_inches="tight"); plt.close(fig_mom)
     title_slide.shapes.add_picture(buf_mom, Inches(6.0), Inches(1.0), width=Inches(4.5))
 
-    # Slide 2: RCA1 Pareto + RCA2 Top 80
     slide2 = prs.slides.add_slide(prs.slide_layouts[5])
     t2 = slide2.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.8)).text_frame
     t2.text = "June reasons — RCA"
-    t2.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145)
-    t2.paragraphs[0].font.size = Pt(24)
+    t2.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145); t2.paragraphs[0].font.size = Pt(24)
 
     fig_pareto = _pareto_fig(rca1_df)
     buf_pareto = BytesIO(); fig_pareto.savefig(buf_pareto, format="png", dpi=220, bbox_inches="tight"); plt.close(fig_pareto)
     slide2.shapes.add_picture(buf_pareto, Inches(0.5), Inches(1.1), width=Inches(5.6))
-
     _add_df_table_to_slide(slide2, rca2_df, left_in=6.4, top_in=1.1, width_in=4.2)
 
-    out = BytesIO()
-    prs.save(out)
-    out.seek(0)
+    out = BytesIO(); prs.save(out); out.seek(0)
     return out.read()
 
 
@@ -595,11 +806,11 @@ def _build_ppt(table_df: pd.DataFrame, mom_df: pd.DataFrame, rca1_df: pd.DataFra
 
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     """
-    Row 1: Portfolio table + MoM line
-    Row 2: RCA1 Pareto (left) + RCA2 Top-80 table (right)
-    + Hide sidebar; + Download PPT
+    Tabs:
+      - Overall (original dashboard, unchanged)
+      - One tab per Portfolio with the layout from the screenshot
     """
-    # Aggressively hide any sidebar / left pane (Streamlit variants)
+    # Hide any sidebar / parsed filters / toolbars
     st.markdown(
         """
         <style>
@@ -607,7 +818,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         .stApp div[role="complementary"] {display:none !important;}
         [data-testid="stSidebarNav"] {display: none !important;}
         [data-testid="stToolbar"] {display: none !important;}
-        div[data-testid="stExpander"] {display: none !important;}  /* hide 'Parsed filters' */
+        div[data-testid="stExpander"] {display: none !important;} /* hide 'Parsed filters' */
         section[data-testid="stMain"] {padding-left: 1rem; padding-right: 1rem;}
         </style>
         """,
@@ -616,61 +827,117 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     cases: pd.DataFrame = store.get("cases", pd.DataFrame()).copy()
     comp: pd.DataFrame = store.get("complaints", pd.DataFrame()).copy()
-
-    # Row 1
-    table = _portfolio_table_for_june(cases, comp)
-    mom = _mom_series(cases, comp)
-
-    c1, c2 = st.columns((1.2, 1.0), gap="large")
-    with c1:
-        _header("Complaint analysis — Jun 2025 (by portfolio)")
-        if table.empty:
-            st.info("No rows returned for the current filters.")
-        else:
-            st.dataframe(
-                _style_table(
-                    table,
-                    formats={"per_1000": "{:.1f}", "cases": "{:,.0f}", "complaints": "{:,.0f}"},
-                ),
-                use_container_width=True,
-            )
-    with c2:
-        if not mom.empty:
-            _plot_mom_line(mom)
-
-    # Row 2
     use_ai = bool(os.getenv("OPENAI_API_KEY"))
-    rca2, rca1 = _rca_tables_for_june(comp, use_ai=use_ai)
 
-    c3, c4 = st.columns((1.05, 1.0), gap="large")
-    with c3:
-        if not rca1.empty:
-            _plot_rca1_pareto(rca1)
-    with c4:
-        _header("RCA2 — Top 80% (June 2025)")
-        if rca2.empty:
-            st.info("No June-2025 complaints with usable RCA text.")
-        else:
-            st.dataframe(
-                _style_table(
-                    rca2.rename(columns={"RCA2": "RCA2"}),
-                    formats={"count": "{:,.0f}", "percent": "{:.1f}", "cum_percent": "{:.1f}"},
-                ),
-                use_container_width=True,
+    portfolios = _portfolio_list(cases, comp)
+    tabs = st.tabs(["Overall"] + portfolios)
+
+    # ----------------- Overall tab (preserved) -----------------
+    with tabs[0]:
+        table = _portfolio_table_for_june(cases, comp)
+        mom = _mom_series(cases, comp)
+
+        c1, c2 = st.columns((1.2, 1.0), gap="large")
+        with c1:
+            _header("Complaint analysis — Jun 2025 (by portfolio)")
+            if table.empty:
+                st.info("No rows returned for the current filters.")
+            else:
+                st.dataframe(
+                    _style_table(
+                        table,
+                        formats={"per_1000": "{:.1f}", "cases": "{:,.0f}", "complaints": "{:,.0f}"},
+                    ),
+                    use_container_width=True,
+                )
+        with c2:
+            if not mom.empty:
+                _plot_mom_line(mom)
+
+        rca2, rca1 = _rca_tables_for_june(comp, use_ai=use_ai)
+        c3, c4 = st.columns((1.05, 1.0), gap="large")
+        with c3:
+            if not rca1.empty:
+                _plot_rca1_pareto(rca1)
+        with c4:
+            _header("RCA2 — Top 80% (June 2025)")
+            if rca2.empty:
+                st.info("No June-2025 complaints with usable RCA text.")
+            else:
+                st.dataframe(
+                    _style_table(
+                        rca2.rename(columns={"RCA2": "RCA2"}),
+                        formats={"count": "{:,.0f}", "percent": "{:.1f}", "cum_percent": "{:.1f}"},
+                    ),
+                    use_container_width=True,
+                )
+
+        # PPT export
+        if _PPT_READY and not table.empty and not mom.empty and not rca1.empty and not rca2.empty:
+            ppt_bytes = _build_ppt(table, mom, rca1, rca2)
+            st.download_button(
+                "Download PPT",
+                data=ppt_bytes,
+                file_name="Complaint_Analysis_Jun2025.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                type="primary",
             )
+        elif not _PPT_READY:
+            st.caption("Install `python-pptx` to enable PPT download.")
 
-    # PowerPoint download
-    if _PPT_READY and not table.empty and not mom.empty and not rca1.empty and not rca2.empty:
-        ppt_bytes = _build_ppt(table, mom, rca1, rca2)
-        st.download_button(
-            "Download PPT",
-            data=ppt_bytes,
-            file_name="Complaint_Analysis_Jun2025.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            type="primary",
-        )
-    elif not _PPT_READY:
-        st.caption("Install `python-pptx` to enable PPT download.")
+    # ----------------- Portfolio tabs -----------------
+    for i, portfolio in enumerate(portfolios, start=1):
+        with tabs[i]:
+            st.markdown(f"<h2 style='color:{_DARK_BLUE};margin:.3rem 0 1rem 0;'>{portfolio} — complaints analysis</h2>", unsafe_allow_html=True)
 
-    # Return empty df to host (we render everything ourselves)
+            # top row
+            t1, t2 = st.columns((1.1, 1.0), gap="large")
+            with t1:
+                df_trend = _portfolio_mom_series(cases, comp, portfolio)
+                if not df_trend.empty:
+                    fig = _fig_portfolio_trend(df_trend, f"{portfolio} trend Jun’24–Jun’25")
+                    st.pyplot(fig)
+                else:
+                    st.info("No data to build trend.")
+            with t2:
+                df_reason_trend = _reason_trend_df(comp, portfolio, use_ai=use_ai)
+                if not df_reason_trend.empty:
+                    figr = _fig_reason_trend(df_reason_trend)
+                    st.pyplot(figr)
+                else:
+                    st.info("No complaints available for Apr–Jun ’25 in this portfolio.")
+
+            # bottom row
+            b1, b2 = st.columns((1.1, 1.0), gap="large")
+            with b1:
+                df_delay = _delay_split_df(comp, portfolio, use_ai=use_ai)
+                if not df_delay.empty:
+                    st.pyplot(_fig_delay_split(df_delay))
+                else:
+                    st.info("No delay complaints detected for Apr–Jun ’25.")
+
+            with b2:
+                left, right = st.columns(2)
+                with left:
+                    _header("Delay — June (Top 80%)")
+                    tdelay = _table_delay_80(comp, portfolio, use_ai=use_ai)
+                    if tdelay.empty:
+                        st.info("No delay reasons for June.")
+                    else:
+                        st.dataframe(
+                            _style_table(tdelay, formats={"Percentage contribution": "{:.0f}%"}),
+                            use_container_width=True,
+                        )
+                with right:
+                    _header("Procedure — June (Top 80%)")
+                    tproc = _table_procedure_80(comp, portfolio, use_ai=use_ai)
+                    if tproc.empty:
+                        st.info("No procedure reasons for June.")
+                    else:
+                        st.dataframe(
+                            _style_table(tproc, formats={"Percentage contribution": "{:.0f}%"}),
+                            use_container_width=True,
+                        )
+
+    # Return empty df (we render UI)
     return ("", pd.DataFrame())
