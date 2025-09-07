@@ -6,6 +6,7 @@ import os
 import re
 from io import BytesIO
 from typing import Dict, List, Tuple
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -139,7 +140,6 @@ def _latest_pass_by_portfolio_scheme(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # Reason classification (keyword + optional OpenAI enrichment)
 # -----------------------------------------------------------------------------
-# Compact, high-coverage keyword model
 _REASON_PATTERNS: Dict[str, List[str]] = {
     "Bank / payment": [
         r"\b(bac[hs]|bank|payment|paid|credit|debit|cheque|refund|charge|bacs)\b",
@@ -151,7 +151,7 @@ _REASON_PATTERNS: Dict[str, List[str]] = {
     "Manual calculation": [r"\b(manual|calc|recalc|spreadsheet|hand[-\s]*calc)\b"],
     "System": [r"\b(system|portal|technical|bug|glitch|down|error|timeout|access|login)\b"],
     "Waiting on member/TPA": [r"\b(chase|await|waiting|member\s*reply|no\s*response|tpa)\b"],
-    "Other": [r".*"],  # default catch-all
+    "Other": [r".*"],
 }
 _REASON_REGEX: List[Tuple[str, re.Pattern]] = []
 for label, patterns in _REASON_PATTERNS.items():
@@ -173,10 +173,6 @@ def _label_reason_kw(texts: List[str]) -> List[str]:
     return out
 
 def _label_reason_ai_batch(texts: List[str]) -> List[str]:
-    """
-    Use OpenAI to classify reason for each text into one of the canonical buckets.
-    If anything goes wrong, we silently fall back to keyword result.
-    """
     if not _OPENAI_READY:
         return _label_reason_kw(texts)
 
@@ -184,57 +180,43 @@ def _label_reason_ai_batch(texts: List[str]) -> List[str]:
         "You classify pension admin 'Case Comments' into one of these labels only:\n"
         " - Bank / payment\n - Trustee / AVC\n - Data entry / setup\n - Postal / dispatch\n"
         " - Manual calculation\n - System\n - Waiting on member/TPA\n - Other\n\n"
-        "Rules: Return ONLY the label text. If unsure, pick the closest label (avoid 'Other' if a"
-        " clear match exists). Keep it short—just the label."
+        "Rules: Return ONLY the label text. If unsure, pick the closest label (avoid 'Other' if a clear match exists)."
     )
     labels = []
     for chunk_start in range(0, len(texts), 25):
         chunk = texts[chunk_start:chunk_start+25]
-        # Prepare few-shot prompt
         user_prompt = "Classify each line on its own line:\n" + "\n".join([f"- {t[:500]}" for t in chunk])
 
         try:
             resp = openai.ChatCompletion.create(
                 model=_OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=[{"role": "system", "content": sys_prompt},
+                          {"role": "user", "content": user_prompt}],
                 temperature=0.0,
                 max_tokens=200,
             )
             content = resp["choices"][0]["message"]["content"]
-            # Split per line; map back to known labels
             batch_out = []
             for line in content.splitlines():
                 lab = line.strip("-• \t\r\n")
                 if lab not in _REASON_PATTERNS:
-                    # quick normalization
                     k = lab.lower()
                     mapped = next((L for L in _REASON_PATTERNS.keys() if L.lower() == k), None)
                     lab = mapped if mapped else "Other"
                 batch_out.append(lab)
-            # If OpenAI returned fewer lines than input (rare), pad with KW result
             if len(batch_out) != len(chunk):
                 batch_out = _label_reason_kw(chunk)
             labels.extend(batch_out)
-
         except Exception:
             labels.extend(_label_reason_kw(chunk))
-
     return labels
 
 
 def _top80_pareto(series_counts: pd.Series, title: str) -> Tuple[pd.DataFrame, plt.Figure]:
-    """
-    Returns (pareto_df, fig). `pareto_df` contains only the top ~80% categories,
-    plus a single 'Other' row that is the remainder.
-    """
     dfc = series_counts.sort_values(ascending=False).rename_axis("reason").reset_index(name="count")
     dfc["percent"] = (dfc["count"] / dfc["count"].sum() * 100)
     dfc["cum_percent"] = dfc["percent"].cumsum()
 
-    # split at 80% (<= 80% stays, > 80% becomes 'Other')
     cutoff = dfc[dfc["cum_percent"] <= 80.0]
     tail = dfc[dfc["cum_percent"] > 80.0]
     if not tail.empty:
@@ -245,19 +227,16 @@ def _top80_pareto(series_counts: pd.Series, title: str) -> Tuple[pd.DataFrame, p
     else:
         top80 = dfc.copy()
 
-    # ---- Plot Pareto
     fig, ax1 = plt.subplots(figsize=(7.2, 4.2))
     bars = ax1.bar(top80["reason"], top80["count"])
     for b in bars:
         ax1.bar_label([b], labels=[f"{int(b.get_height())}"], padding=3)
 
-    # cumulative line on the same axis (no secondary axis)
     cum = top80["percent"].cumsum()
     ax1.plot(top80["reason"], cum, marker="o", linewidth=2, color="#6aa0f8")
 
-    # soft styling
     ax1.grid(False)
-    ax1.set_ylabel("")  # remove y label
+    ax1.set_ylabel("")
     ax1.set_xlabel("")
     ax1.spines["top"].set_visible(False)
     ax1.spines["right"].set_visible(False)
@@ -269,16 +248,12 @@ def _top80_pareto(series_counts: pd.Series, title: str) -> Tuple[pd.DataFrame, p
     return top80, fig
 
 
-# -----------------------------------------------------------------------------
-# Rendering
-# -----------------------------------------------------------------------------
 def _render_pass_mom(df_m: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(7.6, 2.8))
     ax.plot(df_m["mmm_yy"], df_m["pass_pct"], marker="o", linewidth=2, color="#6aa0f8")
     for x, y in zip(df_m["mmm_yy"], df_m["pass_pct"]):
         ax.text(x, y + 1.2, f"{y:.0f}%", ha="center", va="bottom", fontsize=10)
 
-    # clean axes
     ax.grid(False)
     ax.set_xlabel("")
     ax.set_ylabel("")
@@ -290,64 +265,69 @@ def _render_pass_mom(df_m: pd.DataFrame):
     st.pyplot(fig, clear_figure=True)
 
 
+def _latest_pass_by_portfolio_scheme(df: pd.DataFrame) -> pd.DataFrame:
+    last_ym = df["year_month"].max()
+    d1 = df[df["year_month"] == last_ym].copy()
+    if d1.empty:
+        return pd.DataFrame(columns=["portfolio", "scheme", "cases", "pass_%"])
+
+    grp = d1.groupby(["portfolio", "scheme"]).agg(
+        cases=("review_result", "size"),
+        passed=("review_result", lambda s: (s == "pass").sum()),
+    )
+    grp["pass_%"] = (grp["passed"] / grp["cases"] * 100).round(0)
+    out = grp.reset_index().sort_values(["portfolio", "pass_%", "cases"], ascending=[True, False, False])
+    return out[["portfolio", "scheme", "cases", "pass_%"]]
+
+
+# -----------------------------------------------------------------------------
+# Main entry
+# -----------------------------------------------------------------------------
 def run(store: Dict, params: Dict, q: str):
     """
-    Q2: First-pass accuracy analysis (Jan–latest):
-      • Pass% MoM (Jan -> latest; 0 for months with no values)
+    First-pass accuracy analysis (Jan–latest):
+      • Pass% MoM (Jan -> latest; 0 for missing months)
       • Pass % by Portfolio × Scheme (latest month)
-      • Fail reason analysis (table + Pareto side-by-side; OpenAI enrichment if available)
+      • Fail reasons (OpenAI enrichment if available) — Pareto (top 80%) + table side-by-side
     """
+    # Safe fallback if the app didn't pass root
     root = store.get("root")
     if not root:
-        raise KeyError("store['root'] missing")
+        # /questions/<this_file> -> project root is parents[1]
+        root = str(Path(__file__).resolve().parents[1])
 
     df = _load_fpa(root)
 
-    # ----------------  Title  ----------------
     min_dt = df["activity_date"].min()
     max_dt = df["activity_date"].max()
-    st.markdown(
-        f"## First-Pass Accuracy — {min_dt.strftime('%b-%y')}–{max_dt.strftime('%b-%y')}",
-    )
+    st.markdown(f"## First-Pass Accuracy — {min_dt.strftime('%b-%y')}–{max_dt.strftime('%b-%y')}")
 
-    # ----------------  Row 1: MoM + table  ----------------
     c1, c2 = st.columns([1.1, 1.3], gap="large")
-
     with c1:
         _render_pass_mom(_pass_pct_mom(df))
-
     with c2:
         last_ym = df["year_month"].max()
         st.markdown(f"**Pass % by Portfolio × Scheme — {pd.to_datetime(last_ym).strftime('%b-%y')}**")
-        st.dataframe(
-            _latest_pass_by_portfolio_scheme(df),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(_latest_pass_by_portfolio_scheme(df), use_container_width=True, hide_index=True)
 
-    # ----------------  Row 2: Reasons (latest month, Fails only)  ----------------
-    d_last = df[df["year_month"] == df["year_month"].max()].copy()
+    # Reasons (latest month, fails only)
+    st.markdown("---")
+    last_ym = df["year_month"].max()
+    d_last = df[df["year_month"] == last_ym].copy()
     fails = d_last[d_last["review_result"] != "pass"].copy()
 
-    st.markdown("---")
-    st.markdown(f"### Reasons for Fail — {pd.to_datetime(df['year_month'].max()).strftime('%b-%y')}")
-
-    # fast path if nothing to classify
+    st.markdown(f"### Reasons for Fail — {pd.to_datetime(last_ym).strftime('%b-%y')}")
     if fails.empty or fails["comment"].str.strip().eq("").all():
         st.info("No fail records with comments found for the latest month.")
         return
 
     texts = fails["comment"].astype(str).tolist()
-
-    # get labels – OpenAI if available, else regex model
     labels = _label_reason_ai_batch(texts)
     fails["reason"] = labels
 
-    # Pareto top 80 + clubbed Other
     counts = fails["reason"].value_counts()
     pareto_df, fig = _top80_pareto(counts, title="Fail reasons — Pareto (top 80%)")
 
-    # ---- Side-by-side: chart and table
     left, right = st.columns([1.15, 1.0], gap="large")
     with left:
         st.pyplot(fig, clear_figure=True)
@@ -355,5 +335,5 @@ def run(store: Dict, params: Dict, q: str):
         tbl = pareto_df[["reason", "count", "percent", "cum_percent"]].copy()
         tbl["percent"] = tbl["percent"].round(1)
         tbl["cum_percent"] = tbl["cum_percent"].round(1)
-        st.markdown(f"**Reason breakdown (top 80%) — {pd.to_datetime(df['year_month'].max()).strftime('%b-%y')}**")
+        st.markdown(f"**Reason breakdown (top 80%) — {pd.to_datetime(last_ym).strftime('%b-%y')}**")
         st.dataframe(tbl, use_container_width=True, hide_index=True)
