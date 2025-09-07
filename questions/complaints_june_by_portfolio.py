@@ -25,7 +25,7 @@ except Exception:
 
 
 # -------------------------------
-# small helpers
+# small helpers (styling)
 # -------------------------------
 
 _DARK_BLUE = "#0b3d91"
@@ -33,16 +33,12 @@ _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 
 def _header(title: str) -> None:
-    """Dark-blue section header."""
     st.markdown(
-        f"<h3 style='color:{_DARK_BLUE};"
-        "margin:0 0 .35rem 0; font-weight:700;'>"
-        f"{title}</h3>",
+        f"<h3 style='color:{_DARK_BLUE};margin:0 0 .35rem 0; font-weight:700;'>{title}</h3>",
         unsafe_allow_html=True,
     )
 
 def _style_table(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    """Dark-blue header + dark-grey cells."""
     return (
         df.style
         .set_table_styles(
@@ -404,9 +400,6 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
         r2_labels = [_rca2_keyword(t) for t in texts]
 
     r1 = pd.Series(r1_labels).value_counts(dropna=False).rename_axis("RCA1").reset_index(name="count")
-    desired = ["Delay", "Procedure", "Communication", "System", "Incorrect/Incomplete information", "Other"]
-    r1["order"] = r1["RCA1"].apply(lambda x: desired.index(x) if x in desired else len(desired))
-    r1 = r1.sort_values(["order", "RCA1"]).drop(columns="order").reset_index(drop=True)
 
     r2_counts = pd.Series(r2_labels).value_counts(dropna=False).rename_axis("RCA2").reset_index(name="count")
     r2_counts["order"] = np.where(r2_counts["RCA2"].eq("Other"), 1, 0)
@@ -421,7 +414,7 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
 
 
 # -------------------------------
-# plotting (pastel + axis cleanup)
+# plotting
 # -------------------------------
 
 def _plot_mom_line(df: pd.DataFrame):
@@ -431,8 +424,7 @@ def _plot_mom_line(df: pd.DataFrame):
         ax.text(x, y + 0.03, f"{y:.2f}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
     ax.set_title("Complaints per 1,000 — MoM (Jan–Jun ’25)", pad=8, color=_DARK_BLUE)
     ax.set_ylim(bottom=0)
-
-    # remove y axis; soft grey x spine; dark-grey ticks
+    # soften axes
     ax.spines["left"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["top"].set_visible(False)
@@ -444,19 +436,50 @@ def _plot_mom_line(df: pd.DataFrame):
     st.pyplot(fig)
 
 
-def _plot_rca1_bars(df: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(6.0, 3.6))
-    colors = ["#9ecae1", "#a1d99b", "#fdd0a2", "#c7c7c7", "#fdae6b", "#d9d9d9"]
-    vals = df["count"].values
-    ax.bar(df["RCA1"], vals, color=colors[: len(df)])
-    for x, y in enumerate(vals):
-        ax.text(x, y + max(1, y * 0.02), f"{y}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax.set_title("RCA1 — June 2025", pad=8, color=_DARK_BLUE)
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+def _plot_rca1_pareto(df: pd.DataFrame):
+    """
+    Pareto chart: bars (descending counts) + cumulative percentage line.
+    Labels rotated vertical for readability.
+    """
+    data = df.copy()
+    data = data.sort_values("count", ascending=False).reset_index(drop=True)
+    total = float(max(1, data["count"].sum()))
+    data["percent"] = data["count"] * 100.0 / total
+    data["cum_percent"] = data["percent"].cumsum()
+
+    fig, ax = plt.subplots(figsize=(6.4, 3.8))
+    bar_colors = ["#9ecae1", "#a1d99b", "#fdd0a2", "#c7c7c7", "#fdae6b", "#d9d9d9", "#bcbddc", "#ccebc5"]
+    ax.bar(data["RCA1"], data["count"], color=bar_colors[: len(data)])
+
+    # annotate bar counts
+    for i, y in enumerate(data["count"].tolist()):
+        ax.text(i, y + max(1, y * 0.02), f"{int(y)}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+
+    ax.set_title("RCA1 — June 2025 (Pareto)", pad=8, color=_DARK_BLUE)
+
+    # right-hand cumulative % line
+    ax2 = ax.twinx()
+    ax2.plot(data["RCA1"], data["cum_percent"], color=_DARK_BLUE, marker="o", linewidth=2)
+    for i, y in enumerate(data["cum_percent"].tolist()):
+        ax2.text(i, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+
+    # styling: no left y-axis, soft bottom spine, vertical x labels
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     ax.spines["left"].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY); ax.spines["bottom"].set_linewidth(1.25)
-    ax.grid(False); ax.get_yaxis().set_visible(False)
+    ax.grid(False)
+    ax.get_yaxis().set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
     ax.tick_params(axis="x", colors=_DARK_GREY)
+    plt.setp(ax.get_xticklabels(), rotation=90, ha="center")
+
+    # right y-axis = 0..100%
+    ax2.set_ylim(0, 100)
+    ax2.set_ylabel("")  # clean
+    ax2.tick_params(axis="y", colors=_DARK_GREY)
+    ax2.grid(False)
+
     st.pyplot(fig)
 
 
@@ -467,10 +490,9 @@ def _plot_rca1_bars(df: pd.DataFrame):
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     """
     Row 1: Portfolio table + MoM line
-    Row 2: RCA1 bar (left) + RCA2 Top-80 table (right)
-    Returns ("", empty_df) so the host app doesn’t try to render another table.
+    Row 2: RCA1 Pareto (left) + RCA2 Top-80 table (right)
     """
-    # Hide host “Parsed filters” expander and any trailing info alerts (“blue bars”)
+    # Hide host “Parsed filters” expander & trailing info alerts
     st.markdown(
         """
         <style>
@@ -499,14 +521,14 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not mom.empty:
             _plot_mom_line(mom)
 
-    # ----- Row 2 (SWAPPED: RCA1 chart LEFT, RCA2 table RIGHT) -----
+    # ----- Row 2 (RCA1 Pareto LEFT, RCA2 table RIGHT) -----
     use_ai = bool(os.getenv("OPENAI_API_KEY"))
     rca2, rca1 = _rca_tables_for_june(comp, use_ai=use_ai)
 
     c3, c4 = st.columns((1.05, 1.0), gap="large")
     with c3:
         if not rca1.empty:
-            _plot_rca1_bars(rca1)
+            _plot_rca1_pareto(rca1)
     with c4:
         _header("RCA2 — Top 80% (June 2025)")
         if rca2.empty:
