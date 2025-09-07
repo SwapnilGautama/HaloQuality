@@ -920,3 +920,33 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     # Return an empty df (we suppress default alerts with CSS so no blue bars)
     return ("", pd.DataFrame())
+
+# --- Stable entrypoint shim for Q1 (paste at bottom of complaints_june_by_portfolio.py) ---
+
+def _call_first_existing(_names, *args, **kwargs):
+    for _n in _names:
+        _f = globals().get(_n)
+        if callable(_f):
+            return _f(*args, **kwargs)
+    raise RuntimeError(
+        "Q1 entrypoint not found. Expected one of: "
+        "'run_q1','entry','render','main','build','page','render_page'."
+    )
+
+def run(store, params, q):
+    """
+    Stable entrypoint used by app.py. Do not rename or change the signature.
+    - store: {'root': Path, 'data': Path}
+    - params: {'month_key': 'YYYY-MM', 'month_label': 'Month YYYY', 'portfolio': ...}
+    - q: original query text (for future tweaks if needed)
+    """
+    # If your implementation already defines run(store, params, q), call it directly.
+    if globals().get("run") and getattr(globals()["run"], "__name__", "") != "run":
+        return globals()["run"](store, params, q)  # an alternate run existed
+
+    # Otherwise, try the common function names you’ve been using in Q1.
+    return _call_first_existing(
+        ["run_q1", "entry", "render", "main", "build", "page", "render_page"],
+        store, params, q
+    )
+
