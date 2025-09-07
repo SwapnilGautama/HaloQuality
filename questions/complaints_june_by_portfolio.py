@@ -29,6 +29,7 @@ def _ensure_portfolio_series(s: pd.Series) -> pd.Series:
         .str.strip()
         .replace({"nan": np.nan, "": np.nan})
         .fillna("Unknown")
+        .replace({"None": "Unknown"})   # guard against literal “None”
     )
 
 
@@ -93,7 +94,7 @@ def _month_from_complaints(df: pd.DataFrame) -> pd.Series:
     return pd.Series(pd.PeriodIndex([], freq="M"), index=df.index)
 
 
-# --- Text → RCA2 bucketing ---
+# --- Text → RCA2 (WHAT) bucketing ---
 def _reason_rca2_map(text: str) -> str:
     """Keyword bucketing into RCA2-like buckets, tuned for your data."""
     if not isinstance(text, str) or not text.strip():
@@ -109,9 +110,9 @@ def _reason_rca2_map(text: str) -> str:
         return "Overpayment"
     if any(k in t for k in ["manual", "calc", "calculation"]):
         return "Manual calculation"
-    if "timescale" in t or "time scale" in t:
+    if "timescale" in t or "time scale" in t or "sla" in t:
         return "Aptia standard Timescale"
-    if "scheme rule" in t:
+    if "scheme rule" in t or "rules" in t:
         return "Scheme Rules"
     if "factor change" in t or "drop in value" in t:
         return "Drop in value/ factor change"
@@ -120,13 +121,88 @@ def _reason_rca2_map(text: str) -> str:
     if "avc" in t:
         return "Delay – AVC"
     if "requirement not checked" in t or "not checked" in t:
-        return "Delay  Requirement not checked"
+        return "Delay – Requirement not checked"
     if "case not created" in t:
-        return "Delay  Case not created"
+        return "Delay – Case not created"
     if "2nd review" in t or "second review" in t:
-        return "Delay  2nd Review"
+        return "Delay – 2nd review"
+    if "communicat" in t or "letter" in t or "clarity" in t:
+        return "Communication"
+    if "document" in t or "missing info" in t or "incomplete" in t:
+        return "Documentation missing / incomplete"
+    if "system" in t or "technical" in t or "platform" in t:
+        return "System"
 
     return "Other"
+
+
+# --- RCA1 (higher level) mapper from text ---
+def _reason_rca1_map(text: str) -> str:
+    """
+    High-level WHY buckets:
+      Delay, Procedure, Communication, System, Incorrect/Incomplete information, Other
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "Other"
+    t = text.lower()
+
+    # Delay family
+    if ("delay" in t) or any(k in t for k in [
+        "postal delay", "2nd review", "second review", "not checked", "case not created", "avc delay"
+    ]):
+        return "Delay"
+
+    # Procedure / process policy
+    if any(k in t for k in ["manual", "calc", "calculation", "timescale", "time scale",
+                            "scheme rule", "rules", "procedure", "policy", "factor change",
+                            "pension increase", "overpay", "over pay", "death"]):
+        return "Procedure"
+
+    # Communication
+    if "communicat" in t or "letter" in t or "clarity" in t or "explain" in t:
+        return "Communication"
+
+    # System / tooling
+    if "system" in t or "technical" in t or "platform" in t or "it issue" in t:
+        return "System"
+
+    # Incorrect or incomplete information
+    if "wrong" in t or "incorrect" in t or "incomplete" in t or "missing" in t or "documentation":
+        return "Incorrect/Incomplete information"
+
+    return "Other"
+
+
+# --- RCA1 from RCA2 (fallback if text missing) ---
+_RCA2_TO_RCA1 = {
+    # Delay umbrella
+    "Postal delay": "Delay",
+    "Delay – AVC": "Delay",
+    "Delay – Requirement not checked": "Delay",
+    "Delay – Case not created": "Delay",
+    "Delay – 2nd review": "Delay",
+
+    # Procedure umbrella
+    "Manual calculation": "Procedure",
+    "Aptia standard Timescale": "Procedure",
+    "Scheme Rules": "Procedure",
+    "Drop in value/ factor change": "Procedure",
+    "Pension Increase": "Procedure",
+    "Death benefits payout": "Procedure",
+    "Overpayment": "Procedure",
+
+    # Communication
+    "Communication": "Communication",
+
+    # System
+    "System": "System",
+
+    # Incorrect / incomplete
+    "Documentation missing / incomplete": "Incorrect/Incomplete information",
+
+    # default
+    "Other": "Other",
+}
 
 
 def _soft_line(ax):
@@ -152,9 +228,8 @@ def _pastel_colors(n: int) -> list[str]:
 def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -> Tuple[str, pd.DataFrame]:
     """
     Render: Complaint analysis — Jun 2025 (by portfolio)
-    - Portfolio table with Total row
-    - MoM line (Jan–Jun 2025) Complaints per 1,000
-    - June reasons (RCA2) table + bar (Top 80% table also shown)
+    - Row 1: Portfolio table with Total row + MoM line (Jan–Jun'25) — (unchanged)
+    - Row 2: RCA2 (WHAT) Top-80% table + RCA1 (WHY) bar chart
     """
     params = params or {}
     month_key = pd.Period("2025-06", freq="M")  # fixed to June '25 per spec
@@ -206,11 +281,22 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
     else:
         complaints["_portfolio"] = _ensure_portfolio_series(complaints[portfolio_compl_col])
 
-    # Reason bucketing from free text (safe default to "Other")
-    complaints["_rca2"] = complaints[rca_text_col].map(_reason_rca2_map) if rca_text_col else "Other"
+    # Reason bucketing from free text
+    if rca_text_col:
+        complaints["_rca2"] = complaints[rca_text_col].map(_reason_rca2_map)
+        complaints["_rca1"] = complaints[rca_text_col].map(_reason_rca1_map)
+    else:
+        # fallback to “Other”
+        complaints["_rca2"] = "Other"
+        complaints["_rca1"] = "Other"
+
+    # If any RCA1 is missing but RCA2 exists, infer from RCA2
+    mask_missing_rca1 = complaints["_rca1"].isna() | (complaints["_rca1"].astype(str).str.strip() == "")
+    if mask_missing_rca1.any():
+        complaints.loc[mask_missing_rca1, "_rca1"] = complaints.loc[mask_missing_rca1, "_rca2"].map(_RCA2_TO_RCA1).fillna("Other")
 
     # -----------------------------
-    # A. Portfolio table (June only)
+    # A. Portfolio table (June only)  — Row 1 (unchanged)
     # -----------------------------
     cases_jun = cases.loc[cases["_month"] == month_key]
     compl_jun = complaints.loc[complaints["_month"] == month_key]
@@ -262,7 +348,7 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
 
     with c2:
         # --------------------------------------
-        # B. MoM Complaints/1000 line (Jan–Jun)
+        # B. MoM Complaints/1000 line (Jan–Jun) — unchanged
         # --------------------------------------
         months_2025 = pd.period_range("2025-01", "2025-06", freq="M")
         # cases & complaints by month (all portfolios)
@@ -297,49 +383,58 @@ def run(store, params: Optional[Dict] = None, user_text: Optional[str] = None) -
         ax.set_title("Complaints per 1,000 — Jan–Jun 2025", fontsize=11)
         st.pyplot(fig, use_container_width=True)
 
-    # ---- Row 2: RCA2 table (left) + bar (right)
+    # ---- Row 2: RCA2 table (left) + RCA1 bar (right)
     st.markdown("---")
     c3, c4 = st.columns([1.0, 1.2], gap="large")
 
     # --------------------------------------
-    # C. June reasons (RCA2) table + bar
+    # C. June reasons (RCA2) Top-80 table
     # --------------------------------------
-    reasons = (
+    reasons2 = (
         compl_jun["_rca2"]
         .value_counts(dropna=False)
         .rename_axis("reason")
         .to_frame("count")
         .reset_index()
     )
-    reasons["percent"] = (reasons["count"] / max(reasons["count"].sum(), 1)) * 100.0
+    reasons2["percent"] = (reasons2["count"] / max(reasons2["count"].sum(), 1)) * 100.0
 
     with c3:
         st.markdown("### RCA2 — Top 80% (June 2025)")
-        if reasons.empty:
+        if reasons2.empty:
             st.info("No June complaints to show.")
         else:
-            r2 = reasons.sort_values("count", ascending=False).reset_index(drop=True).copy()
+            r2 = reasons2.sort_values("count", ascending=False).reset_index(drop=True).copy()
             r2["cum_percent"] = r2["percent"].cumsum()
             top80 = r2[r2["cum_percent"] <= 80.0]
             if top80.empty and not r2.empty:
                 top80 = r2.iloc[[0]].copy()
             st.dataframe(top80, use_container_width=True)
 
+    # --------------------------------------
+    # D. June RCA1 bar (higher level)
+    # --------------------------------------
+    reasons1 = (
+        compl_jun["_rca1"]
+        .value_counts(dropna=False)
+        .rename_axis("rca1")
+        .to_frame("count")
+        .reset_index()
+    ).sort_values("count", ascending=False)
+
     with c4:
         st.markdown("### RCA1 — June 2025")
-        # For now we show the same RCA2 buckets (RCA1 source may not exist consistently);
-        # if a true RCA1 column exists, it will be mapped in _reason_rca2_map or can be swapped here.
         fig2, ax2 = plt.subplots(figsize=(6.6, 3.6), dpi=150)
-        cols = _pastel_colors(len(reasons))
-        bars = ax2.bar(reasons["reason"], reasons["count"], color=cols, edgecolor="none")
+        cols = _pastel_colors(len(reasons1))
+        bars = ax2.bar(reasons1["rca1"], reasons1["count"], color=cols, edgecolor="none")
         for b in bars:
             h = b.get_height()
-            ax2.text(b.get_x() + b.get_width() / 2, h + max(reasons["count"]) * 0.03, f"{int(h)}",
+            ax2.text(b.get_x() + b.get_width() / 2, h + max(reasons1["count"]) * 0.03, f"{int(h)}",
                      ha="center", va="bottom", fontsize=9)
         _soft_line(ax2)
-        ax2.set_xticklabels(reasons["reason"], rotation=22, ha="right")
-        ax2.set_title("June reasons (RCA)", fontsize=11)
+        ax2.set_xticklabels(reasons1["rca1"], rotation=20, ha="right")
+        ax2.set_title("June reasons (RCA1)", fontsize=11)
         st.pyplot(fig2, use_container_width=True)
 
-    # Return something non-empty for app bookkeeping
+    # Done — no third row rendered.
     return "complaints_june_by_portfolio", table_display
