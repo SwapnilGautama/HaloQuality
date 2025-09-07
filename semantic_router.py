@@ -1,24 +1,36 @@
 # semantic_router.py
-"""
-Very small router: map a free-text question to a question "slug"
-and optional params. Keep this additive and safe.
-"""
-
 from __future__ import annotations
+import re
 from typing import Dict
 
+def _parse_month_range(q: str):
+    m = re.search(r"([a-z]{3}\s*\d{4})\s*to\s*([a-z]{3}\s*\d{4})", q, re.I)
+    if not m:
+        return {}
+    return {"start": m.group(1).title(), "end": m.group(2).title()}
+
+def _parse_portfolio(q: str):
+    # portfolio <name> OR "for London" etc.
+    p = re.search(r"\bportfolio\s+([a-z\s]+)", q, re.I)
+    if p:
+        return {"portfolio": p.group(1).strip().title()}
+    p2 = re.search(r"\bfor\s+([a-z\s]+?)\s+(jun|jul|aug|sep|oct|nov|dec|\d{4}|to|last|month)", q, re.I)
+    if p2:
+        return {"portfolio": p2.group(1).strip().title()}
+    return {}
+
 def match(q: str) -> Dict:
-    ql = (q or "").lower().strip()
+    ql = q.lower()
+    params = {}
+    params.update(_parse_month_range(ql))
+    params.update(_parse_portfolio(ql))
 
-    # --- First Pass Accuracy intents
-    fpa_terms = ["first pass", "first-pass", "fpa", "pass accuracy", "pass rate", "pass %", "first pass accuracy"]
-    if any(t in ql for t in fpa_terms):
-        return {"slug": "first_pass_accuracy", "params": {}}
+    # NEW: detect first pass accuracy
+    if ("first pass accuracy" in ql) or ("first-pass accuracy" in ql) or ("fpa" in ql and "analysis" in ql):
+        return {"slug": "first_pass_accuracy", "params": params}
 
-    # --- Complaints analysis (default/fallback)
-    comp_terms = ["complaint", "complaints", "rca", "per 1000", "portfolio"]
-    if any(t in ql for t in comp_terms):
-        return {"slug": "complaints_june_by_portfolio", "params": {}}
-
-    # default to complaints to remain backwards compatible
-    return {"slug": "complaints_june_by_portfolio", "params": {}}
+    if "complaints per 1000" in ql or "complaints per thousand" in ql:
+        return {"slug": "complaints_per_thousand", "params": params}
+    if "complaint analysis" in ql or "complaints dashboard" in ql or "june analysis" in ql:
+        return {"slug": "complaints_june_by_portfolio", "params": params}
+    return {"slug": "complaints_june_by_portfolio", "params": params}
