@@ -42,7 +42,7 @@ _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 _PASTEL_LINE = "#88cde8"
-_PARETO_LINE = "#6ab6e1"  # smooth soft pastel
+_PARETO_LINE = "#6ab6e1"
 
 def _header(title: str) -> None:
     st.markdown(
@@ -122,7 +122,6 @@ def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label=
     return out
 
 def _months_13() -> List[str]:
-    # Jun-24 .. Jun-25 (13 points)
     base = pd.period_range("2024-06", "2025-06", freq="M")
     return [str(p) for p in base]
 
@@ -253,7 +252,6 @@ _RCA2_ALLOWED = [
     "Scheme rules", "Communication unclear", "Other",
 ]
 
-# RCA2 -> RCA1 mapping to strengthen RCA1 & enable delay splits
 RCA2_TO_RCA1_MAP = {
     "Manual calculation": "Delay",
     "Waiting on member/TPA": "Delay",
@@ -460,7 +458,7 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
 
 
 # -------------------------------
-# Plotting (overall visuals)
+# Plotting (overall)
 # -------------------------------
 
 def _mom_line_fig(df: pd.DataFrame):
@@ -565,19 +563,15 @@ def _portfolio_mom_series(cases: pd.DataFrame, comp: pd.DataFrame, portfolio: st
     return pd.DataFrame({"month": pretty, "per_1000": np.round(per, 1)})
 
 def _fig_portfolio_trend(df: pd.DataFrame, title: str):
-    # red line + dotted linear trend (as in screenshot)
     fig, ax = plt.subplots(figsize=(6.8, 3.2))
     ax.plot(df["month"], df["per_1000"], color="#d95f02", linewidth=2.5, marker="o")
-    # annotate
     for x, y in zip(df["month"], df["per_1000"]):
         ax.text(x, y + 0.15, f"{y:.1f}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    # trendline
     idx = np.arange(len(df))
     z = np.polyfit(idx, df["per_1000"].astype(float), 1)
     ax.plot(df["month"], z[0]*idx + z[1], linestyle=":", linewidth=1.8, color="#7f7f7f")
     ax.set_title(title, color=_DARK_BLUE)
     ax.set_ylim(bottom=0)
-    # soften axes
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY)
@@ -633,7 +627,7 @@ def _fig_reason_trend(df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(6.6, 3.2))
     x = np.arange(len(df["RCA1"]))
     width = 0.26
-    colors = ["#74c476", "#a1d99b", "#9ecae1"]  # Apr, May, Jun
+    colors = ["#74c476", "#a1d99b", "#9ecae1"]
     labels = [c for c in df.columns if c != "RCA1"]
     for i, col in enumerate(labels):
         ax.bar(x + (i-1)*width, df[col].values, width=width, label=col, color=colors[i % len(colors)])
@@ -642,7 +636,6 @@ def _fig_reason_trend(df: pd.DataFrame):
     ax.set_ylim(0, 100)
     ax.legend(frameon=False, loc="upper right")
     ax.set_title("Reason Trend (Apr–Jun ’25) — % split", color=_DARK_BLUE)
-    # clean frame
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY)
@@ -667,7 +660,6 @@ def _delay_split_df(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.Data
             rows.append((lab, 0.0, 0.0))
             continue
         r1, r2 = _rca_labels_for_subset(subset[desc_col], use_ai=use_ai)
-        # keep only Delay-related
         delay_mask = [a == "Delay" or b in DELAY_RCA2 for a, b in zip(r1, r2)]
         if not any(delay_mask):
             rows.append((lab, 0.0, 0.0)); continue
@@ -810,7 +802,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
       - Overall (original dashboard, unchanged)
       - One tab per Portfolio with the layout from the screenshot
     """
-    # Hide any sidebar / parsed filters / toolbars
+    # Hide sidebar / toolbar / parsed filters AND any alert (blue) boxes
     st.markdown(
         """
         <style>
@@ -818,7 +810,9 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         .stApp div[role="complementary"] {display:none !important;}
         [data-testid="stSidebarNav"] {display: none !important;}
         [data-testid="stToolbar"] {display: none !important;}
-        div[data-testid="stExpander"] {display: none !important;} /* hide 'Parsed filters' */
+        div[data-testid="stExpander"] {display: none !important;}
+        /* Hide all info/warning/alert boxes (removes the two blue bars at bottom) */
+        div[role="alert"] { display: none !important; }
         section[data-testid="stMain"] {padding-left: 1rem; padding-right: 1rem;}
         </style>
         """,
@@ -832,7 +826,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     portfolios = _portfolio_list(cases, comp)
     tabs = st.tabs(["Overall"] + portfolios)
 
-    # ----------------- Overall tab (preserved) -----------------
+    # ----------------- Overall tab -----------------
     with tabs[0]:
         table = _portfolio_table_for_june(cases, comp)
         mom = _mom_series(cases, comp)
@@ -872,7 +866,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                     use_container_width=True,
                 )
 
-        # PPT export
         if _PPT_READY and not table.empty and not mom.empty and not rca1.empty and not rca2.empty:
             ppt_bytes = _build_ppt(table, mom, rca1, rca2)
             st.download_button(
@@ -890,40 +883,28 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         with tabs[i]:
             st.markdown(f"<h2 style='color:{_DARK_BLUE};margin:.3rem 0 1rem 0;'>{portfolio} — complaints analysis</h2>", unsafe_allow_html=True)
 
-            # top row
             t1, t2 = st.columns((1.1, 1.0), gap="large")
             with t1:
                 df_trend = _portfolio_mom_series(cases, comp, portfolio)
                 if not df_trend.empty:
-                    fig = _fig_portfolio_trend(df_trend, f"{portfolio} trend Jun’24–Jun’25")
-                    st.pyplot(fig)
-                else:
-                    st.info("No data to build trend.")
+                    st.pyplot(_fig_portfolio_trend(df_trend, f"{portfolio} trend Jun’24–Jun’25"))
             with t2:
                 df_reason_trend = _reason_trend_df(comp, portfolio, use_ai=use_ai)
                 if not df_reason_trend.empty:
-                    figr = _fig_reason_trend(df_reason_trend)
-                    st.pyplot(figr)
-                else:
-                    st.info("No complaints available for Apr–Jun ’25 in this portfolio.")
+                    st.pyplot(_fig_reason_trend(df_reason_trend))
 
-            # bottom row
             b1, b2 = st.columns((1.1, 1.0), gap="large")
             with b1:
                 df_delay = _delay_split_df(comp, portfolio, use_ai=use_ai)
                 if not df_delay.empty:
                     st.pyplot(_fig_delay_split(df_delay))
-                else:
-                    st.info("No delay complaints detected for Apr–Jun ’25.")
 
             with b2:
                 left, right = st.columns(2)
                 with left:
                     _header("Delay — June (Top 80%)")
                     tdelay = _table_delay_80(comp, portfolio, use_ai=use_ai)
-                    if tdelay.empty:
-                        st.info("No delay reasons for June.")
-                    else:
+                    if not tdelay.empty:
                         st.dataframe(
                             _style_table(tdelay, formats={"Percentage contribution": "{:.0f}%"}),
                             use_container_width=True,
@@ -931,13 +912,11 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                 with right:
                     _header("Procedure — June (Top 80%)")
                     tproc = _table_procedure_80(comp, portfolio, use_ai=use_ai)
-                    if tproc.empty:
-                        st.info("No procedure reasons for June.")
-                    else:
+                    if not tproc.empty:
                         st.dataframe(
                             _style_table(tproc, formats={"Percentage contribution": "{:.0f}%"}),
                             use_container_width=True,
                         )
 
-    # Return empty df (we render UI)
+    # Return an empty df (we suppress default alerts with CSS so no blue bars)
     return ("", pd.DataFrame())
