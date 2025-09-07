@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from io import BytesIO
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -11,9 +12,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# -------------------------------
-# Optional OpenAI (AI labelling)
-# -------------------------------
+# Optional OpenAI for AI labelling
 _OPENAI_READY = False
 try:
     import openai  # type: ignore
@@ -23,15 +22,26 @@ try:
 except Exception:
     _OPENAI_READY = False
 
+# Optional python-pptx for export
+_PPT_READY = False
+try:
+    from pptx import Presentation  # type: ignore
+    from pptx.util import Inches, Pt
+    from pptx.enum.text import PP_ALIGN
+    from pptx.dml.color import RGBColor
+    _PPT_READY = True
+except Exception:
+    _PPT_READY = False
+
 
 # -------------------------------
-# small helpers (styling)
+# Theming helpers
 # -------------------------------
 
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
-_PASTEL_LINE = "#88cde8"  # cumulative line on Pareto
+_PASTEL_LINE = "#88cde8"
 
 def _header(title: str) -> None:
     st.markdown(
@@ -40,7 +50,6 @@ def _header(title: str) -> None:
     )
 
 def _hide_index(sty: "pd.io.formats.style.Styler") -> "pd.io.formats.style.Styler":
-    """Hide index for both pandas<2.0 and >=2.0."""
     try:
         return sty.hide(axis="index")
     except Exception:
@@ -63,13 +72,17 @@ def _style_table(
         )
         .set_properties(**{"color": _DARK_GREY})
     )
-    sty = _hide_index(sty)  # <- remove serial/index column
+    sty = _hide_index(sty)
     if formats:
         sty = sty.format(formats)
     else:
         sty = sty.format(precision=3)
     return sty
 
+
+# -------------------------------
+# Column detection / month helpers
+# -------------------------------
 
 def _find_first_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
     cols = {c.lower(): c for c in df.columns}
@@ -78,13 +91,24 @@ def _find_first_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
             return cols[c.lower()]
     return None
 
-
 def _norm_month_from_series(s: pd.Series) -> pd.Series:
     if pd.api.types.is_period_dtype(s):
         return s.astype(str)
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=False)
     return dt.dt.to_period("M").astype(str)
 
+def _build_month_column(df: pd.DataFrame, raw_col: str, assume_year: int | None = None) -> pd.Series:
+    s = df[raw_col]
+    m = _norm_month_from_series(s)
+    if m.notna().sum() >= max(1, int(0.1 * len(m))):
+        return m
+    if assume_year is not None:
+        try:
+            coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", format="%B %Y", errors="coerce")
+        except Exception:
+            coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", errors="coerce")
+        return coerced.dt.to_period("M").astype(str)
+    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M").astype(str)
 
 def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label="Total") -> pd.DataFrame:
     total = {c: df[c].sum() if c in sum_cols else None for c in df.columns}
@@ -98,7 +122,7 @@ def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label=
 
 
 # -------------------------------
-# RCA mappings (keyword fallback)
+# RCA rules + AI support
 # -------------------------------
 
 def _preclean(text: str) -> str:
@@ -130,7 +154,6 @@ def _preclean(text: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-
 def _classify(text: str, patterns: Dict[str, List[str]], default: str) -> str:
     t = _preclean(text)
     for label, pats in patterns.items():
@@ -138,7 +161,6 @@ def _classify(text: str, patterns: Dict[str, List[str]], default: str) -> str:
             if re.search(p, t):
                 return label
     return default
-
 
 def _rca1_keyword(text: str) -> str:
     patterns = {
@@ -168,7 +190,6 @@ def _rca1_keyword(text: str) -> str:
         ],
     }
     return _classify(text, patterns, default="Other")
-
 
 def _rca2_keyword(text: str) -> str:
     patterns = {
@@ -214,45 +235,20 @@ def _rca2_keyword(text: str) -> str:
     }
     return _classify(text, patterns, default="Other")
 
-
-# -------------------------------
-# Optional: AI labelling helpers
-# -------------------------------
-
 _RCA1_ALLOWED = [
-    "Delay",
-    "Procedure",
-    "Communication",
-    "System",
-    "Incorrect/Incomplete information",
-    "Other",
+    "Delay", "Procedure", "Communication", "System",
+    "Incorrect/Incomplete information", "Other",
 ]
-
 _RCA2_ALLOWED = [
-    "Manual calculation",
-    "Documentation missing",
-    "Template/Form issue",
-    "Data entry error",
-    "Waiting on member/TPA",
-    "Bank/Payment issue",
-    "Address/Contact incorrect",
-    "Pension set up",
-    "Postal delay",
-    "AVC",
-    "Case not created",
-    "2nd review / QA",
-    "Trustee",
-    "Death benefits payout",
-    "Overpayment",
-    "Drop in value / factor change",
-    "Scheme rules",
-    "Communication unclear",
-    "Other",
+    "Manual calculation", "Documentation missing", "Template/Form issue", "Data entry error",
+    "Waiting on member/TPA", "Bank/Payment issue", "Address/Contact incorrect",
+    "Pension set up", "Postal delay", "AVC", "Case not created", "2nd review / QA",
+    "Trustee", "Death benefits payout", "Overpayment", "Drop in value / factor change",
+    "Scheme rules", "Communication unclear", "Other",
 ]
 
 # Map RCA2 -> higher-level RCA1 to reduce “Other”
 RCA2_TO_RCA1_MAP = {
-    # Delay umbrella
     "Manual calculation": "Delay",
     "Waiting on member/TPA": "Delay",
     "Postal delay": "Delay",
@@ -265,26 +261,18 @@ RCA2_TO_RCA1_MAP = {
     "Death benefits payout": "Delay",
     "Bank/Payment issue": "Delay",
 
-    # Procedure umbrella
     "Documentation missing": "Procedure",
     "Template/Form issue": "Procedure",
     "Scheme rules": "Procedure",
 
-    # Communication umbrella
     "Communication unclear": "Communication",
 
-    # Incorrect/Incomplete info umbrella
     "Data entry error": "Incorrect/Incomplete information",
     "Address/Contact incorrect": "Incorrect/Incomplete information",
     "Drop in value / factor change": "Incorrect/Incomplete information",
 }
 
-
 def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
-    """
-    Return a list of (rca1, rca2) pairs, strongly discouraging 'Other'.
-    Falls back to keyword classification if anything goes wrong.
-    """
     if not _OPENAI_READY:
         return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
     try:
@@ -325,11 +313,6 @@ def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
     except Exception:
         return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
 
-
-# -------------------------------
-# field detection
-# -------------------------------
-
 def _detect_cases_fields(cases: pd.DataFrame):
     id_col = _find_first_col(cases, ["Case ID", "CaseId", "ID"])
     port_col = _find_first_col(cases, ["Portfolio", "portfolio"])
@@ -337,7 +320,6 @@ def _detect_cases_fields(cases: pd.DataFrame):
         cases, ["Create Date (cases)", "Create Date", "Create date", "Start Date", "StartDate", "Created On", "CreateDt"]
     )
     return id_col, port_col, date_col
-
 
 def _detect_complaints_fields(comp: pd.DataFrame):
     id_col = _find_first_col(comp, ["Original Process Affected Case ID", "Case ID", "Parent Case ID"])
@@ -354,22 +336,8 @@ def _detect_complaints_fields(comp: pd.DataFrame):
     return id_col, port_col, date_col
 
 
-def _build_month_column(df: pd.DataFrame, raw_col: str, assume_year: int | None = None) -> pd.Series:
-    s = df[raw_col]
-    m = _norm_month_from_series(s)
-    if m.notna().sum() >= max(1, int(0.1 * len(m))):
-        return m
-    if assume_year is not None:
-        try:
-            coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", format="%B %Y", errors="coerce")
-        except Exception:
-            coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", errors="coerce")
-        return coerced.dt.to_period("M").astype(str)
-    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M").astype(str)
-
-
 # -------------------------------
-# core computations
+# Core computations
 # -------------------------------
 
 def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
@@ -401,13 +369,12 @@ def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.Dat
     out["complaints"] = out["complaints"].fillna(0).astype(int)
     with np.errstate(divide="ignore", invalid="ignore"):
         out["per_1000"] = (out["complaints"] * 1000 / out["cases"]).replace([np.inf, -np.inf], np.nan)
-    out["per_1000"] = out["per_1000"].round(1)  # single decimal
+    out["per_1000"] = out["per_1000"].round(1)
 
     out = out.sort_values(["complaints", "portfolio"], ascending=[False, True], kind="stable").reset_index(drop=True)
     out = _add_total_row(out, sum_cols=["cases", "complaints"], label_col="portfolio", label="Total")
     out["per_1000"] = out["per_1000"].round(1)
     return out
-
 
 def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     _, _, date_c = _detect_cases_fields(cases)
@@ -426,11 +393,7 @@ def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     pretty = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in want]
     return pd.DataFrame({"month": pretty, "per_1000": per_1000.values})
 
-
 def _repair_rca1_from_rca2(rca1: List[str], rca2: List[str]) -> List[str]:
-    """
-    If RCA1 is 'Other' but RCA2 is specific, infer a better RCA1 via mapping.
-    """
     out = []
     for a, b in zip(rca1, rca2):
         if a == "Other" and b in RCA2_TO_RCA1_MAP:
@@ -438,7 +401,6 @@ def _repair_rca1_from_rca2(rca1: List[str], rca2: List[str]) -> List[str]:
         else:
             out.append(a)
     return out
-
 
 def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
     _, _, date_k = _detect_complaints_fields(comp)
@@ -466,13 +428,10 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
         r1_labels = [_rca1_keyword(t) for t in texts]
         r2_labels = [_rca2_keyword(t) for t in texts]
 
-    # NEW: repair RCA1 'Other' using RCA2 mapping to reduce “Other”
     r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
 
-    # RCA1 counts (for Pareto)
     r1 = pd.Series(r1_labels).value_counts(dropna=False).rename_axis("RCA1").reset_index(name="count")
 
-    # RCA2 Top-80 table
     r2_counts = pd.Series(r2_labels).value_counts(dropna=False).rename_axis("RCA2").reset_index(name="count")
     r2_counts["order"] = np.where(r2_counts["RCA2"].eq("Other"), 1, 0)
     r2_counts = r2_counts.sort_values(["order", "count"], ascending=[True, False]).drop(columns="order").reset_index(drop=True)
@@ -487,10 +446,10 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
 
 
 # -------------------------------
-# plotting
+# Plotting (with fig-return for PPT)
 # -------------------------------
 
-def _plot_mom_line(df: pd.DataFrame):
+def _mom_line_fig(df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(6.0, 3.2))
     ax.plot(df["month"], df["per_1000"], marker="o", linewidth=2.5, color="#9ecae1")
     for x, y in zip(df["month"], df["per_1000"]):
@@ -505,12 +464,13 @@ def _plot_mom_line(df: pd.DataFrame):
     ax.get_yaxis().set_visible(False)
     ax.tick_params(axis="x", colors=_DARK_GREY)
     ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
-    st.pyplot(fig)
+    return fig
 
+def _plot_mom_line(df: pd.DataFrame):
+    st.pyplot(_mom_line_fig(df))
 
-def _plot_rca1_pareto(df: pd.DataFrame):
-    data = df.copy()
-    data = data.sort_values("count", ascending=False).reset_index(drop=True)
+def _pareto_fig(df: pd.DataFrame):
+    data = df.copy().sort_values("count", ascending=False).reset_index(drop=True)
     total = float(max(1, data["count"].sum()))
     data["percent"] = data["count"] * 100.0 / total
     data["cum_percent"] = data["percent"].cumsum()
@@ -553,25 +513,101 @@ def _plot_rca1_pareto(df: pd.DataFrame):
     ax2.get_yaxis().set_visible(False)
     ax2.grid(False)
 
-    st.pyplot(fig)
+    return fig
+
+def _plot_rca1_pareto(df: pd.DataFrame):
+    st.pyplot(_pareto_fig(df))
 
 
 # -------------------------------
-# streamlit UI / entrypoint
+# PowerPoint export
+# -------------------------------
+
+def _add_df_table_to_slide(slide, df: pd.DataFrame, left_in: float, top_in: float, width_in: float):
+    """Add a df as a real PowerPoint table; styling close to the app."""
+    rows, cols = df.shape[0] + 1, df.shape[1]
+    table = slide.shapes.add_table(rows, cols, Inches(left_in), Inches(top_in), Inches(width_in), Inches(0.8 + 0.3*rows)).table
+
+    # Header
+    for j, col in enumerate(df.columns):
+        cell = table.cell(0, j)
+        cell.text = str(col)
+        cell.text_frame.paragraphs[0].font.bold = True
+        cell.text_frame.paragraphs[0].font.size = Pt(12)
+        cell.text_frame.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145)  # dark blue
+
+    # Body
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        for j, col in enumerate(df.columns):
+            val = row[col]
+            if isinstance(val, float):
+                if col == "per_1000" or col.endswith("percent"):
+                    text = f"{val:.1f}"
+                else:
+                    text = f"{val:.3f}".rstrip('0').rstrip('.') if '.' in f"{val:.3f}" else f"{val:.0f}"
+            else:
+                text = str(val)
+            cell = table.cell(i, j)
+            cell.text = text
+            p = cell.text_frame.paragraphs[0]
+            p.font.size = Pt(11)
+            p.font.color.rgb = RGBColor(51, 51, 51)  # dark grey
+            p.alignment = PP_ALIGN.LEFT
+    return table
+
+def _build_ppt(table_df: pd.DataFrame, mom_df: pd.DataFrame, rca1_df: pd.DataFrame, rca2_df: pd.DataFrame) -> bytes:
+    prs = Presentation()
+    # Slide 1: Title
+    title_slide = prs.slides.add_slide(prs.slide_layouts[5])
+    title = title_slide.shapes.title if title_slide.shapes.title else title_slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.8)).text_frame
+    title.text = "Complaint analysis — Jun 2025"
+    title.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145)
+    title.paragraphs[0].font.size = Pt(28)
+
+    # Slide 1 content: table (left) + MoM chart (right)
+    _add_df_table_to_slide(title_slide, table_df, left_in=0.5, top_in=1.2, width_in=5.0)
+    fig_mom = _mom_line_fig(mom_df)
+    buf_mom = BytesIO(); fig_mom.savefig(buf_mom, format="png", dpi=220, bbox_inches="tight"); plt.close(fig_mom)
+    title_slide.shapes.add_picture(buf_mom, Inches(6.0), Inches(1.0), width=Inches(4.5))
+
+    # Slide 2: RCA1 Pareto + RCA2 Top 80
+    slide2 = prs.slides.add_slide(prs.slide_layouts[5])
+    t2 = slide2.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.8)).text_frame
+    t2.text = "June reasons — RCA"
+    t2.paragraphs[0].font.color.rgb = RGBColor(11, 61, 145)
+    t2.paragraphs[0].font.size = Pt(24)
+
+    fig_pareto = _pareto_fig(rca1_df)
+    buf_pareto = BytesIO(); fig_pareto.savefig(buf_pareto, format="png", dpi=220, bbox_inches="tight"); plt.close(fig_pareto)
+    slide2.shapes.add_picture(buf_pareto, Inches(0.5), Inches(1.1), width=Inches(5.6))
+
+    _add_df_table_to_slide(slide2, rca2_df, left_in=6.4, top_in=1.1, width_in=4.2)
+
+    out = BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return out.read()
+
+
+# -------------------------------
+# Streamlit entrypoint
 # -------------------------------
 
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     """
     Row 1: Portfolio table + MoM line
     Row 2: RCA1 Pareto (left) + RCA2 Top-80 table (right)
+    + Hide sidebar; + Download PPT
     """
-    # Hide host “Parsed filters”, info bars, and the left sidebar
+    # Aggressively hide any sidebar / left pane (Streamlit variants)
     st.markdown(
         """
         <style>
-        div[data-testid="stExpander"] {display: none;}
-        div[data-testid="stAlert"] {display: none;}
-        div[data-testid="stSidebar"] {display: none;}
+        [data-testid="stSidebar"], section[data-testid="stSidebar"] {display: none !important;}
+        .stApp div[role="complementary"] {display:none !important;}
+        [data-testid="stSidebarNav"] {display: none !important;}
+        [data-testid="stToolbar"] {display: none !important;}
+        div[data-testid="stExpander"] {display: none !important;}  /* hide 'Parsed filters' */
         section[data-testid="stMain"] {padding-left: 1rem; padding-right: 1rem;}
         </style>
         """,
@@ -581,7 +617,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     cases: pd.DataFrame = store.get("cases", pd.DataFrame()).copy()
     comp: pd.DataFrame = store.get("complaints", pd.DataFrame()).copy()
 
-    # ----- Row 1 -----
+    # Row 1
     table = _portfolio_table_for_june(cases, comp)
     mom = _mom_series(cases, comp)
 
@@ -602,7 +638,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not mom.empty:
             _plot_mom_line(mom)
 
-    # ----- Row 2 -----
+    # Row 2
     use_ai = bool(os.getenv("OPENAI_API_KEY"))
     rca2, rca1 = _rca_tables_for_june(comp, use_ai=use_ai)
 
@@ -623,5 +659,18 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                 use_container_width=True,
             )
 
-    # prevent host app duplicate table
+    # PowerPoint download
+    if _PPT_READY and not table.empty and not mom.empty and not rca1.empty and not rca2.empty:
+        ppt_bytes = _build_ppt(table, mom, rca1, rca2)
+        st.download_button(
+            "Download PPT",
+            data=ppt_bytes,
+            file_name="Complaint_Analysis_Jun2025.pptx",
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            type="primary",
+        )
+    elif not _PPT_READY:
+        st.caption("Install `python-pptx` to enable PPT download.")
+
+    # Return empty df to host (we render everything ourselves)
     return ("", pd.DataFrame())
