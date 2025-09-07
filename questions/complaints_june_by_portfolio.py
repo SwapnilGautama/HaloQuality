@@ -2,313 +2,458 @@
 # questions/complaints_june_by_portfolio.py
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, List
+import os
 import re
-import calendar
-import pandas as pd
+from typing import Dict, List, Tuple
+
 import numpy as np
+import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# -------------------------------------------------------------------
-# helpers
-# -------------------------------------------------------------------
+# -------------------------------
+# Optional OpenAI (AI labelling)
+# -------------------------------
+_OPENAI_READY = False
+try:
+    # Prefer the classic API since it's widely available across deployments
+    import openai  # type: ignore
 
-def _find_col(df: pd.DataFrame, needles: List[str]) -> Optional[str]:
-    """Return the first column whose lowercase name contains ANY of the
-    substrings in `needles` (also lowercase)."""
-    low = {c.lower(): c for c in df.columns}
-    for lc, orig in low.items():
-        if any(n in lc for n in needles):
-            return orig
+    if os.getenv("OPENAI_API_KEY"):
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        _OPENAI_READY = True
+except Exception:
+    _OPENAI_READY = False
+
+
+# -------------------------------
+# small helpers
+# -------------------------------
+
+def _section(title: str, caption: str | None = None) -> None:
+    st.subheader(title)
+    if caption:
+        st.caption(caption)
+
+
+def _find_first_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    cols = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols:
+            return cols[c.lower()]
     return None
 
 
-def _month_key(year: int, month: int) -> str:
-    return f"{year}-{month:02d}"
-
-
-def _to_month(df: pd.DataFrame, col: str) -> pd.Series:
-    """Coerce to pandas Period (month) then to string 'YYYY-MM'."""
-    x = pd.to_datetime(df[col], errors="coerce").dt.to_period("M").astype(str)
-    return x
-
-
-def _coerce_months_from_text(s: pd.Series, default_year: int) -> pd.Series:
+def _norm_month_from_series(s: pd.Series) -> pd.Series:
     """
-    Handle cases like 'June', 'Jun', etc., assuming `default_year`.
-    Returns 'YYYY-MM' strings or NaN.
+    Return a series of 'YYYY-MM' (string) months from any date-ish column.
+    Accepts datetime, string, period; coerces errors to NaT.
     """
-    def parse_one(v):
-        if pd.isna(v):
-            return np.nan
-        txt = str(v).strip()
-        # try direct date
-        dt = pd.to_datetime(txt, errors="coerce", dayfirst=True)
-        if not pd.isna(dt):
-            return str(dt.to_period("M"))
-        # try month names
-        m = re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)", txt, re.I)
-        if m:
-            month = m.group(1).lower()[:3]
-            month_num = {
-                "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-                "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12
-            }[month]
-            return f"{default_year}-{month_num:02d}"
-        return np.nan
-    return s.map(parse_one)
+    if pd.api.types.is_period_dtype(s):
+        return s.astype(str)
+
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=False)
+    return dt.dt.to_period("M").astype(str)
 
 
-def _soft_axes(ax):
-    """Hide frame & y ticks for minimalist visuals (pastel style)."""
-    for spine in ["top", "right", "left", "bottom"]:
-        ax.spines[spine].set_visible(False)
-    ax.grid(False)
-    ax.tick_params(axis="y", left=False, labelleft=False)
+def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label="Total") -> pd.DataFrame:
+    total = {c: df[c].sum() if c in sum_cols else None for c in df.columns}
+    total[label_col] = label
+    out = pd.concat([pd.DataFrame([total]), df], ignore_index=True)
+    if all(c in out.columns for c in ["cases", "complaints"]):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            per = out["complaints"] * 1000 / out["cases"]
+        out["per_1000"] = per.replace([np.inf, -np.inf], np.nan)
+    return out
 
 
-def _annotate_line(ax, xs, ys):
-    for x, y in zip(xs, ys):
-        ax.text(x, y, f"{y:.2f}", ha="center", va="bottom", fontsize=9)
+# -------------------------------
+# RCA mappings (keyword fallback)
+# -------------------------------
+
+def _classify(text: str, patterns: Dict[str, List[str]], default: str) -> str:
+    t = (text or "").lower()
+    for label, pats in patterns.items():
+        for p in pats:
+            if re.search(p, t):
+                return label
+    return default
 
 
-# -------------------------------------------------------------------
-# RCA mapping
-# -------------------------------------------------------------------
-
-# Higher level — RCA1 (broad umbrellas, kept as-is)
-RCA1_MAP: List[Tuple[str, str]] = [
-    (r"\bdelay|late|slow|backlog|waiting|manual calc|postal|2nd review|not created|not checked\b", "Delay"),
-    (r"\bprocedure|process|timescale|scheme rule|factor change|setup\b", "Procedure"),
-    (r"\bcommunicat|letter|email|call|clarity\b", "Communication"),
-    (r"\bsystem|portal|workflow|it error|glitch\b", "System"),
-    (r"\bincorrect|incomplete|wrong|missing|evidence|document|doc|form\b", "Incorrect/Incomplete information"),
-]
-
-# Deeper level — RCA2 (built from "Brief Description - RCA done by admin")
-# You can extend this easily; left side is a pattern, right side is the category label.
-RCA2_MAP: List[Tuple[str, str]] = [
-    (r"\bscheme rule", "Scheme Rules"),
-    (r"\bstandard time|timescale|sla\b", "Aptia standard Timescale"),
-    (r"\bdrop in value|factor change", "Drop in value / factor change"),
-    (r"\bdeath benefit|death\s*benefits\s*payout", "Death benefits payout"),
-    (r"\boverpayment\b", "Overpayment"),
-    (r"\bpension increase\b", "Pension Increase"),
-    (r"\btransfer doc|transfer\s*document", "Transfer Documentation"),
-    (r"\bmanual calc|manual calculation", "Manual calculation"),
-    (r"\bpostal delay|post\b", "Postal Delay"),
-    (r"\brequirement not checked|not checked|validation", "Requirement not checked"),
-    (r"\bcase not created|missing case\b", "Case not created"),
-    (r"\b2nd review|second review\b", "2nd Review"),
-    (r"\btrustee\b", "Trustee"),
-    (r"\bavc\b", "Delay – AVC"),
-    (r"\bcommunicat|lack of clarity|unclear\b", "Communication — lack of clarity"),
-    (r"\bdoc(ument)? missing|missing (doc|document|evidence|form)", "Documentation Missing"),
-    (r"\bsetup|set up\b", "Pension set up"),
-]
-
-def _classify(text: str, mapping: List[Tuple[str, str]], default_label="Other") -> str:
-    if not isinstance(text, str):
-        return default_label
-    t = text.lower()
-    for pat, label in mapping:
-        if re.search(pat, t):
-            return label
-    return default_label
-
-
-# -------------------------------------------------------------------
-# main compute
-# -------------------------------------------------------------------
-
-def _build_tables_and_charts(store, month_key: str = "2025-06"):
-    """Do all the work; returns the DF we display in Row 1 (for app to cache/return)."""
-    # ---- read store ----
-    cases = store.get("cases", pd.DataFrame()).copy()
-    complaints = store.get("complaints", pd.DataFrame()).copy()
-
-    if cases.empty or complaints.empty:
-        st.warning("No cases or complaints data.")
-        return pd.DataFrame()
-
-    # ---- locate columns robustly ----
-    # portfolio
-    port_c_cases = _find_col(cases, ["portfolio"])
-    port_c_compl = _find_col(complaints, ["portfolio"])
-    if port_c_cases is None:
-        st.error("Missing 'Portfolio' in cases.")
-        return pd.DataFrame()
-    if port_c_compl is None:
-        # It's ok if complaints has no portfolio — join later still works but table looks better with cases' portfolios
-        port_c_compl = port_c_cases
-
-    # case id (for sanity checks if needed)
-    case_id_col = _find_col(cases, ["case id", "id"])
-
-    # create date for cases
-    create_cases = _find_col(cases, ["create date"])
-    if create_cases is None:
-        # fallback: start date
-        create_cases = _find_col(cases, ["start date"])
-    if create_cases is None:
-        st.error("Missing Create date in cases.")
-        return pd.DataFrame()
-
-    # complaint date/month in complaints (Month field is often present)
-    comp_date_col = None
-    for cand in [["date complaint received", "dd/mm/yy"], ["complaint date", "month"], ["month"]]:
-        comp_date_col = _find_col(complaints, cand)
-        if comp_date_col:
-            break
-    # brief description field for RCA2 text analysis
-    rca_text_col = _find_col(complaints, ["brief description", "rca done by admin"])
-
-    # ---- month keys ----
-    # Cases use real dates
-    cases["_month"] = _to_month(cases, create_cases)
-    # Complaints can be actual dates or just "June"
-    if comp_date_col is None:
-        complaints["_month"] = np.nan
-    else:
-        # Try datetime first; if fails, allow month words and coerce to 2025
-        tmp = pd.to_datetime(complaints[comp_date_col], errors="coerce")
-        if tmp.notna().any():
-            complaints["_month"] = tmp.dt.to_period("M").astype(str)
-        else:
-            complaints["_month"] = _coerce_months_from_text(complaints[comp_date_col], 2025)
-
-    # ---- June (Row 1 table per portfolio) ----
-    cases_jun = cases.loc[cases["_month"] == month_key].groupby(port_c_cases).size().rename("cases")
-    compl_jun = complaints.loc[complaints["_month"] == month_key].groupby(port_c_compl).size().rename("complaints")
-
-    # Keep the portfolio index from CASES (so we don't pick up 'None' from complaints)
-    df1 = (
-        pd.DataFrame(cases_jun)
-        .join(compl_jun, how="left")
-        .fillna({"complaints": 0})
-        .astype({"complaints": int})
-        .reset_index()
-        .rename(columns={port_c_cases: "portfolio"})
-    )
-
-    # per 1000
-    df1["per_1000"] = np.where(df1["cases"] > 0, df1["complaints"] / df1["cases"] * 1000, np.nan)
-
-    # Add TOTAL row at the top
-    total_row = {
-        "portfolio": "Total",
-        "cases": int(df1["cases"].sum()),
-        "complaints": int(df1["complaints"].sum()),
-        "per_1000": (df1["complaints"].sum() / df1["cases"].sum() * 1000) if df1["cases"].sum() > 0 else np.nan,
+def _rca1_keyword(text: str) -> str:
+    patterns = {
+        "Delay": [
+            r"\bdelay(ed|s|ing)?\b", r"\btimes? ?scale\b", r"\bsla\b", r"\bbacklog\b",
+            r"\bqueue\b", r"\boverdue\b", r"\bawait(ing)?\b", r"\bchase|chaser|chasing\b",
+        ],
+        "Procedure": [
+            r"\bscheme rules?\b", r"\bprocedure\b", r"\bprocess\b",
+            r"\btemplate\b", r"\bform\b", r"\bconsent form\b",
+            r"\bdocumentation (missing|not provided)\b", r"\bevidence\b",
+        ],
+        "Communication": [
+            r"\bcommunicat(e|ion|ions)\b", r"\bemail\b", r"\bletter\b",
+            r"\bphone|call\b", r"\bupdate\b", r"\b(not|no) response\b",
+            r"\bunclear\b", r"\bmis-?communicat",
+        ],
+        "System": [
+            r"\bsystem\b", r"\bportal\b", r"\bworkflow\b", r"\bautomation\b",
+            r"\bbug\b", r"\btechnical\b", r"\bit\b",
+        ],
+        "Incorrect/Incomplete information": [
+            r"\bincorrect\b", r"\bwrong\b", r"\bincomplete\b", r"\berror\b",
+            r"\bmis-?key(ed)?\b", r"\btypo\b", r"\bmisallocat(ed|ion)\b",
+            r"\baddress\b", r"\bbank\b", r"\bdob\b", r"\bni number\b",
+        ],
     }
-    df1 = pd.concat([pd.DataFrame([total_row]), df1], ignore_index=True)
+    return _classify(text, patterns, default="Other")
 
-    # ---- MoM chart (Jan–Jun 2025) overall per 1000 ----
-    months = [ _month_key(2025, m) for m in range(1, 7) ]  # Jan..Jun 2025
-    cases_m = cases.groupby("_month").size().reindex(months).fillna(0).astype(int)
-    compl_m = complaints.groupby("_month").size().reindex(months).fillna(0).astype(int)
-    per1000_m = np.where(cases_m > 0, compl_m / cases_m * 1000, 0.0)
 
-    # ---- draw Row 1 ----
-    left, right = st.columns([1.2, 1.2])
+def _rca2_keyword(text: str) -> str:
+    patterns = {
+        "Manual calculation": [r"\bmanual calculat", r"\bre-?calculat"],
+        "Documentation missing": [r"\bdocument(s|ation)? (missing|not (provided|received))\b",
+                                  r"\bevidence (missing|not provided)\b"],
+        "Template/Form issue": [r"\bwrong form\b", r"\bincorrect form\b", r"\btemplate\b", r"\bform( not|) complete"],
+        "Data entry error": [r"\bmis-?key", r"\bkeying error\b", r"\btypo\b", r"\bduplicate( case|)\b", r"\bwrong entry\b"],
+        "Waiting on member/TPA": [r"\bawait(ing)?\b", r"\bchase|chaser|chasing\b", r"\bno response\b"],
+        "Bank/Payment issue": [r"\bbank\b", r"\bbacs\b", r"\bpayment\b", r"\brefund\b"],
+        "Address/Contact incorrect": [r"\baddress\b", r"\bcontact details?\b"],
+        "Pension set up": [r"\b(pension|record) set ?up\b", r"\bsetup\b"],
+        "Postal delay": [r"\bpost(al)?\b", r"\bmail\b"],
+        "AVC": [r"\bavc\b"],
+        "Case not created": [r"\bcase not created\b", r"\bnot created\b", r"\bnot raised\b"],
+        "2nd review / QA": [r"\b(second|2nd) review\b", r"\bqa\b"],
+        "Trustee": [r"\btrustee\b"],
+        "Death benefits payout": [r"\bdeath benefit", r"\bbeneficiar(y|ies)"],
+        "Overpayment": [r"\boverpayment\b"],
+        "Drop in value / factor change": [r"\bfactor change\b", r"\bdrop in value\b", r"\bmarket\b"],
+        "Scheme rules": [r"\bscheme rules?\b", r"\blegislation\b"],
+        "Communication unclear": [r"\black of clarity\b", r"\bnot clear\b", r"\bconfus"],
+    }
+    return _classify(text, patterns, default="Other")
 
-    with left:
-        st.subheader("Complaint analysis — Jun 2025 (by portfolio)")
-        st.caption(f"Total: cases={total_row['cases']:,}, complaints={total_row['complaints']:,}, per_1000={total_row['per_1000']:.2f}")
-        st.dataframe(
-            df1[["portfolio", "cases", "complaints", "per_1000"]],
-            use_container_width=True
+
+# -------------------------------
+# Optional: AI labelling helpers
+# -------------------------------
+
+_RCA1_ALLOWED = [
+    "Delay",
+    "Procedure",
+    "Communication",
+    "System",
+    "Incorrect/Incomplete information",
+    "Other",
+]
+
+# Make RCA2 granular, but still human-readable and stable:
+_RCA2_ALLOWED = [
+    "Manual calculation",
+    "Documentation missing",
+    "Template/Form issue",
+    "Data entry error",
+    "Waiting on member/TPA",
+    "Bank/Payment issue",
+    "Address/Contact incorrect",
+    "Pension set up",
+    "Postal delay",
+    "AVC",
+    "Case not created",
+    "2nd review / QA",
+    "Trustee",
+    "Death benefits payout",
+    "Overpayment",
+    "Drop in value / factor change",
+    "Scheme rules",
+    "Communication unclear",
+    "Other",
+]
+
+
+def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
+    """
+    Returns list of (rca1, rca2) for each text using OpenAI if available.
+    Falls back to keyword labels on any error.
+    """
+    if not _OPENAI_READY:
+        return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
+
+    try:
+        # We prompt for JSON array of {"rca1": "...", "rca2": "..."} items
+        prompt = (
+            "You are classifying complaint root causes. "
+            "For each 'Brief Description – RCA done by admin', return a JSON array of objects "
+            "with keys 'rca1' and 'rca2'.\n\n"
+            f"RCA1 must be one of: {', '.join(_RCA1_ALLOWED)}.\n"
+            f"RCA2 must be one of: {', '.join(_RCA2_ALLOWED)}.\n"
+            "If unsure, use 'Other'.\n\n"
+            "Descriptions:\n"
+            + "\n".join([f"- {t}" for t in texts])
         )
 
-    with right:
-        fig, ax = plt.subplots(figsize=(6.5, 3.0))
-        xs = list(range(len(months)))
-        ax.plot(xs, per1000_m, marker="o", linewidth=2.5)
-        _soft_axes(ax)
-        # x labels Jan..Jun
-        ax.set_xticks(xs, [calendar.month_abbr[int(m.split("-")[1])] for m in months], fontsize=10)
-        _annotate_line(ax, xs, per1000_m)
-        ax.set_title("Complaints per 1,000 — MoM (Jan–Jun ’25)", pad=10)
-        st.pyplot(fig, clear_figure=True)
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",  # economical + reasoning
+            messages=[
+                {"role": "system", "content": "You output concise JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
 
-    # ---- Row 2: RCA2 (left table) + RCA1 (right chart) for June 2025 ----
-    st.markdown("---")
-    left2, right2 = st.columns([1.2, 1.2])
+        content = resp["choices"][0]["message"]["content"]
+        # very defensive parse
+        out = []
+        try:
+            data = pd.read_json(content)
+            # If it's a dict, wrap; else expect list-like
+            if isinstance(data, pd.DataFrame):
+                for _, row in data.iterrows():
+                    r1 = row.get("rca1", "Other")
+                    r2 = row.get("rca2", "Other")
+                    r1 = r1 if r1 in _RCA1_ALLOWED else "Other"
+                    r2 = r2 if r2 in _RCA2_ALLOWED else "Other"
+                    out.append((r1, r2))
+        except Exception:
+            out = []
 
-    # RCA2 on June data only, using deep text mapping
-    with left2:
-        st.subheader("RCA2 — Top 80% (June 2025)")
-        if rca_text_col is None:
-            st.info("No 'Brief Description - RCA done by admin' field in complaints.")
-            rca2_df = pd.DataFrame(columns=["RCA2", "count", "percent", "cum_percent"])
-        else:
-            june_mask = complaints["_month"].eq(month_key)
-            rcatext = complaints.loc[june_mask, rca_text_col].astype(str)
-            mapped = rcatext.map(lambda x: _classify(x, RCA2_MAP, default_label="Other"))
-            rca2 = mapped.value_counts(dropna=False).reset_index()
-            rca2.columns = ["RCA2", "count"]
-            rca2["percent"] = rca2["count"] / rca2["count"].sum() * 100
-            rca2 = rca2.sort_values("count", ascending=False, ignore_index=True)
-            rca2["cum_percent"] = rca2["percent"].cumsum()
-            # top 80%
-            rca2_df = rca2.loc[rca2["cum_percent"] <= 80]
-            if rca2_df.empty and not rca2.empty:
-                rca2_df = rca2.head(5)
-        st.dataframe(rca2_df, use_container_width=True)
+        if len(out) != len(texts):
+            # fallback if sizes mismatched
+            return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
+        return out
 
-    # RCA1 on June data (broad umbrellas; unchanged)
-    with right2:
-        st.subheader("RCA1 — June 2025")
-        # compute from comments + fallback to 'Other'
-        if rca_text_col is None:
-            st.info("No 'Brief Description - RCA done by admin' field for RCA1.")
-        else:
-            june_mask = complaints["_month"].eq(month_key)
-            rcatext = complaints.loc[june_mask, rca_text_col].astype(str)
-            def map_rca1(x: str) -> str:
-                for pat, lab in RCA1_MAP:
-                    if re.search(pat, x.lower()):
-                        return lab
-                return "Other"
-            rca1 = rcatext.map(map_rca1).value_counts().reindex(
-                ["Incorrect/Incomplete information", "Delay", "Procedure", "Communication", "System", "Other"],
-                fill_value=0
-            )
-            # pastel bar
-            fig2, ax2 = plt.subplots(figsize=(6.5, 3.2))
-            bars = ax2.bar(rca1.index, rca1.values)
-            _soft_axes(ax2)
-            ax2.set_xticklabels(rca1.index, rotation=20, ha="right")
-            ax2.set_title("June reasons (RCA1)")
-            # labels on bars
-            for b in bars:
-                ax2.text(b.get_x() + b.get_width()/2, b.get_height(), f"{int(b.get_height())}",
-                         ha="center", va="bottom", fontsize=9)
-            st.pyplot(fig2, clear_figure=True)
-
-    # Return Row 1 table for app’s caching/logging
-    return df1
+    except Exception:
+        # fallback on any API error
+        return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
 
 
-# -------------------------------------------------------------------
-# public entrypoint expected by app
-# -------------------------------------------------------------------
+# -------------------------------
+# field detection
+# -------------------------------
 
-def run(store: Dict[str, pd.DataFrame], params: Dict, user_text: Optional[str] = None):
+def _detect_cases_fields(cases: pd.DataFrame) -> Tuple[str | None, str | None, str | None]:
+    id_col = _find_first_col(cases, ["Case ID", "CaseId", "ID"])
+    port_col = _find_first_col(cases, ["Portfolio", "portfolio"])
+    date_col = _find_first_col(
+        cases, ["Create Date (cases)", "Create Date", "Create date", "Start Date", "StartDate", "Created On", "CreateDt"]
+    )
+    return id_col, port_col, date_col
+
+
+def _detect_complaints_fields(comp: pd.DataFrame) -> Tuple[str | None, str | None, str | None]:
+    id_col = _find_first_col(comp, ["Original Process Affected Case ID", "Case ID", "Parent Case ID"])
+    port_col = _find_first_col(comp, ["Portfolio", "portfolio"])
+    date_col = _find_first_col(
+        comp,
+        [
+            "Date Complaint Received - DD/MM/YY",
+            "Date Complaint Received",
+            "Complaint Date",
+            "Received Date",
+            "Month",
+        ],
+    )
+    return id_col, port_col, date_col
+
+
+def _build_month_column(df: pd.DataFrame, raw_col: str, assume_year: int | None = None) -> pd.Series:
+    s = df[raw_col]
+    m = _norm_month_from_series(s)
+    # if parse gave enough signal, keep
+    if m.notna().sum() >= max(1, int(0.1 * len(m))):
+        return m
+    # month-name fallback
+    if assume_year is not None:
+        try:
+            coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", format="%B %Y", errors="coerce")
+        except Exception:
+            coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", errors="coerce")
+        return coerced.dt.to_period("M").astype(str)
+    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M").astype(str)
+
+
+# -------------------------------
+# core computations
+# -------------------------------
+
+def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
+    id_c, port_c, date_c = _detect_cases_fields(cases)
+    id_k, port_k, date_k = _detect_complaints_fields(comp)
+
+    missing = []
+    if port_c is None: missing.append("Portfolio (cases)")
+    if date_c is None: missing.append("Create Date (cases)")
+    if port_k is None: missing.append("Portfolio (complaints)")
+    if date_k is None: missing.append("Complaint date (complaints)")
+    if missing:
+        st.warning(f"Missing columns: {missing}")
+        return pd.DataFrame(columns=["portfolio", "cases", "complaints", "per_1000"])
+
+    cases = cases.copy()
+    comp = comp.copy()
+
+    cases["_month"] = _build_month_column(cases, date_c)
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+
+    cases_jun = cases.loc[cases["_month"] == "2025-06"].groupby(port_c, dropna=False, as_index=False).size()
+    cases_jun.rename(columns={"size": "cases", port_c: "portfolio"}, inplace=True)
+
+    comp_jun = comp.loc[comp["_month"] == "2025-06"].groupby(port_k, dropna=False, as_index=False).size()
+    comp_jun.rename(columns={"size": "complaints", port_k: "portfolio"}, inplace=True)
+
+    out = pd.merge(cases_jun, comp_jun, how="left", on="portfolio")
+    out["complaints"] = out["complaints"].fillna(0).astype(int)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["per_1000"] = (out["complaints"] * 1000 / out["cases"]).replace([np.inf, -np.inf], np.nan)
+    out["per_1000"] = out["per_1000"].round(3)
+
+    out = out.sort_values(["complaints", "portfolio"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    out = _add_total_row(out, sum_cols=["cases", "complaints"], label_col="portfolio", label="Total")
+    return out
+
+
+def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
+    _, _, date_c = _detect_cases_fields(cases)
+    _, _, date_k = _detect_complaints_fields(comp)
+    if date_c is None or date_k is None:
+        return pd.DataFrame(columns=["month", "per_1000"])
+
+    cases = cases.copy(); comp = comp.copy()
+    cases["_month"] = _build_month_column(cases, date_c)
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+
+    want = [f"2025-{i:02d}" for i in range(1, 7)]
+    cases_m = cases.loc[cases["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
+    comp_m = comp.loc[comp["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
+    per_1000 = (comp_m * 1000 / cases_m.replace(0, np.nan)).fillna(0.0).round(2)
+    return pd.DataFrame({"month": want, "per_1000": per_1000.values})
+
+
+def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    _, _, date_k = _detect_complaints_fields(comp)
+    desc_col = _find_first_col(
+        comp,
+        ["Brief Description - RCA done by admin", "Brief Description", "RCA", "Admin Description", "Root Cause"],
+    )
+    if date_k is None or desc_col is None:
+        return pd.DataFrame(columns=["RCA2", "count", "percent", "cum_percent"]), pd.DataFrame(columns=["RCA1", "count"])
+
+    comp = comp.copy()
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+    june = comp.loc[comp["_month"] == "2025-06", [desc_col]].fillna("")
+
+    texts = june[desc_col].astype(str).tolist()
+
+    # AI labelling if allowed and available, else keyword fallback
+    if use_ai and _OPENAI_READY and len(texts) > 0:
+        # batch in chunks (safety)
+        r1_labels: List[str] = []
+        r2_labels: List[str] = []
+        batch = 80  # conservative
+        for i in range(0, len(texts), batch):
+            chunk = texts[i:i+batch]
+            pairs = _ai_label_batch(chunk)
+            r1_labels.extend([p[0] for p in pairs])
+            r2_labels.extend([p[1] for p in pairs])
+    else:
+        r1_labels = [_rca1_keyword(t) for t in texts]
+        r2_labels = [_rca2_keyword(t) for t in texts]
+
+    # RCA1 counts for bar chart (ordered)
+    r1 = pd.Series(r1_labels).value_counts(dropna=False).rename_axis("RCA1").reset_index(name="count")
+    desired = ["Delay", "Procedure", "Communication", "System", "Incorrect/Incomplete information", "Other"]
+    r1["order"] = r1["RCA1"].apply(lambda x: desired.index(x) if x in desired else len(desired))
+    r1 = r1.sort_values(["order", "RCA1"]).drop(columns="order").reset_index(drop=True)
+
+    # RCA2 top 80%
+    r2 = pd.Series(r2_labels).value_counts(dropna=False).rename_axis("RCA2").reset_index(name="count")
+    total = max(1, r2["count"].sum())
+    r2["percent"] = (r2["count"] * 100 / total).round(2)
+    r2["cum_percent"] = r2["percent"].cumsum()
+    r2 = r2.loc[r2["cum_percent"] <= 80.0].reset_index(drop=True)
+
+    return r2, r1
+
+
+# -------------------------------
+# plotting
+# -------------------------------
+
+def _plot_mom_line(df: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(6.0, 3.2))
+    ax.plot(df["month"], df["per_1000"], marker="o", linewidth=2.5, color="#9ecae1")
+    for x, y in zip(df["month"], df["per_1000"]):
+        ax.text(x, y + 0.03, f"{y:.2f}", ha="center", va="bottom", fontsize=9)
+    ax.set_title("Complaints per 1,000 — MoM (Jan–Jun ’25)", pad=8)
+    ax.set_ylim(bottom=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.get_yaxis().set_visible(False)
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+    st.pyplot(fig)
+
+
+def _plot_rca1_bars(df: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(6.0, 3.6))
+    colors = ["#9ecae1", "#a1d99b", "#fdd0a2", "#c7c7c7", "#fdae6b", "#d9d9d9"]
+    vals = df["count"].values
+    ax.bar(df["RCA1"], vals, color=colors[: len(df)])
+    for x, y in enumerate(vals):
+        ax.text(x, y + max(1, y * 0.02), f"{y}", ha="center", va="bottom", fontsize=9)
+    ax.set_title("RCA1 — June 2025", pad=8)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    ax.grid(False); ax.get_yaxis().set_visible(False)
+    st.pyplot(fig)
+
+
+# -------------------------------
+# streamlit UI / entrypoint
+# -------------------------------
+
+def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     """
-    Streamlit renders here. Always return (title, df) so the caller
-    never gets a None return (avoids 'cannot unpack non-iterable NoneType').
+    Render:
+      Row 1: Portfolio table (Total on top) + Jan–Jun line
+      Row 2: RCA2 Top-80 table + RCA1 bar chart
+
+    Return a blank slug and empty dataframe to stop host app
+    from rendering a duplicate third table.
     """
-    st.header("Complaint analysis — June 2025 (by portfolio)")
+    cases: pd.DataFrame = store.get("cases", pd.DataFrame()).copy()
+    comp: pd.DataFrame = store.get("complaints", pd.DataFrame()).copy()
 
-    # We keep June 2025 as default; the router already parses month but we
-    # deliberately DO NOT change what’s working in Row 1.
-    month_key = "2025-06"
+    # ----- Row 1 -----
+    table = _portfolio_table_for_june(cases, comp)
+    mom = _mom_series(cases, comp)
 
-    df_out = _build_tables_and_charts(store, month_key=month_key)
-    title = "complaints_june_by_portfolio"
-    if df_out is None or df_out.empty:
-        # Still return a harmless empty frame to keep caller happy
-        return title, pd.DataFrame(columns=["portfolio", "cases", "complaints", "per_1000"])
-    return title, df_out
+    c1, c2 = st.columns((1.2, 1.0), gap="large")
+    with c1:
+        _section("Complaint analysis — Jun 2025 (by portfolio)",
+                 "Joined on Create Date (cases) & Month (complaints, 2025) by Portfolio.")
+        if table.empty:
+            st.info("No rows returned for the current filters.")
+        else:
+            st.dataframe(table, use_container_width=True)
+    with c2:
+        if not mom.empty:
+            _plot_mom_line(mom)
+
+    # ----- Row 2 -----
+    use_ai = bool(os.getenv("OPENAI_API_KEY"))
+    rca2, rca1 = _rca_tables_for_june(comp, use_ai=use_ai)
+    c3, c4 = st.columns((1.05, 1.0), gap="large")
+    with c3:
+        _section("RCA2 — Top 80% (June 2025)",
+                 "Deeper reasons derived only from *Brief Description – RCA done by admin*."
+                 + ("  (AI-enhanced)" if use_ai and _OPENAI_READY else "  (keyword model)"))
+        if rca2.empty:
+            st.info("No June-2025 complaints with usable RCA text.")
+        else:
+            st.dataframe(rca2.rename(columns={"RCA2": "RCA2"}), use_container_width=True)
+    with c4:
+        if not rca1.empty:
+            _plot_rca1_bars(rca1)
+
+    # IMPORTANT: prevent host app from rendering a duplicate row
+    # by returning an empty dataframe and blank slug.
+    return ("", pd.DataFrame())
