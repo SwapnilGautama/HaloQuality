@@ -1,78 +1,87 @@
-# app.py
-import os, glob, importlib
-import pandas as pd
+# -*- coding: utf-8 -*-
+import os
 import streamlit as st
 
-from core.data_store import load_store  # keep the shared store used by existing questions
+# App-wide page config
+st.set_page_config(page_title="HALO Quality — Chat", page_icon="✅", layout="wide")
 
-# ---------- Page config & branding ----------
-st.set_page_config(page_title="Quality Chat", page_icon="💬", layout="wide")
-
-BRAND_HTML = """
-<h1 style="margin:.2rem 0 1rem 0; font-weight:700; letter-spacing:.2px;">
-  <span style="
-      background:#ff7a00;
-      color:#fff;
-      padding:.15rem .5rem .2rem .5rem;
-      border-radius:.40rem;
-      display:inline-block;">
-    HALO
-  </span>
-  <span style="color:#0b3d91;"> Quality</span>
-  <span style="color:#6c757d; font-weight:600;"> — Chat</span>
-</h1>
+# ----------------------
+# Brand header (HALO = orange bg / white text, Quality = dark blue)
+# ----------------------
+BRAND_CSS = """
+<style>
+/* brand wordmark */
+.halo-badge{
+  display:inline-block;
+  background:#ff7a00; /* orange */
+  color:#ffffff; 
+  padding:8px 14px; 
+  margin-right:10px;
+  font-weight:800;
+  border-radius:6px;
+  letter-spacing:1px;
+}
+.quality-word{
+  color:#0a3b8f;      /* dark blue */
+  font-weight:800;
+}
+h1.app-title{
+  margin:6px 0 22px 0 !important;
+}
+</style>
 """
-st.markdown(BRAND_HTML, unsafe_allow_html=True)
+st.markdown(BRAND_CSS, unsafe_allow_html=True)
+st.markdown('<h1 class="app-title"><span class="halo-badge">HALO</span><span class="quality-word">Quality</span> — Chat</h1>', unsafe_allow_html=True)
 
-# ---------- Two chips ----------
-st.write("")
-c1, c2 = st.columns([1.1, 1.1])
-with c1:
-    chip_complaints = st.button("complaint analysis — June 2025 (by portfolio)")
-with c2:
-    chip_fpa = st.button("first pass accuracy analysis")
+# ----------------------
+# Chips (only two)
+# ----------------------
+chip_css = """
+<style>
+.chip {display:inline-block; padding:8px 14px; border:1px solid #ddd; border-radius:999px;
+       margin:4px 12px 10px 0; cursor:pointer; background: #fff;}
+.chip:hover {border-color:#0a3b8f; color:#0a3b8f;}
+</style>
+"""
+st.markdown(chip_css, unsafe_allow_html=True)
 
-default_q = ""
-if chip_complaints:
-    default_q = "complaint analysis — June 2025 (by portfolio)"
-elif chip_fpa:
-    default_q = "first pass accuracy analysis"
+colA, colB = st.columns([1,1])
+with colA:
+    if st.button("complaint analysis — June 2025 (by portfolio)", key="chip_comp"):
+        st.session_state["_router_q"] = "complaint analysis — June 2025 (by portfolio)"
+with colB:
+    if st.button("first pass accuracy analysis", key="chip_fpa"):
+        st.session_state["_router_q"] = "first pass accuracy analysis"
 
+# ----------------------
+# Free-text input (kept for parity)
+# ----------------------
+default_q = st.session_state.get("_router_q", "complaint analysis — June 2025 (by portfolio)")
 q = st.text_input(
     "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
     value=default_q,
-    placeholder="Ask about complaints or first pass accuracy…",
 )
 
-# ---------- Shared store for questions (preserves existing behaviour) ----------
-@st.cache_resource(show_spinner=False)
-def get_store():
-    # Same default your complaints question expects
-    try:
-        return load_store(assume_year_for_complaints=2025)
-    except Exception:
-        return load_store()
+# ----------------------
+# Lightweight semantic router
+# ----------------------
+def route_query(q: str):
+    ql = q.lower()
+    if "first pass accuracy" in ql or "fpa" in ql or "first-pass" in ql:
+        return "first_pass_accuracy"
+    # default to complaints question you already have working
+    return "complaints_june_by_portfolio"
 
-store = get_store()
+slug = route_query(q)
 
-# ---------- Semantic router & dispatch ----------
-import semantic_router as sem_router
-
-if q.strip():
-    try:
-        match = sem_router.match(q)
-        slug = match.get("slug")
-        params = match.get("params", {})
-        if not slug:
-            st.warning("Sorry—couldn't figure out which analysis to run.")
-        else:
-            mod = importlib.import_module(f"questions.{slug}")
-            # Every question's run() draws directly to Streamlit
-            try:
-                mod.run(store, params, q)
-            except Exception as e:
-                st.error("This question failed.")
-                st.exception(e)
-    except Exception as e:
-        st.error("Sorry—couldn't run that question.")
-        st.exception(e)
+# ----------------------
+# Run question module
+# ----------------------
+# We keep the question runner in this file to avoid sidebars and to keep layout simple.
+# Each module returns None and directly renders its content.
+if slug == "complaints_june_by_portfolio":
+    from questions.complaints_june_by_portfolio import run as run_complaints
+    run_complaints()
+else:
+    from questions.first_pass_accuracy import run as run_fpa
+    run_fpa()
