@@ -1,75 +1,131 @@
 # app.py
 from __future__ import annotations
 import importlib
-import sys
-from pathlib import Path
 import traceback
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import pandas as pd
 import streamlit as st
 
-# ---------- Page ----------
-st.set_page_config(page_title="HALO Quality — Chat", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
-<style>
-[data-testid="stSidebar"]{display:none!important;}
-.halo{background:#ff7a00;color:#fff;font-weight:800;border-radius:.5rem;padding:.25rem .7rem;margin-right:.5rem}
-.brand{color:#0d3b82;font-weight:800}
-</style>
-""", unsafe_allow_html=True)
-st.markdown('<span class="halo">HALO</span><span class="brand">Quality</span> — Chat', unsafe_allow_html=True)
+# -----------------------------
+# Resilient import helper
+# -----------------------------
+def _imp(mod: str, attr: str | None = None):
+    """
+    Import a module (prefers repo root). If that fails, import from core.<mod>.
+    Optionally return a named attribute.
+    """
+    try:
+        m = importlib.import_module(mod)
+    except ModuleNotFoundError:
+        m = importlib.import_module(f"core.{mod}")
+    return getattr(m, attr) if attr else m
 
-# ---------- Shared store ----------
-ROOT = Path(__file__).parent
-store = {"root": ROOT, "data": ROOT / "data"}
 
-# ---------- Chips / inputs ----------
-c1, c2 = st.columns([1,1])
+# These must exist in your repo (root or under core/)
+load_store = _imp("data_store", "load_store")
+sem_router = _imp("semantic_router")  # must define match(q) -> {"slug": ..., "params": {...}}
+
+# Search paths for question modules
+QUESTION_MODULE_PREFIXES = ("questions", "core.questions")
+
+
+def _run_question(store: Dict[str, Any], slug: str, params: Dict[str, Any], user_text: Optional[str] = None):
+    """
+    Dynamically import a question module and run it.
+    Returns (title/subtitle, dataframe) or (message, empty df) on failure.
+    """
+    last_exc = None
+    for prefix in QUESTION_MODULE_PREFIXES:
+        mod_name = f"{prefix}.{slug}"
+        try:
+            mod = importlib.import_module(mod_name)
+            # Each question module must expose: run(store, params, user_text=None)
+            return mod.run(store, params, user_text=user_text)
+        except Exception as e:
+            last_exc = e
+            # Try next prefix
+            continue
+
+    # If all imports failed, show a helpful message
+    err = f"That question module failed to import.\n\nslug={slug}\n\n{traceback.format_exc()}"
+    return err, pd.DataFrame()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
+st.title("Halo Quality — Chat")
+st.caption("Hi! Ask me about cases, complaints (incl. RCA), or first-pass accuracy.")
+
+# Load data (defensively accept/ignore kwargs)
+with st.spinner("Reading Excel / parquet sources"):
+    try:
+        store = load_store(assume_year_for_complaints=2025)  # prefer assuming 2025 for complaints 'Report Month'
+    except TypeError:
+        store = load_store()
+
+cases: pd.DataFrame = store.get("cases", pd.DataFrame())
+complaints: pd.DataFrame = store.get("complaints", pd.DataFrame())
+
+# Sidebar status
+with st.sidebar:
+    st.header("Data status")
+    st.write(f"Cases rows: **{len(cases):,}**")
+    st.write(f"Complaints rows: **{len(complaints):,}**")
+
+# Quick chips
+c1, c2, c3 = st.columns(3)
 with c1:
-    chip_q1 = st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True)
+    if st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True):
+        st.session_state["q"] = "complaint analysis — June 2025 (by portfolio)"
 with c2:
-    chip_q2 = st.button("first pass accuracy analysis", use_container_width=True)
+    st.button("show rca1 by portfolio for process Member Enquiry last 3 months", use_container_width=True)
+with c3:
+    st.button("unique cases by process and portfolio Apr 2025 to Jun 2025", use_container_width=True)
 
-default_q = "complaint analysis — June 2025 by portfolio"
-if chip_q2:
-    default_q = "first pass accuracy analysis"
-elif chip_q1:
-    default_q = "complaint analysis — June 2025 by portfolio"
-
-q_text = st.text_input(
-    "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
+# Query box (✅ fixed quotes/closing parenthesis)
+default_q = st.session_state.get("q", "complaint analysis for June 2025 by portfolio")
+q = st.text_input(
+    "Type your question (e.g., 'complaint analysis for June 2025 by portfolio')",
     value=default_q,
 )
 
-# ---------- Router ----------
+# Route the query
+match = sem_router.match(q) if hasattr(sem_router, "match") else {"slug": "complaints_june_by_portfolio", "params": {}}
+slug = match.get("slug", "complaints_june_by_portfolio")
+params = match.get("params", {}) or {}
+
+# Show parsed filters for debugging
+with st.expander("Parsed filters"):
+    st.json(params)
+
+# Run the chosen question
 try:
-    from semantic_router import route
-except Exception as e:
-    st.error(f"Could not import semantic router: {e}")
-    st.stop()
-
-slug, params = route(q_text or "")
-if not slug:
-    st.info("Ask me about complaints or first-pass accuracy using the chips above.")
-    st.stop()
-
-# ---------- HARD ISOLATION: only import the chosen question ----------
-Q1 = "questions.complaints_june_by_portfolio"
-Q2 = "questions.first_pass_accuracy"
-for m in [Q1, Q2]:
-    if m in sys.modules:
-        del sys.modules[m]
-target = Q1 if slug == "complaints_june_by_portfolio" else Q2
-
-try:
-    mod = importlib.import_module(target)
+    result, df = _run_question(store, slug, params, user_text=q)
 except Exception:
-    st.error(f"Could not load `{target}`.")
-    st.code("".join(traceback.format_exc()))
-    st.stop()
+    st.error("Sorry—couldn't run that question.")
+    st.code(traceback.format_exc())
+else:
+    # Render result
+    if isinstance(result, tuple) and len(result) in (1, 2):
+        title = result[0]
+        subtitle = result[1] if len(result) == 2 else None
+        if isinstance(title, str):
+            st.subheader(title)
+        elif isinstance(title, (list, tuple)) and title:
+            st.subheader(str(title[0]))
+            if len(title) > 1:
+                st.caption(str(title[1]))
+        if subtitle:
+            st.caption(subtitle)
+    elif isinstance(result, str):
+        # A message string came back (e.g., “No data loaded.”)
+        st.info(result)
 
-# ---------- Run the question ----------
-try:
-    _ = mod.run(store, params, q_text)
-except Exception as e:
-    st.error("This question failed.")
-    st.exception(e)
-    st.code("".join(traceback.format_exc()))
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("No rows returned for the current filters.")
