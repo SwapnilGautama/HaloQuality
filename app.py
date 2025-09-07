@@ -1,85 +1,67 @@
-# -*- coding: utf-8 -*-
 # app.py
 from __future__ import annotations
-
 import importlib
 from pathlib import Path
-
+import traceback
 import streamlit as st
 
-# --------------------- basic page setup ---------------------
-st.set_page_config(page_title="HALO Quality — Chat", layout="wide")
+# ---------- Page & style ----------
+st.set_page_config(page_title="HALO Quality — Chat", layout="wide", initial_sidebar_state="collapsed")
+HIDE_SIDEBAR = """
+<style>
+[data-testid="stSidebar"] {display:none !important;}
+section.main > div {padding-top: 0rem;}
+/* Brand */
+.halo-badge{background:#ff7a00;color:#fff;font-weight:800;border-radius:.5rem;padding:.25rem .7rem;display:inline-block;margin-right:.5rem}
+.brand-q{color:#0d3b82;font-weight:800}
+</style>
+"""
+st.markdown(HIDE_SIDEBAR, unsafe_allow_html=True)
+st.markdown('<div class="halo-badge">HALO</div><span class="brand-q">Quality</span> — Chat', unsafe_allow_html=True)
 
-# brand header
-st.markdown(
-    """
-    <style>
-      .halo-badge {
-        display:inline-block;padding:6px 12px;border-radius:6px;
-        background:#ff7a00;color:#ffffff;font-weight:800;letter-spacing:1px;
-        font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Helvetica Neue",Arial;
-      }
-      .brand-title {
-        font-size:34px;font-weight:800;color:#0b3d91;vertical-align:middle;margin-left:10px
-      }
-      .brand-sub { font-size:34px;font-weight:600;color:#444;vertical-align:middle;margin-left:6px }
-      .stTabs [data-baseweb="tab-list"] { gap: 18px; }
-    </style>
-    <div style="margin:6px 0 14px 0;">
-      <span class="halo-badge">HALO</span>
-      <span class="brand-title">Quality</span>
-      <span class="brand-sub">— Chat</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# ---------- Storage ----------
+ROOT = Path(__file__).parent
+store = {
+    "root": ROOT,
+    "data": ROOT / "data",
+}
 
-# --------------------- question chips ----------------------
-colc, colf = st.columns([1, 1])
-with colc:
-    chip1 = st.button("complaint analysis — June 2025 (by portfolio)")
-with colf:
-    chip2 = st.button("first pass accuracy analysis")
+# ---------- Quick actions (chips) ----------
+c1, c2 = st.columns([1,1])
+with c1:
+    q1_btn = st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True)
+with c2:
+    q2_btn = st.button("first pass accuracy analysis", use_container_width=True)
 
-# text box (optional)
-q = st.text_input(
+q_text = st.text_input(
     "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
-    value="",
+    value=("first pass accuracy analysis" if q2_btn else ("complaint analysis — June 2025 by portfolio" if q1_btn else "")),
 )
 
-# determine which question to run
-if chip1:
-    q = "complaint analysis — June 2025 by portfolio"
-if chip2:
-    q = "first pass accuracy analysis"
-
-# --------------------- semantic router ---------------------
+# ---------- Routing ----------
 try:
-    from semantic_router import route  # <— this now exists
+    from semantic_router import route
 except Exception as e:
     st.error(f"Could not import semantic router: {e}")
     st.stop()
 
-if not q.strip():
+slug, params = route(q_text or "")
+
+if not slug:
+    st.info("Ask me about complaints or first-pass accuracy. Try a chip above.")
     st.stop()
 
-slug, params = route(q)
-
-# --------------------- question module dispatch -------------
-ROOT = Path(__file__).resolve().parent
-store = {"root": str(ROOT)}  # always pass a root
-
+# ---------- Load, run ----------
 try:
     mod = importlib.import_module(f"questions.{slug}")
-except ModuleNotFoundError:
-    st.error(f"Question module not found for slug: `{slug}`")
-    st.stop()
-except Exception as e:
-    st.error(f"Failed to import question `{slug}`: {e}")
+except Exception:
+    st.error(f"Could not load question module: `questions.{slug}`")
     st.stop()
 
 try:
-    _ = mod.run(store, params, q)   # every question gets (store, params, q)
+    # Every question gets the same call signature
+    _ = mod.run(store, params, q_text)
 except Exception as e:
     st.error("This question failed.")
     st.exception(e)
+    st.code("".join(traceback.format_exc()))
