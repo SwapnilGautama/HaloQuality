@@ -31,6 +31,7 @@ except Exception:
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
+_PASTEL_LINE = "#88cde8"  # cumulative line on Pareto
 
 def _header(title: str) -> None:
     st.markdown(
@@ -38,8 +39,8 @@ def _header(title: str) -> None:
         unsafe_allow_html=True,
     )
 
-def _style_table(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    return (
+def _style_table(df: pd.DataFrame, formats: Dict[str, str] | None = None) -> "pd.io.formats.style.Styler":
+    sty = (
         df.style
         .set_table_styles(
             [
@@ -48,8 +49,12 @@ def _style_table(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
             ]
         )
         .set_properties(**{"color": _DARK_GREY})
-        .format(precision=3)
     )
+    if formats:
+        sty = sty.format(formats)
+    else:
+        sty = sty.format(precision=3)
+    return sty
 
 
 def _find_first_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
@@ -370,7 +375,9 @@ def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     cases_m = cases.loc[cases["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
     comp_m = comp.loc[comp["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
     per_1000 = (comp_m * 1000 / cases_m.replace(0, np.nan)).fillna(0.0).round(2)
-    return pd.DataFrame({"month": want, "per_1000": per_1000.values})
+    # pretty month labels MMM-YY
+    pretty = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in want]
+    return pd.DataFrame({"month": pretty, "per_1000": per_1000.values})
 
 
 def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -406,8 +413,11 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
     r2_counts = r2_counts.sort_values(["order", "count"], ascending=[True, False]).drop(columns="order").reset_index(drop=True)
 
     total = max(1, r2_counts["count"].sum())
-    r2_counts["percent"] = (r2_counts["count"] * 100 / total).round(2)
+    r2_counts["percent"] = (r2_counts["count"] * 100 / total)
     r2_counts["cum_percent"] = r2_counts["percent"].cumsum()
+    # one decimal for presentation
+    r2_counts["percent"] = r2_counts["percent"].round(1)
+    r2_counts["cum_percent"] = r2_counts["cum_percent"].round(1)
     r2 = r2_counts.loc[r2_counts["cum_percent"] <= 80.0].reset_index(drop=True)
 
     return r2, r1
@@ -439,7 +449,7 @@ def _plot_mom_line(df: pd.DataFrame):
 def _plot_rca1_pareto(df: pd.DataFrame):
     """
     Pareto chart: bars (descending counts) + cumulative percentage line.
-    Labels rotated vertical for readability.
+    Vertical x labels, no border (only soft bottom axis), pastel cumulative line.
     """
     data = df.copy()
     data = data.sort_values("count", ascending=False).reset_index(drop=True)
@@ -448,7 +458,7 @@ def _plot_rca1_pareto(df: pd.DataFrame):
     data["cum_percent"] = data["percent"].cumsum()
 
     fig, ax = plt.subplots(figsize=(6.4, 3.8))
-    bar_colors = ["#9ecae1", "#a1d99b", "#fdd0a2", "#c7c7c7", "#fdae6b", "#d9d9d9", "#bcbddc", "#ccebc5"]
+    bar_colors = ["#9ecae1", "#a1d99b", "#bdbdbd", "#fdd0a2", "#fdae6b", "#c7c7c7", "#bcbddc", "#ccebc5"]
     ax.bar(data["RCA1"], data["count"], color=bar_colors[: len(data)])
 
     # annotate bar counts
@@ -459,14 +469,21 @@ def _plot_rca1_pareto(df: pd.DataFrame):
 
     # right-hand cumulative % line
     ax2 = ax.twinx()
-    ax2.plot(data["RCA1"], data["cum_percent"], color=_DARK_BLUE, marker="o", linewidth=2)
+    ax2.plot(
+        data["RCA1"],
+        data["cum_percent"],
+        color=_PASTEL_LINE,
+        marker="o",
+        linewidth=2.5,
+        solid_capstyle="round",
+        solid_joinstyle="round",
+    )
     for i, y in enumerate(data["cum_percent"].tolist()):
         ax2.text(i, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
 
-    # styling: no left y-axis, soft bottom spine, vertical x labels
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_visible(False)
+    # styling: remove frame/border; keep soft bottom line only
+    for sp in ["top", "right", "left"]:
+        ax.spines[sp].set_visible(False)
     ax.grid(False)
     ax.get_yaxis().set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY)
@@ -474,7 +491,9 @@ def _plot_rca1_pareto(df: pd.DataFrame):
     ax.tick_params(axis="x", colors=_DARK_GREY)
     plt.setp(ax.get_xticklabels(), rotation=90, ha="center")
 
-    # right y-axis = 0..100%
+    # right axis: hide frame as well, keep ticks 0-100
+    for sp in ["top", "right", "left", "bottom"]:
+        ax2.spines[sp].set_visible(False)
     ax2.set_ylim(0, 100)
     ax2.set_ylabel("")  # clean
     ax2.tick_params(axis="y", colors=_DARK_GREY)
@@ -492,12 +511,15 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     Row 1: Portfolio table + MoM line
     Row 2: RCA1 Pareto (left) + RCA2 Top-80 table (right)
     """
-    # Hide host “Parsed filters” expander & trailing info alerts
+    # Hide host “Parsed filters” + info bars + the left sidebar
     st.markdown(
         """
         <style>
         div[data-testid="stExpander"] {display: none;}
         div[data-testid="stAlert"] {display: none;}
+        div[data-testid="stSidebar"] {display: none;}
+        /* widen main area when sidebar hidden */
+        section[data-testid="stMain"] {padding-left: 1rem; padding-right: 1rem;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -516,7 +538,13 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if table.empty:
             st.info("No rows returned for the current filters.")
         else:
-            st.dataframe(_style_table(table), use_container_width=True)
+            st.dataframe(
+                _style_table(
+                    table,
+                    formats={"per_1000": "{:.3f}", "cases": "{:,.0f}", "complaints": "{:,.0f}"},
+                ),
+                use_container_width=True,
+            )
     with c2:
         if not mom.empty:
             _plot_mom_line(mom)
@@ -534,7 +562,13 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if rca2.empty:
             st.info("No June-2025 complaints with usable RCA text.")
         else:
-            st.dataframe(_style_table(rca2.rename(columns={"RCA2": "RCA2"})), use_container_width=True)
+            st.dataframe(
+                _style_table(
+                    rca2.rename(columns={"RCA2": "RCA2"}),
+                    formats={"count": "{:,.0f}", "percent": "{:.1f}", "cum_percent": "{:.1f}"},
+                ),
+                use_container_width=True,
+            )
 
     # prevent host app duplicate table
     return ("", pd.DataFrame())
