@@ -1,52 +1,47 @@
+# -*- coding: utf-8 -*-
+# semantic_router.py — very small router for two questions
+
 from __future__ import annotations
 import re
-from typing import Dict, Any, Optional
-import pandas as pd
+from typing import Dict, Optional
+import pandas as pd  # (kept: sometimes used by callers for month coercion)
 
+# ----------------------------- helpers ----------------------------------------
 def _to_month_key(text: str) -> Optional[str]:
-    m = re.search(
-        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{4})?",
-        text,
-        re.I,
-    )
+    """
+    Extract 'mmm yyyy' like 'Jun 2025' from free text and normalise to YYYY-MM.
+    """
+    m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{4})", text, re.I)
     if not m:
         return None
-    mon = m.group(1)
-    yr = int(m.group(2)) if m.group(2) else 2025
-    dt = pd.to_datetime(f"1 {mon} {yr}", errors="coerce", dayfirst=True)
-    if pd.isna(dt):
-        return None
-    return f"{dt.year:04d}-{dt.month:02d}"
+    mon = m.group(1).lower()
+    yr = int(m.group(2))
+    # map to month number
+    mm = {
+        "jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+        "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"
+    }[mon]
+    return f"{yr}-{mm}"
 
-def _parse_portfolio(q: str) -> Dict[str, str]:
-    p = re.search(r"\bportfolio\s+([a-z\s]+)", q, re.I)
-    if p:
-        return {"portfolio": p.group(1).strip().title()}
-    p2 = re.search(
-        r"\bfor\s+([a-z\s]+?)\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{4}|to|last|month)",
-        q,
-        re.I,
-    )
-    if p2:
-        return {"portfolio": p2.group(1).strip().title()}
-    return {}
+# ----------------------------- routers ----------------------------------------
+def match(q: str) -> Optional[Dict]:
+    qs = q.strip().lower()
 
-def match(q: str) -> Dict[str, Any]:
-    ql = q.lower()
-    params: Dict[str, Any] = {}
-    mk = _to_month_key(ql)
-    if mk:
-        params["month"] = mk
-    params.update(_parse_portfolio(ql))
+    # First Pass Accuracy
+    if any(k in qs for k in ["first pass accuracy", "first-pass accuracy", "fpa"]):
+        # Optional month if specified (not required)
+        mon = _to_month_key(q)  # returns 'YYYY-MM' or None
+        return {
+            "slug": "first_pass_accuracy",   # questions/first_pass_accuracy.py
+            "params": {"month": mon}         # None -> show full Jan-2025..latest
+        }
 
-    if any(k in ql for k in [
-        "first pass accuracy", "first-pass accuracy", "first pass", "fpa", "accuracy analysis"
-    ]):
-        return {"slug": "first_pass_accuracy", "params": params}
+    # Default: complaints
+    if any(k in qs for k in ["complaint analysis", "complaints analysis", "complaints"]):
+        mon = _to_month_key(q) or "2025-06"  # default Jun-25 to keep your slide view
+        return {
+            "slug": "complaints_june_by_portfolio",   # (your existing module)
+            "params": {"month": mon}
+        }
 
-    if any(k in ql for k in [
-        "complaint analysis", "complaints dashboard", "complaints analysis"
-    ]):
-        return {"slug": "complaints_june_by_portfolio", "params": params}
-
-    return {"slug": "complaints_june_by_portfolio", "params": params}
+    return None
