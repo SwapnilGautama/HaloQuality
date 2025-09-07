@@ -54,9 +54,8 @@ if chip2:
     q = "first pass accuracy analysis"
 
 # --------------------- semantic router ---------------------
-# Your semantic router returns (slug, params)
 try:
-    from semantic_router import route  # your existing router
+    from semantic_router import route  # <— this now exists
 except Exception as e:
     st.error(f"Could not import semantic router: {e}")
     st.stop()
@@ -67,9 +66,8 @@ if not q.strip():
 slug, params = route(q)
 
 # --------------------- question module dispatch -------------
-# Always pass store['root'] = project root
 ROOT = Path(__file__).resolve().parent
-store = {"root": str(ROOT)}
+store = {"root": str(ROOT)}  # always pass a root
 
 try:
     mod = importlib.import_module(f"questions.{slug}")
@@ -80,9 +78,8 @@ except Exception as e:
     st.error(f"Failed to import question `{slug}`: {e}")
     st.stop()
 
-# Each question gets (store, params, q)
 try:
-    _ = mod.run(store, params, q)
+    _ = mod.run(store, params, q)   # every question gets (store, params, q)
 except Exception as e:
     st.error("This question failed.")
     st.exception(e)
