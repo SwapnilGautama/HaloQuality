@@ -44,7 +44,7 @@ def _run_question(store: Dict[str, Any], slug: str, params: Dict[str, Any], user
 
 
 # ===================== Page setup (branding + no sidebar) ====================
-st.set_page_config(page_title="Halo Quality — Chat", layout="wide")
+st.set_page_config(page_title="Halo Quality — AI Assistant", layout="wide")
 
 # kill the sidebar & toolbar permanently (and keep the clean look)
 st.markdown(
