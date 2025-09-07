@@ -17,11 +17,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.markdown('<span class="halo">HALO</span><span class="brand">Quality</span> — Chat', unsafe_allow_html=True)
 
-# ---------- Storage (shared but harmless) ----------
+# ---------- Shared store ----------
 ROOT = Path(__file__).parent
 store = {"root": ROOT, "data": ROOT / "data"}
 
-# ---------- Chips / prompt ----------
+# ---------- Chips / inputs ----------
 c1, c2 = st.columns([1,1])
 with c1:
     chip_q1 = st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True)
@@ -29,8 +29,10 @@ with c2:
     chip_q2 = st.button("first pass accuracy analysis", use_container_width=True)
 
 default_q = "complaint analysis — June 2025 by portfolio"
-if chip_q2: default_q = "first pass accuracy analysis"
-elif chip_q1: default_q = "complaint analysis — June 2025 by portfolio"
+if chip_q2:
+    default_q = "first pass accuracy analysis"
+elif chip_q1:
+    default_q = "complaint analysis — June 2025 by portfolio"
 
 q_text = st.text_input(
     "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
@@ -49,18 +51,14 @@ if not slug:
     st.info("Ask me about complaints or first-pass accuracy using the chips above.")
     st.stop()
 
-# ---------- HARD ISOLATION GUARANTEE ----------
-# We only import the selected question; we also remove the other from sys.modules
-# so nothing lingers across runs.
+# ---------- HARD ISOLATION: only import the chosen question ----------
 Q1 = "questions.complaints_june_by_portfolio"
 Q2 = "questions.first_pass_accuracy"
 for m in [Q1, Q2]:
     if m in sys.modules:
         del sys.modules[m]
-
 target = Q1 if slug == "complaints_june_by_portfolio" else Q2
 
-# Import exactly the target module and run it.
 try:
     mod = importlib.import_module(target)
 except Exception:
@@ -68,8 +66,8 @@ except Exception:
     st.code("".join(traceback.format_exc()))
     st.stop()
 
+# ---------- Run the question ----------
 try:
-    # every question uses the same signature
     _ = mod.run(store, params, q_text)
 except Exception as e:
     st.error("This question failed.")
