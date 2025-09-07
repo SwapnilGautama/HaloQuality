@@ -1,27 +1,13 @@
 # app.py
-import os, glob, importlib, inspect
+import os, glob, importlib
 import pandas as pd
 import streamlit as st
 
-# If your data store helper exists (as in your project), keep using it:
-try:
-    from core.data_store import load_store
-except Exception:
-    load_store = None  # graceful fallback if not present
+# NEW: bring back the shared data store your question modules expect
+from core.data_store import load_store
 
-# --- Page config (collapse & hide sidebar)
-st.set_page_config(page_title="Quality Chat", page_icon="💬", layout="wide", initial_sidebar_state="collapsed")
-st.markdown(
-    """
-    <style>
-      /* hide the sidebar & its toggle forever */
-      [data-testid="stSidebar"], section[data-testid="stSidebar"] {display:none !important;}
-      [data-testid="stToolbar"] {right: 0 !important;}
-      .block-container {padding-top: 1.2rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# --- Page config
+st.set_page_config(page_title="Quality Chat", page_icon="💬", layout="wide")
 
 # --- Branding (HALO orange pill + Quality dark blue)
 BRAND_HTML = """
@@ -40,7 +26,45 @@ BRAND_HTML = """
 """
 st.markdown(BRAND_HTML, unsafe_allow_html=True)
 
-# --- Quick action chips
+# --- Sidebar Data status (best-effort)
+@st.cache_data(show_spinner=False)
+def _safe_len(path_patterns, read_excel=False):
+    total = 0
+    try:
+        files = []
+        for pat in path_patterns:
+            files += glob.glob(pat)
+        for f in files:
+            if f.lower().endswith((".xls", ".xlsx")) or read_excel:
+                df = pd.read_excel(f)
+            else:
+                df = pd.read_csv(f)
+            total += len(df)
+    except Exception:
+        pass
+    return total
+
+@st.cache_data(show_spinner=False)
+def sidebar_counts():
+    cases_rows = _safe_len(["data/cases/*.csv", "data/cases/*.xlsx"])
+    complaints_rows = _safe_len(["data/complaints/*.csv", "data/complaints/*.xlsx"])
+    fpa_rows = _safe_len(["data/first_pass_accuracy/*.xlsx"], read_excel=True)
+    # Also allow the uploaded dev file path for FPA
+    if fpa_rows == 0 and os.path.exists("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"):
+        try:
+            fpa_rows = len(pd.read_excel("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"))
+        except Exception:
+            pass
+    return cases_rows, complaints_rows, fpa_rows
+
+with st.sidebar:
+    st.subheader("Data status")
+    cr, cmpr, fpar = sidebar_counts()
+    st.caption(f"Cases rows: **{cr:,}**")
+    st.caption(f"Complaints rows: **{cmpr:,}**")
+    st.caption(f"FPA rows: **{fpar:,}**")
+
+# --- Chips (only two)
 st.write("")
 c1, c2 = st.columns([1.1, 1.1])
 with c1:
@@ -61,15 +85,14 @@ q = st.text_input(
     placeholder="Ask about complaints or first pass accuracy…",
 )
 
-# --- Load the shared store so question modules get data
+# --- Load the shared store (CACHED) so modules have data
 @st.cache_resource(show_spinner=False)
 def get_store():
-    if load_store is None:
-        return None
+    # Keep your earlier default behavior: assume 2025 for complaints month-join
     try:
-        # match your earlier behaviour (assume 2025 year for complaints month-join)
         return load_store(assume_year_for_complaints=2025)
-    except TypeError:
+    except Exception:
+        # Graceful fallback if the function signature differs in some envs
         return load_store()
 
 store = get_store()
@@ -77,59 +100,23 @@ store = get_store()
 # --- Router → question module selection
 import semantic_router as _router
 
-def _safe_call_run(mod, store, params, q):
-    """
-    Call mod.run(...) no matter what signature it uses.
-    Supports: run(), run(store), run(store, params), run(store, params, q),
-              as well as named kwargs (store/params/q).
-    """
-    if not hasattr(mod, "run"):
-        raise AttributeError("Question module is missing a `run` function.")
-    fn = getattr(mod, "run")
-
-    sig = inspect.signature(fn)
-    if len(sig.parameters) == 0:
-        return fn()
-
-    # Build kwargs for common names
-    kwargs = {}
-    for name in sig.parameters:
-        if name == "store":
-            kwargs["store"] = store
-        elif name in ("params", "parameters", "args"):
-            kwargs["params"] = params
-        elif name in ("q", "query", "question"):
-            kwargs["q"] = q
-
-    try:
-        # First try keyword call (most friendly)
-        return fn(**kwargs)
-    except TypeError:
-        # As a fallback, build a positional arg list in the order declared
-        ordered = []
-        for name in sig.parameters:
-            if name == "store":
-                ordered.append(store)
-            elif name in ("params", "parameters", "args"):
-                ordered.append(params)
-            elif name in ("q", "query", "question"):
-                ordered.append(q)
-            else:
-                ordered.append(None)
-        return fn(*ordered)
-
 if q.strip():
     try:
         route = _router.match(q)
         slug = route.get("slug")
-        params = route.get("params", {}) or {}
+        params = route.get("params", {})
 
         if not slug:
             st.warning("Sorry—couldn't figure out which analysis to run.")
         else:
             mod = importlib.import_module(f"questions.{slug}")
-            _safe_call_run(mod, store, params, q)
+            # Every question's run() draws to Streamlit; we don't need its return.
+            try:
+                _ = mod.run(store, params, q)
+            except Exception as e:
+                st.error("This question failed.")
+                st.exception(e)
 
     except Exception as e:
-        st.error("This question failed.")
+        st.error("Sorry—couldn't run that question.")
         st.exception(e)
