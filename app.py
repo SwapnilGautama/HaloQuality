@@ -1,122 +1,75 @@
 # app.py
-import os, glob, importlib
-import pandas as pd
+from __future__ import annotations
+import importlib
+import sys
+from pathlib import Path
+import traceback
 import streamlit as st
 
-# NEW: bring back the shared data store your question modules expect
-from core.data_store import load_store
+# ---------- Page ----------
+st.set_page_config(page_title="HALO Quality — Chat", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+[data-testid="stSidebar"]{display:none!important;}
+.halo{background:#ff7a00;color:#fff;font-weight:800;border-radius:.5rem;padding:.25rem .7rem;margin-right:.5rem}
+.brand{color:#0d3b82;font-weight:800}
+</style>
+""", unsafe_allow_html=True)
+st.markdown('<span class="halo">HALO</span><span class="brand">Quality</span> — Chat', unsafe_allow_html=True)
 
-# --- Page config
-st.set_page_config(page_title="Quality Chat", page_icon="💬", layout="wide")
+# ---------- Shared store ----------
+ROOT = Path(__file__).parent
+store = {"root": ROOT, "data": ROOT / "data"}
 
-# --- Branding (HALO orange pill + Quality dark blue)
-BRAND_HTML = """
-<h1 style="margin:.2rem 0 1rem 0; font-weight:700; letter-spacing:.2px;">
-  <span style="
-      background:#ff7a00;
-      color:#fff;
-      padding:.15rem .5rem .2rem .5rem;
-      border-radius:.40rem;
-      display:inline-block;">
-    HALO
-  </span>
-  <span style="color:#0b3d91;"> Quality</span>
-  <span style="color:#6c757d; font-weight:600;"> — Chat</span>
-</h1>
-"""
-st.markdown(BRAND_HTML, unsafe_allow_html=True)
-
-# --- Sidebar Data status (best-effort)
-@st.cache_data(show_spinner=False)
-def _safe_len(path_patterns, read_excel=False):
-    total = 0
-    try:
-        files = []
-        for pat in path_patterns:
-            files += glob.glob(pat)
-        for f in files:
-            if f.lower().endswith((".xls", ".xlsx")) or read_excel:
-                df = pd.read_excel(f)
-            else:
-                df = pd.read_csv(f)
-            total += len(df)
-    except Exception:
-        pass
-    return total
-
-@st.cache_data(show_spinner=False)
-def sidebar_counts():
-    cases_rows = _safe_len(["data/cases/*.csv", "data/cases/*.xlsx"])
-    complaints_rows = _safe_len(["data/complaints/*.csv", "data/complaints/*.xlsx"])
-    fpa_rows = _safe_len(["data/first_pass_accuracy/*.xlsx"], read_excel=True)
-    # Also allow the uploaded dev file path for FPA
-    if fpa_rows == 0 and os.path.exists("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"):
-        try:
-            fpa_rows = len(pd.read_excel("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"))
-        except Exception:
-            pass
-    return cases_rows, complaints_rows, fpa_rows
-
-with st.sidebar:
-    st.subheader("Data status")
-    cr, cmpr, fpar = sidebar_counts()
-    st.caption(f"Cases rows: **{cr:,}**")
-    st.caption(f"Complaints rows: **{cmpr:,}**")
-    st.caption(f"FPA rows: **{fpar:,}**")
-
-# --- Chips (only two)
-st.write("")
-c1, c2 = st.columns([1.1, 1.1])
+# ---------- Chips / inputs ----------
+c1, c2 = st.columns([1,1])
 with c1:
-    chip_complaints = st.button("complaint analysis — June 2025 (by portfolio)")
+    chip_q1 = st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True)
 with c2:
-    chip_fpa = st.button("first pass accuracy analysis")
+    chip_q2 = st.button("first pass accuracy analysis", use_container_width=True)
 
-# --- Query box (autofill from chips)
-default_q = ""
-if chip_complaints:
-    default_q = "complaint analysis — June 2025 (by portfolio)"
-elif chip_fpa:
+default_q = "complaint analysis — June 2025 by portfolio"
+if chip_q2:
     default_q = "first pass accuracy analysis"
+elif chip_q1:
+    default_q = "complaint analysis — June 2025 by portfolio"
 
-q = st.text_input(
+q_text = st.text_input(
     "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
     value=default_q,
-    placeholder="Ask about complaints or first pass accuracy…",
 )
 
-# --- Load the shared store (CACHED) so modules have data
-@st.cache_resource(show_spinner=False)
-def get_store():
-    # Keep your earlier default behavior: assume 2025 for complaints month-join
-    try:
-        return load_store(assume_year_for_complaints=2025)
-    except Exception:
-        # Graceful fallback if the function signature differs in some envs
-        return load_store()
+# ---------- Router ----------
+try:
+    from semantic_router import route
+except Exception as e:
+    st.error(f"Could not import semantic router: {e}")
+    st.stop()
 
-store = get_store()
+slug, params = route(q_text or "")
+if not slug:
+    st.info("Ask me about complaints or first-pass accuracy using the chips above.")
+    st.stop()
 
-# --- Router → question module selection
-import semantic_router as _router
+# ---------- HARD ISOLATION: only import the chosen question ----------
+Q1 = "questions.complaints_june_by_portfolio"
+Q2 = "questions.first_pass_accuracy"
+for m in [Q1, Q2]:
+    if m in sys.modules:
+        del sys.modules[m]
+target = Q1 if slug == "complaints_june_by_portfolio" else Q2
 
-if q.strip():
-    try:
-        route = _router.match(q)
-        slug = route.get("slug")
-        params = route.get("params", {})
+try:
+    mod = importlib.import_module(target)
+except Exception:
+    st.error(f"Could not load `{target}`.")
+    st.code("".join(traceback.format_exc()))
+    st.stop()
 
-        if not slug:
-            st.warning("Sorry—couldn't figure out which analysis to run.")
-        else:
-            mod = importlib.import_module(f"questions.{slug}")
-            # Every question's run() draws to Streamlit; we don't need its return.
-            try:
-                _ = mod.run(store, params, q)
-            except Exception as e:
-                st.error("This question failed.")
-                st.exception(e)
-
-    except Exception as e:
-        st.error("Sorry—couldn't run that question.")
-        st.exception(e)
+# ---------- Run the question ----------
+try:
+    _ = mod.run(store, params, q_text)
+except Exception as e:
+    st.error("This question failed.")
+    st.exception(e)
+    st.code("".join(traceback.format_exc()))
