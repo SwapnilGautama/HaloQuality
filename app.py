@@ -3,12 +3,15 @@ import os, glob, importlib
 import pandas as pd
 import streamlit as st
 
+# NEW: bring back the shared data store your question modules expect
+from core.data_store import load_store
+
 # --- Page config
 st.set_page_config(page_title="Quality Chat", page_icon="💬", layout="wide")
 
-# --- Branding (Halo = orange pill, white text; Quality = dark blue)
+# --- Branding (HALO orange pill + Quality dark blue)
 BRAND_HTML = """
-<h1 style="margin: .2rem 0 1rem 0; font-weight:700; letter-spacing:.2px;">
+<h1 style="margin:.2rem 0 1rem 0; font-weight:700; letter-spacing:.2px;">
   <span style="
       background:#ff7a00;
       color:#fff;
@@ -23,7 +26,7 @@ BRAND_HTML = """
 """
 st.markdown(BRAND_HTML, unsafe_allow_html=True)
 
-# --- Utility: tiny data status for the sidebar (best-effort, optional)
+# --- Sidebar Data status (best-effort)
 @st.cache_data(show_spinner=False)
 def _safe_len(path_patterns, read_excel=False):
     total = 0
@@ -46,7 +49,7 @@ def sidebar_counts():
     cases_rows = _safe_len(["data/cases/*.csv", "data/cases/*.xlsx"])
     complaints_rows = _safe_len(["data/complaints/*.csv", "data/complaints/*.xlsx"])
     fpa_rows = _safe_len(["data/first_pass_accuracy/*.xlsx"], read_excel=True)
-    # Also look for the dev-upload fallback if present
+    # Also allow the uploaded dev file path for FPA
     if fpa_rows == 0 and os.path.exists("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"):
         try:
             fpa_rows = len(pd.read_excel("/mnt/data/FirstPassAccuracy_Aug'25.xlsx"))
@@ -61,7 +64,7 @@ with st.sidebar:
     st.caption(f"Complaints rows: **{cmpr:,}**")
     st.caption(f"FPA rows: **{fpar:,}**")
 
-# --- Chips (only two, as requested)
+# --- Chips (only two)
 st.write("")
 c1, c2 = st.columns([1.1, 1.1])
 with c1:
@@ -69,7 +72,7 @@ with c1:
 with c2:
     chip_fpa = st.button("first pass accuracy analysis")
 
-# --- Query box (single line) with chip autopopulate
+# --- Query box (autofill from chips)
 default_q = ""
 if chip_complaints:
     default_q = "complaint analysis — June 2025 (by portfolio)"
@@ -82,10 +85,21 @@ q = st.text_input(
     placeholder="Ask about complaints or first pass accuracy…",
 )
 
+# --- Load the shared store (CACHED) so modules have data
+@st.cache_resource(show_spinner=False)
+def get_store():
+    # Keep your earlier default behavior: assume 2025 for complaints month-join
+    try:
+        return load_store(assume_year_for_complaints=2025)
+    except Exception:
+        # Graceful fallback if the function signature differs in some envs
+        return load_store()
+
+store = get_store()
+
 # --- Router → question module selection
 import semantic_router as _router
 
-store = {}  # simple passthrough store (kept for compatibility)
 if q.strip():
     try:
         route = _router.match(q)
@@ -95,10 +109,8 @@ if q.strip():
         if not slug:
             st.warning("Sorry—couldn't figure out which analysis to run.")
         else:
-            # dynamic import and run
             mod = importlib.import_module(f"questions.{slug}")
-            # every question module implements run(store, params, user_text)
-            st.write("")  # spacing
+            # Every question's run() draws to Streamlit; we don't need its return.
             try:
                 _ = mod.run(store, params, q)
             except Exception as e:
