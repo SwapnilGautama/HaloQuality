@@ -40,14 +40,13 @@ def _run_question(store: Dict[str, Any], slug: str, params: Dict[str, Any], user
     err = f"That question module failed to import.\n\nslug={slug}\n\n{traceback.format_exc()}"
     return err, pd.DataFrame()
 
-# ===================== Page setup (branding + no sidebar) ====================
+# ===================== Page setup ====================
 st.set_page_config(page_title="Halo - Quality - AI Assistant", layout="wide")
 
+# ---------- Header styles (no sidebar rule here) ----------
 st.markdown(
     """
     <style>
-      [data-testid="stSidebar"], [data-testid="stSidebarNav"] { display: none !important; }
-      section[data-testid="stSidebar"] { display: none !important; }
       [data-testid="stToolbar"] { display:none !important; }
 
       /* HALO branding */
@@ -90,14 +89,37 @@ with st.spinner("Loading data..."):
 # default prompt is now "fpa"
 q_default = st.session_state.get("q", "fpa")
 q = st.text_input(
-    "Type your question (e.g., 'comp', 'complaint', or 'fpa')",
+    "Type your question (e.g., 'comp', 'complaint', or 'fpa'; say 'with filters' to open the filter pane)",
     value=q_default,
 )
 st.session_state["q"] = q
 
+# Route
 match = sem_router.match(q) if hasattr(sem_router, "match") else {"slug": "complaints_june_by_portfolio", "params": {}}
 slug = match.get("slug", "complaints_june_by_portfolio")
 params = match.get("params", {}) or {}
+
+# ============================== Conditional sidebar visibility ===============================
+def _wants_sidebar(text: str, p: Dict[str, Any]) -> bool:
+    if p.get("show_sidebar") is True:
+        return True
+    t = (text or "").lower()
+    keywords = ("filter", "filters", "filter pane", "with filters", "show filters")
+    return any(k in t for k in keywords)
+
+SHOW_SIDEBAR = _wants_sidebar(q, params)
+
+# Apply CSS to hide sidebar only when NOT requested
+if not SHOW_SIDEBAR:
+    st.markdown(
+        """
+        <style>
+          [data-testid="stSidebar"], [data-testid="stSidebarNav"] { display: none !important; }
+          section[data-testid="stSidebar"] { display: none !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ============================== Run question ===============================
 try:
