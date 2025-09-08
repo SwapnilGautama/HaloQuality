@@ -11,23 +11,76 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ---------- Styles (unchanged) ----------
+# ---------- Styles ----------
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 
-# ---------- OpenAI-only classification ----------
-_OAI_READY = False
-_OAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# =========================================================
+# Robust OpenAI setup: secrets + env + SDK v1/legacy support
+# =========================================================
+def _get_openai_key() -> Optional[str]:
+    # 1) OS env
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
+    # 2) Streamlit secrets (flat)
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    # 3) Streamlit secrets (nested)
+    try:
+        if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
+            return st.secrets["openai"]["api_key"]
+    except Exception:
+        pass
+    return None
+
+def _get_openai_model() -> str:
+    # model from env or secrets; default gpt-4o-mini
+    model = os.getenv("OPENAI_MODEL")
+    if model:
+        return model
+    try:
+        if "OPENAI_MODEL" in st.secrets:
+            return st.secrets["OPENAI_MODEL"]
+    except Exception:
+        pass
+    try:
+        if "openai" in st.secrets and "model" in st.secrets["openai"]:
+            return st.secrets["openai"]["model"]
+    except Exception:
+        pass
+    return "gpt-4o-mini"
+
+_OPENAI_API_KEY = _get_openai_key()
+_OPENAI_MODEL = _get_openai_model()
+
+# Detect SDK flavor
+_HAS_OPENAI_V1 = False
+_OPENAI_CLIENT = None
+try:
+    # New SDK (1.x)
+    from openai import OpenAI as _OpenAIClient  # type: ignore
+    if _OPENAI_API_KEY:
+        _OPENAI_CLIENT = _OpenAIClient(api_key=_OPENAI_API_KEY)
+        _HAS_OPENAI_V1 = True
+except Exception:
+    _HAS_OPENAI_V1 = False
+    _OPENAI_CLIENT = None
+
+# Legacy fallback
+import_types_ok = True
 try:
     import openai  # type: ignore
-    if os.getenv("OPENAI_API_KEY"):
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        _OAI_READY = True
 except Exception:
-    _OAI_READY = False
+    import_types_ok = False
 
-# Allowed categories (broader, more actionable buckets)
+_OAI_READY = bool(_OPENAI_API_KEY) and (bool(_OPENAI_CLIENT) or import_types_ok)
+
+# Allowed categories (broader, actionable buckets)
 _ALLOWED_LABELS: List[str] = [
     "Bank / payment",
     "Communication / update",
@@ -40,9 +93,7 @@ _ALLOWED_LABELS: List[str] = [
     "Rules / process",
     "Other",
 ]
-
 _ALLOWED_SET = {x.lower(): x for x in _ALLOWED_LABELS}
-
 
 # =========================================================
 # Data loading (unchanged)
@@ -94,7 +145,6 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         raise KeyError(f"Missing required columns for FPA: {missing}")
     return df.rename(columns={v: k for k, v in col_map.items() if v}), col_map
 
-
 # =========================================================
 # Pass% + table logic (unchanged)
 # =========================================================
@@ -132,19 +182,15 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
         ["portfolio", "pass_%", "scheme"], ascending=[True, False, True]
     )
 
-
 # =========================================================
-# OpenAI-only classification
+# OpenAI-only classification (with v1/legacy support)
 # =========================================================
 def _normalize_label(label: str) -> str:
-    """Map any model output to the nearest allowed label (strict)."""
     if not isinstance(label, str):
         return "Other"
     t = label.strip().lower()
-    # exact or near-exact match
     if t in _ALLOWED_SET:
         return _ALLOWED_SET[t]
-    # simple loose match by token overlap
     for allowed in _ALLOWED_LABELS:
         toks = set(allowed.lower().replace("/", " ").split())
         if any(tok in t for tok in toks):
@@ -152,7 +198,7 @@ def _normalize_label(label: str) -> str:
     return "Other"
 
 def _oai_label_batch(texts: List[str]) -> List[str]:
-    """Call OpenAI once for a batch of comments and return a label per item."""
+    """One batch call; returns one label per input."""
     system = (
         "You are a quality analyst. Classify each bullet point into ONE label.\n"
         "Use ONLY one of these labels exactly:\n"
@@ -162,41 +208,55 @@ def _oai_label_batch(texts: List[str]) -> List[str]:
     )
     bullets = "\n".join(f"- {t}" for t in texts)
     user = "Classify the following items:\n\n" + bullets
-    resp = openai.ChatCompletion.create(
-        model=_OAI_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    raw = resp["choices"][0]["message"]["content"]
+
+    raw = ""
+    try:
+        if _HAS_OPENAI_V1 and _OPENAI_CLIENT:
+            # New SDK v1.x
+            resp = _OPENAI_CLIENT.chat.completions.create(
+                model=_OPENAI_MODEL,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            raw = resp.choices[0].message.content or ""
+        else:
+            # Legacy SDK
+            if _OPENAI_API_KEY and import_types_ok:
+                openai.api_key = _OPENAI_API_KEY
+                resp = openai.ChatCompletion.create(
+                    model=_OPENAI_MODEL,
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                raw = resp["choices"][0]["message"]["content"] or ""
+    except Exception:
+        raw = ""
+
     try:
         arr = json.loads(raw)
         if not isinstance(arr, list):
             raise ValueError("Not a list")
     except Exception:
-        # On parsing issues, fall back to all Other (but app still renders)
         return ["Other"] * len(texts)
-    # Normalize to allowed set
+
     return [_normalize_label(x) for x in arr][: len(texts)]
 
 def _ai_label_many(texts: List[str]) -> List[str]:
-    """Chunk to stay safe on very large datasets."""
     if not _OAI_READY:
-        # No API key => render the rest of the app; label as Other
         return ["Other"] * len(texts)
-
     out: List[str] = []
-    BATCH = 60  # conservative chunk size
+    BATCH = 60
     for i in range(0, len(texts), BATCH):
-        chunk = texts[i : i + BATCH]
-        out.extend(_oai_label_batch(chunk))
-    # If the model returned fewer than expected for any reason, pad with Other
+        out.extend(_oai_label_batch(texts[i : i + BATCH]))
     if len(out) < len(texts):
         out.extend(["Other"] * (len(texts) - len(out)))
     return out
-
 
 # =========================================================
 # Reasons (OpenAI-only) + Pareto
@@ -215,8 +275,8 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
 
     texts = fails["comment"].fillna("").astype(str).tolist()
+    labels = _ai_label_many(texts)
 
-    labels = _ai_label_many(texts)  # <-- OpenAI-only
     s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
 
@@ -224,7 +284,7 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     s["percent"] = s["count"] * 100.0 / total
     s["cum_percent"] = s["percent"].cumsum()
 
-    # Pareto: Top 80% + Other (push pre-existing 'Other' into the tail if it's within top-80 by count)
+    # Pareto: Top 80% + Other (ensure 'Other' ends up in the tail if included in head)
     head = s[s["cum_percent"] <= 80.0].copy()
     tail = s[s["cum_percent"] > 80.0].copy()
     if not head.empty and (head["reason"] == "Other").any():
@@ -244,7 +304,6 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     head["percent"] = head["percent"].round(1)
     head["cum_percent"] = head["cum_percent"].round(1)
     return head, latest
-
 
 # =========================================================
 # Plots (unchanged)
@@ -279,7 +338,6 @@ def _fig_reasons_bar(df: pd.DataFrame, title: str):
     plt.setp(ax.get_xticklabels(), rotation=90, ha="center", color=_DARK_GREY)
     ax.grid(False)
     return fig
-
 
 # =========================================================
 # Streamlit entry point (unchanged interface)
