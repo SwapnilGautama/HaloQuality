@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
+import os
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -205,6 +207,184 @@ def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     return mat
 
 # ======================
+# Insights (AI first, then heuristic fallback)
+# ======================
+def _format_period(p: pd.Period) -> str:
+    try:
+        return pd.Period(p).to_timestamp().strftime("%b-%y")
+    except Exception:
+        return str(p)
+
+def _safe_int(x) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return 0
+
+def _portfolio_pass_table(df: pd.DataFrame) -> pd.DataFrame:
+    # helper for insights calcs: portfolio × month with pass %
+    df = df.copy()
+    df["_m"] = _coerce_month(df["date"])
+    grp = df.groupby(["portfolio", "_m"])["result"].agg(
+        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
+    ).reset_index()
+    grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"].replace(0, np.nan)).fillna(0).round(0)
+    return grp
+
+def _get_prev_period(periods: List[pd.Period], latest: pd.Period) -> Optional[pd.Period]:
+    prevs = [p for p in periods if p < latest]
+    return prevs[-1] if prevs else None
+
+def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> List[str]:
+    # 1) Overall MoM pass %
+    overall_series = mom["pass_pct"].astype(float)
+    last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
+    prev_val = overall_series.iloc[-2] if len(overall_series) >= 2 else np.nan
+    delta = (last_val - prev_val) if not (np.isnan(last_val) or np.isnan(prev_val)) else np.nan
+
+    # 2) Portfolios up/down
+    df_raw = df_raw.copy()
+    df_raw["_m"] = _coerce_month(df_raw["date"])
+    periods = sorted(df_raw["_m"].dropna().unique().tolist())
+    latest = periods[-1] if periods else None
+    prev = _get_prev_period(periods, latest) if latest else None
+
+    ptab = _portfolio_pass_table(df_raw)
+    def _extract_pass(grp, at_period):
+        if at_period is None: return pd.Series(dtype=float)
+        sub = grp[grp["_m"] == at_period][["portfolio", "pass_%"]].set_index("portfolio")["pass_%"]
+        return sub
+
+    curr = _extract_pass(ptab, latest)
+    prevp = _extract_pass(ptab, prev)
+    change = (curr - prevp).dropna().sort_values(ascending=False) if not curr.empty and not prevp.empty else pd.Series(dtype=float)
+    top_up = change.head(2)
+    top_down = change.tail(2).sort_values()
+
+    # 3) Top 2 fail reasons and trends + 4) top portfolio contributors
+    reasons_points = []
+    contrib_points = []
+    if not fails_all.empty and latest is not None:
+        latest_fails = fails_all[fails_all["_m"] == latest]
+        prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
+        top2 = latest_fails["reason"].value_counts().head(2).index.tolist()
+        for r in top2:
+            c_now = _safe_int((latest_fails["reason"] == r).sum())
+            c_prev = _safe_int((prev_fails["reason"] == r).sum()) if not prev_fails.empty else 0
+            delta_r = c_now - c_prev
+            reasons_points.append(f"**{r}**: {c_now} in { _format_period(latest) } ({'+' if delta_r>=0 else ''}{delta_r} vs { _format_period(prev) if prev else 'prior' }).")
+            # contributors
+            tops = latest_fails[latest_fails["reason"] == r].groupby("portfolio").size().sort_values(ascending=False).head(3)
+            if not tops.empty:
+                parts = ", ".join([f"{k} ({v})" for k, v in tops.items()])
+                contrib_points.append(f"Top portfolios for **{r}**: {parts}.")
+
+    # build bullets
+    bullets = []
+    if not np.isnan(last_val):
+        if not np.isnan(delta):
+            bullets.append(f"**Pass rate** in {mom['month'].iloc[-1]}: **{last_val:.0f}%** ({'+' if delta>=0 else ''}{delta:.0f} pp MoM).")
+        else:
+            bullets.append(f"**Pass rate** latest ({mom['month'].iloc[-1]}): **{last_val:.0f}%**.")
+    if not change.empty:
+        if not top_up.empty:
+            bullets.append("**Portfolio ↑ MoM**: " + ", ".join([f"{idx} (+{val:.0f} pp)" for idx, val in top_up.items()]))
+        if not top_down.empty:
+            bullets.append("**Portfolio ↓ MoM**: " + ", ".join([f"{idx} ({val:.0f} pp)" for idx, val in top_down.items()]))
+    if reasons_points:
+        bullets.append("**Fail reasons (top 2)**: " + " ".join(reasons_points))
+    if contrib_points:
+        bullets.append("**Contributors**: " + " ".join(contrib_points))
+
+    # keep 3–4 concise bullets
+    if len(bullets) > 4:
+        bullets = bullets[:4]
+    return bullets
+
+def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> Optional[List[str]]:
+    """
+    Try to use OpenAI (if available). If anything fails, return None to fall back safely.
+    Requires OPENAI_API_KEY in env or st.secrets["OPENAI_API_KEY"] and `openai` >= 1.0 installed.
+    """
+    try:
+        # Gather compact context
+        df_tmp = df_raw.copy()
+        df_tmp["_m"] = _coerce_month(df_tmp["date"])
+        latest = df_tmp["_m"].max()
+        prevs = sorted(df_tmp["_m"].dropna().unique().tolist())
+        prev = prevs[-2] if len(prevs) >= 2 else None
+
+        # prepare slim CSV-ish strings
+        mom_str = mom.to_csv(index=False)
+        # portfolio pass table
+        ptab = _portfolio_pass_table(df_raw)
+        ptab_str = ptab.to_csv(index=False)
+        # fail reasons latest vs prev (counts)
+        if fails_all.empty:
+            fr_str = "none"
+        else:
+            latest_fails = fails_all[fails_all["_m"] == latest]
+            prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
+            fr_now = latest_fails.groupby("reason").size().sort_values(ascending=False).head(10)
+            fr_prev = prev_fails.groupby("reason").size().sort_values(ascending=False).head(10)
+            fr_df = pd.DataFrame({"latest": fr_now}).join(pd.DataFrame({"prev": fr_prev}), how="outer").fillna(0).astype(int)
+            fr_str = fr_df.to_csv()
+
+        # OpenAI call (optional)
+        try:
+            from openai import OpenAI
+        except Exception:
+            return None
+
+        api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+        if not api_key:
+            return None
+        client = OpenAI(api_key=api_key)
+
+        sys_prompt = (
+            "You are a concise analytics assistant. Produce 3–4 sharp bullets about:\n"
+            "1) month-on-month pass rate, 2) standout portfolios (big increases/decreases),\n"
+            "3) top 2 fail reasons trend, 4) top portfolio contributors for those reasons.\n"
+            "Keep bullets short and concrete. Use percentages where available. Avoid fluff."
+        )
+        user_prompt = (
+            f"MoM Pass% table:\n{mom_str}\n\n"
+            f"Portfolio pass% by month (portfolio,_m,pass_%):\n{ptab_str}\n\n"
+            f"Fail reasons (latest vs prev counts):\n{fr_str}\n"
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        text = resp.choices[0].message.content.strip()
+        # split into bullets by lines; fall back to plain lines
+        bullets = [ln.strip("-• ").strip() for ln in text.split("\n") if ln.strip()]
+        bullets = [b for b in bullets if b]
+        if not bullets:
+            return None
+        # cap at 4
+        return bullets[:4]
+    except Exception:
+        return None
+
+def _render_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> None:
+    # Try OpenAI → fallback heuristic
+    bullets = _openai_insights(mom, df_raw, fails_all)
+    if bullets is None or len(bullets) == 0:
+        bullets = _heuristic_insights(mom, df_raw, fails_all)
+    st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>AI Insights</h4>", unsafe_allow_html=True)
+    if not bullets:
+        st.caption("No insights available.")
+        return
+    for b in bullets[:4]:
+        if b:
+            st.markdown(f"- {b}")
+
+# ======================
 # Plots (styling)
 # ======================
 def _fig_mom(df: pd.DataFrame, title: str):
@@ -303,6 +483,9 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         all_reasons, all_portfolios = [], []
     sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
     sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
+
+    # ========= NEW: AI INSIGHTS (kept lightweight, safe fallback) =========
+    _render_insights(mom, df_raw, fails_all)
 
     # ---- Row 1 ----
     c1, c2 = st.columns((1.1, 1.0), gap="large")
