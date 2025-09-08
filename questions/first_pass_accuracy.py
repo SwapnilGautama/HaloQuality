@@ -102,18 +102,30 @@ def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     label = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
     return pd.DataFrame({"month": label, "pass_pct": pct.values})
 
-def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame:
-    df = df.assign(_m=_coerce_month(df["date"]))
-    sub = df[df["_m"] == last_m]
-    if sub.empty:
-        return pd.DataFrame(columns=["portfolio", "scheme", "cases", "pass_%"])
-    grp = sub.groupby(["portfolio", "scheme"])["result"].agg(
-        cases="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
+def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Portfolio (rows) × Month (columns) FPA% from Jan-25 to latest.
+    """
+    df = df.copy()
+    df["_m"] = _coerce_month(df["date"])
+    if df["_m"].dropna().empty:
+        return pd.DataFrame()
+
+    start = pd.Period("2025-01")
+    end = df["_m"].max()
+    months = pd.period_range(start, end, freq="M")
+
+    # Compute pass% per portfolio per month
+    grp = df.groupby(["portfolio", "_m"])["result"].agg(
+        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
     ).reset_index()
-    grp["pass_%"] = (grp["passed"] * 100.0 / grp["cases"]).round(0)
-    return grp[["portfolio", "scheme", "cases", "pass_%"]].sort_values(
-        ["portfolio", "pass_%", "scheme"], ascending=[True, False, True]
-    )
+    grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"]).round(0)
+
+    piv = grp.pivot(index="portfolio", columns="_m", values="pass_%").reindex(columns=months)
+    # Pretty month headers like Jan-25
+    piv.columns = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in piv.columns]
+    piv = piv.sort_index().fillna(0).astype(int)
+    return piv
 
 # ======================
 # Reasons — ALL + Pareto line to 100%
@@ -148,7 +160,7 @@ def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     return vc, latest
 
 # ======================
-# Plots (updated styling)
+# Plots (styling)
 # ======================
 def _fig_mom(df: pd.DataFrame, title: str):
     """
@@ -179,7 +191,7 @@ def _fig_pareto_full(df: pd.DataFrame):
     Bars = counts (sorted desc), smooth cumulative % line.
     RCA1-style:
       - Soft pastel bars, teal cumulative line
-      - NO chart title here (we already render a section title above the chart)
+      - NO plot title here (section title is rendered above)
       - NO plot border (all spines off except bottom in soft grey)
       - NO primary/secondary y-axes
     """
@@ -210,7 +222,7 @@ def _fig_pareto_full(df: pd.DataFrame):
     y_dense = np.interp(x_dense, x, df["cum_percent"].values)
     ax2.plot(x_dense, y_dense, linewidth=2.8, color=_RCA1_CUM_LINE)
 
-    # Minimal labels on the line at coarse intervals
+    # Minimal labels on the line at bar positions
     for xi, cp in zip(x, df["cum_percent"]):
         ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
 
@@ -224,7 +236,7 @@ def _fig_pareto_full(df: pd.DataFrame):
     ax1.spines["bottom"].set_color(_SOFT_GREY)
     ax1.spines["bottom"].set_linewidth(1.25)
 
-    # Hide both y-axes completely and also hide twin axis frame/spines
+    # Hide both y-axes completely and hide twin axis spines
     ax1.get_yaxis().set_visible(False)
     ax2.get_yaxis().set_visible(False)
     for sp in ["left", "right", "top", "bottom"]:
@@ -258,7 +270,9 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
     latest = df_raw["_m"].max()
-    table = _table_portfolio_scheme(df_raw, latest)
+
+    # NEW: Month-on-Month FPA% by portfolio (rows × columns)
+    piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
@@ -266,10 +280,10 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     with c2:
         st.markdown(
             f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>"
-            f"Pass % by Portfolio × Scheme — {pd.Period(latest).to_timestamp().strftime('%b-%y')}"
+            f"FPA % by Portfolio — Month on Month"
             f"</h4>", unsafe_allow_html=True)
-        if not table.empty:
-            st.dataframe(table, use_container_width=True)
+        if not piv_portfolio_mom.empty:
+            st.dataframe(piv_portfolio_mom, use_container_width=True)
 
     # Row 2: Reasons — ALL + Pareto line
     reasons, lastp = _label_all_latest(df_raw)
@@ -281,7 +295,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     r1, r2 = st.columns(2, gap="large")
     with r1:
         if not reasons.empty:
-            # NOTE: no in-plot title now; the H4 above is the chart title
             st.pyplot(_fig_pareto_full(reasons))
         else:
             st.info("No fail reasons available for the latest month.")
