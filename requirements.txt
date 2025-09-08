@@ -9,4 +9,7 @@ plotly
 PyYAML>=6.0.2
 matplotlib
 python-pptx
-openai>=1.51.0
+# --- Added for GPT + robust calls ---
+openai>=1.40.0
+tiktoken
+tenacity
