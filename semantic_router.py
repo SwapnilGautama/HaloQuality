@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Dict
 
+# loose month matcher; router only passes through a hint month if present
 _MONTH_RX = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{2,4})?"
 
 def _norm_q(q: str) -> str:
@@ -18,16 +19,13 @@ def match(q: str) -> Dict:
     text = _norm_q(q)
 
     # Q2 trigger phrases
-    if any(p in text for p in ["first pass", "fpa", "first-pass accuracy"]):
-        # optional: pick a month if the user mentions one; Q2 still handles full-range internally
+    if any(p in text for p in ["first pass", "fpa", "first-pass accuracy", "first pass accuracy"]):
         m = re.search(_MONTH_RX, text)
         params = {"hint_month": m.group(0)} if m else {}
         return {"slug": "first_pass_accuracy", "params": params}
 
-
     # Q3 trigger phrases
     if any(p in text for p in ["fail reasons", "fra", "fail reasons analysis"]):
-        # optional: pick a month if the user mentions one; Q2 still handles full-range internally
         m = re.search(_MONTH_RX, text)
         params = {"hint_month": m.group(0)} if m else {}
         return {"slug": "fail_reasons_analysis", "params": params}
