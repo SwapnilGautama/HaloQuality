@@ -73,9 +73,9 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "comment": _pick(df, ["Case Comment", "Comments", "Reviewer Comment", "Comment"]),
         "rca2": _pick(df, ["RCA2", "Root Cause 2", "RCA 2"]),
         # potential comparison fields (optional; detected later)
-        "team": _pick(df, ["Team", "Assign To Team", "Department"]),
+        "team": _pick(df, ["Team", "Team Manager", "Department"]),
         "work_type": _pick(df, ["Work Type", "WorkType", "Activity Type"]),
-        "individual": _pick(df, ["Reviewer", "User", "Owner", "Analyst"]),
+        "individual": _pick(df, ["Reviewer", "User", "Administrator", "Analyst"]),
         "location": _pick(df, ["Location", "Region", "Site"]),
     }
     missing = [k for k, v in col_map.items() if k in ("date", "result") and v is None]
