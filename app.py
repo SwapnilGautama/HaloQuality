@@ -1,7 +1,6 @@
 # app.py
 from __future__ import annotations
 import importlib
-import os
 import traceback
 from typing import Any, Dict, Optional
 
@@ -44,13 +43,12 @@ def _run_question(store: Dict[str, Any], slug: str, params: Dict[str, Any], user
 # ===================== Page setup (branding + no sidebar) ====================
 st.set_page_config(page_title="Halo - Quality - AI Assistant", layout="wide")
 
-# kill the sidebar & toolbar permanently (and keep the clean look)
 st.markdown(
     """
     <style>
       [data-testid="stSidebar"], [data-testid="stSidebarNav"] { display: none !important; }
       section[data-testid="stSidebar"] { display: none !important; }
-      [data-testid="stToolbar"] { display:none !important; }  /* top-right hamburger */
+      [data-testid="stToolbar"] { display:none !important; }
 
       /* HALO branding */
       .halo-wrap{
@@ -65,12 +63,6 @@ st.markdown(
       .brand-title{
         color:#0B3B8C; font-weight:800; font-size:36px; line-height:1.1;
       }
-      .brand-subtle{
-        color:#3c3c3c; font-size:20px; margin-left:.25rem;
-      }
-
-      /* tighten input spacing a bit */
-      div[data-baseweb="input"] { margin-top: -6px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -95,10 +87,10 @@ with st.spinner("Loading data..."):
         store = load_store()
 
 # ============================== Router + query box ==============================
-# (Removed the 3 chips as requested)
-q_default = st.session_state.get("q", "first pass accuracy analysis")
+# default prompt is now "fpa"
+q_default = st.session_state.get("q", "fpa")
 q = st.text_input(
-    "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis' or 'fail reasons analysis')",
+    "Type your question (e.g., 'comp', 'complaint', or 'fpa')",
     value=q_default,
 )
 st.session_state["q"] = q
