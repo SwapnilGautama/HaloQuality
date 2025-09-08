@@ -115,22 +115,42 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
     end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
 
-    # Compute pass% per portfolio per month
     grp = df.groupby(["portfolio", "_m"])["result"].agg(
         total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
     ).reset_index()
     grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"]).round(0)
 
     piv = grp.pivot(index="portfolio", columns="_m", values="pass_%").reindex(columns=months)
-    # Pretty month headers like Jan-25
     piv.columns = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in piv.columns]
     piv = piv.sort_index().fillna(0).astype(int)
     return piv
 
 # ======================
-# Reasons — ALL + Pareto line to 100%
+# Reason labelling helpers
 # ======================
+def _label_all(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Label ALL failed rows across all months with a 'reason' column.
+    Uses the same rule-based labeller as the latest-month view.
+    """
+    from core.reason_labeller import label_dataframe
+    df = df.copy()
+    df["_m"] = _coerce_month(df["date"])
+    fails = df[~df["result"].apply(_is_pass)].copy()
+    if fails.empty:
+        return pd.DataFrame(columns=list(df.columns) + ["reason"])
+    lab_df = pd.DataFrame({
+        "Case Comment": fails["comment"].fillna("").astype(str),
+        "RCA2": (fails["rca2"].fillna("").astype(str) if "rca2" in fails.columns else "")
+    })
+    fails["reason"] = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2")\
+        .fillna("Other").astype(str)
+    return fails
+
 def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
+    """
+    Existing latest-month aggregation (kept as-is for the Pareto chart).
+    """
     from core.reason_labeller import label_dataframe
 
     df = df.assign(_m=_coerce_month(df["date"]))
@@ -159,6 +179,26 @@ def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     vc["cum_percent"] = vc["cum_percent"].round(1)
     return vc, latest
 
+def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pivot for the second-row table:
+      rows   -> (portfolio, reason)
+      cols   -> months (Jan–latest)
+      values -> count of failed cases
+    """
+    if fails.empty:
+        return pd.DataFrame()
+
+    months = pd.period_range(fails["_m"].min(), fails["_m"].max(), freq="M")
+    month_labels = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
+
+    g = fails.groupby(["portfolio", "reason", "_m"]).size().reset_index(name="count")
+    mat = g.pivot_table(index=["portfolio", "reason"], columns="_m", values="count", fill_value=0)
+    mat = mat.reindex(columns=months, fill_value=0)
+    mat.columns = month_labels
+    mat = mat.sort_index()
+    return mat
+
 # ======================
 # Plots (styling)
 # ======================
@@ -167,21 +207,15 @@ def _fig_mom(df: pd.DataFrame, title: str):
     Smooth pastel line, no markers, soft baseline, no y-axis.
     """
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
-
     ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
-
-    # light labels above points
     for x, y in zip(df["month"], df["pass_pct"]):
         ax.text(x, y + 2, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-
-    # Style: remove borders & y-axis; soft bottom spine only
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY)
     ax.spines["bottom"].set_linewidth(1.25)
     ax.get_yaxis().set_visible(False)
     ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
-
     ax.set_title(title, pad=8, color=_DARK_BLUE)
     ax.set_ylim(bottom=0, top=100)
     return fig
@@ -189,65 +223,44 @@ def _fig_mom(df: pd.DataFrame, title: str):
 def _fig_pareto_full(df: pd.DataFrame):
     """
     Bars = counts (sorted desc), smooth cumulative % line.
-    RCA1-style:
-      - Soft pastel bars, teal cumulative line
-      - NO plot title here (section title is rendered above)
-      - NO plot border (all spines off except bottom in soft grey)
-      - NO primary/secondary y-axes
+    RCA1-style: soft pastel bars, teal line, soft bottom spine, no y-axes.
     """
     fig, ax1 = plt.subplots(figsize=(8.6, 4.0))
-
     x = np.arange(len(df))
-
-    # Bars with RCA1-like pastel palette
     colors = [_RCA1_BARS[i % len(_RCA1_BARS)] for i in range(len(df))]
     bars = ax1.bar(x, df["count"], color=colors)
 
-    # Count labels on bars
     lift = max(df["count"]) * 0.015 if len(df) else 1
     for b in bars:
-        ax1.text(
-            b.get_x() + b.get_width() / 2,
-            b.get_height() + lift,
-            f"{int(b.get_height())}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-            color=_DARK_GREY,
-        )
+        ax1.text(b.get_x() + b.get_width()/2, b.get_height() + lift,
+                 f"{int(b.get_height())}", ha="center", va="bottom",
+                 fontsize=9, color=_DARK_GREY)
 
-    # Smooth cumulative line (interpolated for gentle curve)
     ax2 = ax1.twinx()
     x_dense = np.linspace(x.min(), x.max(), num=max(200, len(x) * 20))
     y_dense = np.interp(x_dense, x, df["cum_percent"].values)
     ax2.plot(x_dense, y_dense, linewidth=2.8, color=_RCA1_CUM_LINE)
 
-    # Minimal labels on the line at bar positions
     for xi, cp in zip(x, df["cum_percent"]):
-        ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
+        ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom",
+                 fontsize=8, color=_DARK_GREY)
 
-    # X ticks / labels
     ax1.set_xticks(x)
     ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
 
-    # Style: remove plot borders; keep only a soft bottom baseline on the primary axis
     for sp in ["left", "right", "top"]:
         ax1.spines[sp].set_visible(False)
     ax1.spines["bottom"].set_color(_SOFT_GREY)
     ax1.spines["bottom"].set_linewidth(1.25)
 
-    # Hide both y-axes completely and hide twin axis spines
     ax1.get_yaxis().set_visible(False)
     ax2.get_yaxis().set_visible(False)
     for sp in ["left", "right", "top", "bottom"]:
         ax2.spines[sp].set_visible(False)
 
-    ax1.set_xlabel("")
-    ax1.set_ylabel("")
-    ax2.set_ylabel("")
+    ax1.set_xlabel(""); ax1.set_ylabel(""); ax2.set_ylabel("")
     ax1.grid(False)
     ax2.set_ylim(0, 100)
-
     return fig
 
 # ======================
@@ -271,35 +284,61 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
     latest = df_raw["_m"].max()
 
-    # NEW: Month-on-Month FPA% by portfolio (rows × columns)
+    # Month-on-Month FPA% by portfolio (rows × columns)
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
+    # ---- Sidebar filters for Row 2 matrix ----
+    st.sidebar.header("Filters — Fail reasons view")
+    fails_all = _label_all(df_raw)
+    all_reasons = sorted(fails_all["reason"].unique().tolist()) if not fails_all.empty else []
+    all_portfolios = sorted(fails_all["portfolio"].dropna().unique().tolist()) if not fails_all.empty else []
+    sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
+    sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
+
+    # ---- Row 1 ----
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
         st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
     with c2:
         st.markdown(
-            f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>"
-            f"FPA % by Portfolio — Month on Month"
-            f"</h4>", unsafe_allow_html=True)
+            f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA % by Portfolio — Month on Month</h4>",
+            unsafe_allow_html=True
+        )
         if not piv_portfolio_mom.empty:
             st.dataframe(piv_portfolio_mom, use_container_width=True)
 
-    # Row 2: Reasons — ALL + Pareto line
-    reasons, lastp = _label_all_latest(df_raw)
-    st.markdown(
-        f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
-        f"Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}"
-        f"</h4>", unsafe_allow_html=True)
+    # ---- Row 2 ----
+    # Left: Pareto chart (latest month) — unchanged
+    reasons_latest, lastp = _label_all_latest(df_raw)
 
-    r1, r2 = st.columns(2, gap="large")
+    # Right: New matrix (portfolio × reason rows; months columns; counts)
+    fail_matrix = _pivot_fail_matrix(fails_all)
+
+    st.markdown(
+        f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}</h4>",
+        unsafe_allow_html=True
+    )
+    r1, r2 = st.columns((1.0, 1.2), gap="large")
     with r1:
-        if not reasons.empty:
-            st.pyplot(_fig_pareto_full(reasons))
+        if not reasons_latest.empty:
+            st.pyplot(_fig_pareto_full(reasons_latest))
         else:
             st.info("No fail reasons available for the latest month.")
+
     with r2:
-        if not reasons.empty:
-            st.dataframe(reasons, use_container_width=True)
+        if not fail_matrix.empty:
+            # Apply sidebar filters
+            if sel_reasons:
+                fail_matrix = fail_matrix.loc[fail_matrix.index.get_level_values("reason").isin(sel_reasons)]
+            if sel_portfolios:
+                fail_matrix = fail_matrix.loc[fail_matrix.index.get_level_values("portfolio").isin(sel_portfolios)]
+
+            st.markdown(
+                f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month</h4>",
+                unsafe_allow_html=True
+            )
+            st.dataframe(fail_matrix, use_container_width=True)
+        else:
+            st.info("No fail reason data available to populate the matrix.")
 
     return ("", pd.DataFrame())
