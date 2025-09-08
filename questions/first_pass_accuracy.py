@@ -15,14 +15,16 @@ _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#E0E0E0"   # softer axis baseline
 
-# Pastel palette
-_PASTEL_LINE = "#8ECAE6"  # FPA line
-_PASTEL_LINE_DOT = "#8ECAE6"
-_PASTEL_BARS = [
-    "#8ECAE6", "#BDE0FE", "#A9DEF9", "#CDEAC0", "#B9FBC0", "#FFD6A5",
-    "#FFC8DD", "#E2E2F1", "#F1D1B5", "#C3F0CA", "#E4C1F9", "#FDE4CF"
+# Pastel palette for the FPA line
+_PASTEL_LINE = "#8ECAE6"
+
+# RCA1-like pastel bar palette (soft blues/greens/greys/oranges)
+_RCA1_BARS = [
+    "#9ECAE1", "#A1D99B", "#BDBDBD", "#FDAE6B", "#C6DBEF", "#FDD0A2",
+    "#D9F0A3", "#BCBDDC", "#C7E9C0", "#F2F0F7", "#E5F5E0", "#FEE6CE"
 ]
-_PASTEL_LINE_2 = "#90BE6D"  # cumulative line
+# Smooth cumulative line (soft green/teal)
+_RCA1_CUM_LINE = "#74C69D"
 
 # ======================
 # Data loading
@@ -156,7 +158,7 @@ def _fig_mom(df: pd.DataFrame, title: str):
 
     ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
 
-    # light, unobtrusive labels above points
+    # light labels above points
     for x, y in zip(df["month"], df["pass_pct"]):
         ax.text(x, y + 2, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
 
@@ -172,27 +174,29 @@ def _fig_mom(df: pd.DataFrame, title: str):
     ax.set_ylim(bottom=0, top=100)
     return fig
 
-def _fig_pareto_full(df: pd.DataFrame, title: str):
+def _fig_pareto_full(df: pd.DataFrame):
     """
     Bars = counts (sorted desc), smooth cumulative % line.
-    - Pastel bar palette
-    - No borders
-    - No y-axes shown (primary or secondary)
-    - Bottom x-axis in soft grey
+    RCA1-style:
+      - Soft pastel bars, teal cumulative line
+      - NO chart title here (we already render a section title above the chart)
+      - NO plot border (all spines off except bottom in soft grey)
+      - NO primary/secondary y-axes
     """
     fig, ax1 = plt.subplots(figsize=(8.6, 4.0))
 
     x = np.arange(len(df))
 
-    # Bars with pastel palette
-    colors = [_PASTEL_BARS[i % len(_PASTEL_BARS)] for i in range(len(df))]
+    # Bars with RCA1-like pastel palette
+    colors = [_RCA1_BARS[i % len(_RCA1_BARS)] for i in range(len(df))]
     bars = ax1.bar(x, df["count"], color=colors)
 
     # Count labels on bars
+    lift = max(df["count"]) * 0.015 if len(df) else 1
     for b in bars:
         ax1.text(
             b.get_x() + b.get_width() / 2,
-            b.get_height() + (max(df["count"]) * 0.015),
+            b.get_height() + lift,
             f"{int(b.get_height())}",
             ha="center",
             va="bottom",
@@ -200,11 +204,11 @@ def _fig_pareto_full(df: pd.DataFrame, title: str):
             color=_DARK_GREY,
         )
 
-    # Smooth cumulative line: interpolate to a denser grid for a gentle curve
+    # Smooth cumulative line (interpolated for gentle curve)
     ax2 = ax1.twinx()
     x_dense = np.linspace(x.min(), x.max(), num=max(200, len(x) * 20))
     y_dense = np.interp(x_dense, x, df["cum_percent"].values)
-    ax2.plot(x_dense, y_dense, linewidth=2.5, color=_PASTEL_LINE_2)
+    ax2.plot(x_dense, y_dense, linewidth=2.8, color=_RCA1_CUM_LINE)
 
     # Minimal labels on the line at coarse intervals
     for xi, cp in zip(x, df["cum_percent"]):
@@ -214,23 +218,24 @@ def _fig_pareto_full(df: pd.DataFrame, title: str):
     ax1.set_xticks(x)
     ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
 
-    # Style: remove borders & both y-axes; keep soft bottom spine
+    # Style: remove plot borders; keep only a soft bottom baseline on the primary axis
     for sp in ["left", "right", "top"]:
         ax1.spines[sp].set_visible(False)
     ax1.spines["bottom"].set_color(_SOFT_GREY)
     ax1.spines["bottom"].set_linewidth(1.25)
 
-    # Hide both y-axes completely
+    # Hide both y-axes completely and also hide twin axis frame/spines
     ax1.get_yaxis().set_visible(False)
     ax2.get_yaxis().set_visible(False)
+    for sp in ["left", "right", "top", "bottom"]:
+        ax2.spines[sp].set_visible(False)
 
     ax1.set_xlabel("")
     ax1.set_ylabel("")
     ax2.set_ylabel("")
     ax1.grid(False)
-
-    ax1.set_title(title, pad=8, color=_DARK_BLUE)
     ax2.set_ylim(0, 100)
+
     return fig
 
 # ======================
@@ -276,7 +281,8 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     r1, r2 = st.columns(2, gap="large")
     with r1:
         if not reasons.empty:
-            st.pyplot(_fig_pareto_full(reasons, "Fail reasons — Pareto (all categories)"))
+            # NOTE: no in-plot title now; the H4 above is the chart title
+            st.pyplot(_fig_pareto_full(reasons))
         else:
             st.info("No fail reasons available for the latest month.")
     with r2:
