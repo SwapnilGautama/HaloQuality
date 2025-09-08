@@ -65,6 +65,8 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     if not p:
         raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
     df = _read_excel_any(p)
+
+    # --- EXPANDED CANDIDATES (adds Administrator→individual, Team manager→team, more location variants) ---
     col_map = {
         "date": _pick(df, ["Activity Date", "ActivityDate", "Date", "Activity date"]),
         "result": _pick(df, ["Review Result", "Review result", "Result"]),
@@ -73,14 +75,19 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "comment": _pick(df, ["Case Comment", "Comments", "Reviewer Comment", "Comment"]),
         "rca2": _pick(df, ["RCA2", "Root Cause 2", "RCA 2"]),
         # potential comparison fields (optional; detected later)
-        "team": _pick(df, ["Team", "Team Manager", "Department"]),
+        # Team manager → team (keep previous candidates too)
+        "team": _pick(df, ["Team manager", "Team Manager", "Manager", "Team", "Assign To Team", "Department", "TeamManager"]),
         "work_type": _pick(df, ["Work Type", "WorkType", "Activity Type"]),
-        "individual": _pick(df, ["Reviewer", "User", "Administrator", "Analyst"]),
-        "location": _pick(df, ["Location", "Region", "Site"]),
+        # Administrator → individual (keep previous candidates too)
+        "individual": _pick(df, ["Administrator", "Reviewer", "User", "Owner", "Analyst"]),
+        # broaden location
+        "location": _pick(df, ["Location", "Region", "Site", "Office", "Branch"]),
     }
+
     missing = [k for k, v in col_map.items() if k in ("date", "result") and v is None]
     if missing:
         raise KeyError(f"Missing required columns for FPA: {missing}")
+
     df = df.rename(columns={v: k for k, v in col_map.items() if v})
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     return df, col_map
@@ -275,7 +282,7 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
 
     if not fails_all.empty and latest is not None:
         latest_fails = fails_all[fails_all["_m"] == latest]
-        prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
+        prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns(fails_all.columns))
 
         # concentration by portfolio (share in latest)
         by_port = latest_fails.groupby("portfolio").size().sort_values(ascending=False)
@@ -308,10 +315,8 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
                 parts = ", ".join([f"{k} ({int(v)})" for k, v in tops.items()])
                 contrib_points.append(f"Top portfolios for **{r}**: {parts}.")
 
-    # ---- Build bullets in structured + indented format ----
+    # ---- Build bullets ----
     bullets: List[str] = []
-
-    # Pass rate headline
     if not np.isnan(last_val):
         if not np.isnan(delta):
             bullets.append(
@@ -321,37 +326,27 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
         else:
             bullets.append(f"**Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
 
-    # Standout portfolios (indented)
     if not change.empty:
         lines = []
-        # Up movers
         for idx, val in top_up.items():
             lines.append(f"  - *{idx}*: {('+' if val>=0 else '')}{val:.0f} pp MoM")
-        # Down movers
         for idx, val in top_down.items():
             lines.append(f"  - *{idx}*: {val:.0f} pp MoM")
         if lines:
             bullets.append("**Standout Portfolios**:\n" + "\n".join(lines))
 
-    # Fail reasons (top 2) (indented)
     if reasons_points:
         bullets.append("**Fail Reasons (Top 2)**:\n" + "\n".join([f"  - {p}" for p in reasons_points]))
 
-    # Standout observations (indented)
     if obs_points or contrib_points:
         combined = obs_points + contrib_points
         bullets.append("**Standout Observations**:\n" + "\n".join([f"  - {p}" for p in combined]))
 
-    # Keep 3–4 bullets max
     if len(bullets) > 4:
         bullets = bullets[:4]
     return bullets
 
 def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> Optional[List[str]]:
-    """
-    Try to use OpenAI (if available). If anything fails, return None to fall back safely.
-    Requires OPENAI_API_KEY in env or st.secrets["OPENAI_API_KEY"] and `openai` >= 1.0 installed.
-    """
     try:
         df_tmp = df_raw.copy()
         df_tmp["_m"] = _coerce_month(df_tmp["date"])
@@ -373,11 +368,7 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
             fr_df = pd.DataFrame({"latest": fr_now}).join(pd.DataFrame({"prev": fr_prev}), how="outer").fillna(0).astype(int)
             fr_str = fr_df.to_csv()
 
-        try:
-            from openai import OpenAI
-        except Exception:
-            return None
-
+        from openai import OpenAI  # may not be available; handled by except
         api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
         if not api_key:
             return None
@@ -420,7 +411,6 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
         return None
 
 def _render_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> None:
-    # Try OpenAI → fallback heuristic
     bullets = _openai_insights(mom, df_raw, fails_all)
     if not bullets:
         bullets = _heuristic_insights(mom, df_raw, fails_all)
@@ -502,9 +492,10 @@ def _fig_pareto_full(df: pd.DataFrame):
 def _available_dim(df: pd.DataFrame, logical_name: str, col_map: Dict[str, str]) -> Optional[str]:
     """
     Return the canonical column name for a comparison dimension if present, else None.
-    logical_name is one of: 'portfolio','team','work_type','individual','location'
+    After _load_fpa(), dataframe columns are renamed to canonical names (the keys),
+    so we must check presence against the logical name itself.
     """
-    return col_map.get(logical_name) if col_map.get(logical_name) in df.columns else None
+    return logical_name if logical_name in df.columns else None
 
 def _pass_mom_by_dim(df: pd.DataFrame, dim_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -633,7 +624,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Tab 2: Comparisons (new) =====================
+    # ===================== Tab 2: Comparisons (existing layout preserved) =====================
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .75rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
         st.caption("Explore pass percentages across different slices such as Portfolio, Team, Work Type, Individuals and Locations (where available in your data).")
