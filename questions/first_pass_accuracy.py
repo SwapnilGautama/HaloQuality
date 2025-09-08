@@ -4,7 +4,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 import os
-import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -72,7 +71,9 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "scheme": _pick(df, ["Scheme", "Scheme Name", "Plan", "Plan Name"]),
         "comment": _pick(df, ["Case Comment", "Comments", "Reviewer Comment", "Comment"]),
         "rca2": _pick(df, ["RCA2", "Root Cause 2", "RCA 2"]),
-        # potential comparison fields (optional; detected later)
+        # comparison fields we will try to render on the Comparisons tab
+        "administrator": _pick(df, ["Administrator", "Admin"]),
+        "team_manager": _pick(df, ["Team Manager", "Manager", "TeamManager"]),
         "team": _pick(df, ["Team", "Assign To Team", "Department"]),
         "work_type": _pick(df, ["Work Type", "WorkType", "Activity Type"]),
         "individual": _pick(df, ["Reviewer", "User", "Owner", "Analyst"]),
@@ -110,9 +111,6 @@ def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"month": label, "pass_pct": pct.values})
 
 def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Portfolio (rows) × Month (columns) FPA% from Jan-25 to latest.
-    """
     df = df.copy()
     df["_m"] = _coerce_month(df["date"])
     if df["_m"].dropna().empty:
@@ -136,9 +134,6 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
 # Reason labelling helpers
 # ======================
 def _label_all(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Label ALL failed rows across all months with a 'reason' column.
-    """
     from core.reason_labeller import label_dataframe
     df = df.copy()
     df["_m"] = _coerce_month(df["date"])
@@ -154,11 +149,7 @@ def _label_all(df: pd.DataFrame) -> pd.DataFrame:
     return fails
 
 def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
-    """
-    Latest-month aggregation for the Pareto chart.
-    """
     from core.reason_labeller import label_dataframe
-
     df = df.assign(_m=_coerce_month(df["date"]))
     latest = df["_m"].max()
     if pd.isna(latest):
@@ -186,16 +177,8 @@ def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     return vc, latest
 
 def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pivot for the second-row table (2025 only):
-      rows   -> (portfolio, reason)
-      cols   -> months (Jan–latest) within calendar year 2025
-      values -> count of failed cases
-    """
     if fails.empty:
         return pd.DataFrame()
-
-    # Limit to 2025 only
     start_2025 = pd.Period("2025-01")
     fails_2025 = fails[fails["_m"] >= start_2025].copy()
     if fails_2025.empty:
@@ -227,7 +210,6 @@ def _safe_int(x) -> int:
         return 0
 
 def _portfolio_pass_table(df: pd.DataFrame) -> pd.DataFrame:
-    # helper for insights calcs: portfolio × month with pass %
     df = df.copy()
     df["_m"] = _coerce_month(df["date"])
     grp = df.groupby(["portfolio", "_m"])["result"].agg(
@@ -241,13 +223,11 @@ def _get_prev_period(periods: List[pd.Period], latest: pd.Period) -> Optional[pd
     return prevs[-1] if prevs else None
 
 def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> List[str]:
-    # 1) Overall MoM pass %
     overall_series = mom["pass_pct"].astype(float)
     last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
     prev_val = overall_series.iloc[-2] if len(overall_series) >= 2 else np.nan
     delta = (last_val - prev_val) if not (np.isnan(last_val) or np.isnan(prev_val)) else np.nan
 
-    # 2) Portfolios up/down
     df_raw = df_raw.copy()
     df_raw["_m"] = _coerce_month(df_raw["date"])
     periods = sorted(df_raw["_m"].dropna().unique().tolist())
@@ -268,7 +248,6 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
     top_up = change.head(2)
     top_down = change.tail(2).sort_values()
 
-    # 3) Top 2 fail reasons and trends + 4) top portfolio contributors
     reasons_points = []
     contrib_points = []
     obs_points = []
@@ -277,7 +256,6 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
         latest_fails = fails_all[fails_all["_m"] == latest]
         prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
 
-        # concentration by portfolio (share in latest)
         by_port = latest_fails.groupby("portfolio").size().sort_values(ascending=False)
         if not by_port.empty:
             top_port, top_port_cnt = by_port.index[0], int(by_port.iloc[0])
@@ -285,7 +263,6 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
             share = round(top_port_cnt * 100.0 / total_latest, 1)
             obs_points.append(f"Failures concentrated in **{top_port}** ({share}% of { _format_period(latest) } fails).")
 
-        # dominant reason share
         by_reason = latest_fails.groupby("reason").size().sort_values(ascending=False)
         if not by_reason.empty:
             top_reason, top_reason_cnt = by_reason.index[0], int(by_reason.iloc[0])
@@ -293,7 +270,6 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
             share_r = round(top_reason_cnt * 100.0 / total_latest, 1)
             obs_points.append(f"**{top_reason}** accounts for **{share_r}%** of { _format_period(latest) } fails.")
 
-        # top 2 reasons with deltas + contributors
         top2 = by_reason.head(2).index.tolist()
         for r in top2:
             c_now = _safe_int((latest_fails["reason"] == r).sum())
@@ -308,10 +284,7 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
                 parts = ", ".join([f"{k} ({int(v)})" for k, v in tops.items()])
                 contrib_points.append(f"Top portfolios for **{r}**: {parts}.")
 
-    # ---- Build bullets in structured + indented format ----
     bullets: List[str] = []
-
-    # Pass rate headline
     if not np.isnan(last_val):
         if not np.isnan(delta):
             bullets.append(
@@ -321,37 +294,31 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
         else:
             bullets.append(f"**Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
 
-    # Standout portfolios (indented)
     if not change.empty:
         lines = []
-        # Up movers
         for idx, val in top_up.items():
             lines.append(f"  - *{idx}*: {('+' if val>=0 else '')}{val:.0f} pp MoM")
-        # Down movers
         for idx, val in top_down.items():
             lines.append(f"  - *{idx}*: {val:.0f} pp MoM")
         if lines:
             bullets.append("**Standout Portfolios**:\n" + "\n".join(lines))
 
-    # Fail reasons (top 2) (indented)
     if reasons_points:
         bullets.append("**Fail Reasons (Top 2)**:\n" + "\n".join([f"  - {p}" for p in reasons_points]))
 
-    # Standout observations (indented)
     if obs_points or contrib_points:
         combined = obs_points + contrib_points
         bullets.append("**Standout Observations**:\n" + "\n".join([f"  - {p}" for p in combined]))
 
-    # Keep 3–4 bullets max
     if len(bullets) > 4:
         bullets = bullets[:4]
     return bullets
 
 def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> Optional[List[str]]:
-    """
-    Try to use OpenAI (if available). If anything fails, return None to fall back safely.
-    Requires OPENAI_API_KEY in env or st.secrets["OPENAI_API_KEY"] and `openai` >= 1.0 installed.
-    """
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception:
+        return None
     try:
         df_tmp = df_raw.copy()
         df_tmp["_m"] = _coerce_month(df_tmp["date"])
@@ -360,8 +327,9 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
         prev = prevs[-2] if len(prevs) >= 2 else None
 
         mom_str = mom.to_csv(index=False)
-        ptab = _portfolio_pass_table(df_raw)
-        ptab_str = ptab.to_csv(index=False)
+
+        grp = _portfolio_pass_table(df_raw)
+        ptab_str = grp.to_csv(index=False)
 
         if fails_all.empty:
             fr_str = "none"
@@ -373,11 +341,6 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
             fr_df = pd.DataFrame({"latest": fr_now}).join(pd.DataFrame({"prev": fr_prev}), how="outer").fillna(0).astype(int)
             fr_str = fr_df.to_csv()
 
-        try:
-            from openai import OpenAI
-        except Exception:
-            return None
-
         api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
         if not api_key:
             return None
@@ -388,8 +351,7 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
             "- Bullet 1: **Month-on-Month Pass Rate** with latest value and MoM delta.\n"
             "- Bullet 2: **Standout Portfolios** with two indented sub-bullets (biggest ↑/↓), format '  - *Portfolio*: +X pp MoM'.\n"
             "- Bullet 3: **Fail Reasons (Top 2)** with two indented sub-bullets showing counts and MoM deltas.\n"
-            "- Bullet 4: **Standout Observations** with indented sub-bullets (concentration or dominant reason share and top portfolio contributors).\n"
-            "Keep bullets terse and numeric; avoid prose."
+            "- Bullet 4: **Standout Observations** with indented sub-bullets."
         )
         user_prompt = (
             f"MoM Pass% table (month,pass_pct):\n{mom_str}\n\n"
@@ -420,7 +382,6 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
         return None
 
 def _render_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> None:
-    # Try OpenAI → fallback heuristic
     bullets = _openai_insights(mom, df_raw, fails_all)
     if not bullets:
         bullets = _heuristic_insights(mom, df_raw, fails_all)
@@ -437,9 +398,6 @@ def _render_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
 # Plots (styling)
 # ======================
 def _fig_mom(df: pd.DataFrame, title: str):
-    """
-    Smooth pastel line, soft baseline, no y-axis.
-    """
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
     for x, y in zip(df["month"], df["pass_pct"]):
@@ -455,9 +413,6 @@ def _fig_mom(df: pd.DataFrame, title: str):
     return fig
 
 def _fig_pareto_full(df: pd.DataFrame):
-    """
-    Bars = counts (sorted desc), smooth cumulative % line.
-    """
     fig, ax1 = plt.subplots(figsize=(8.6, 4.0))
     x = np.arange(len(df))
     colors = [_RCA1_BARS[i % len(_RCA1_BARS)] for i in range(len(df))]
@@ -497,58 +452,84 @@ def _fig_pareto_full(df: pd.DataFrame):
     return fig
 
 # ======================
-# Comparison helpers (new tab)
+# Comparison helpers (new)
 # ======================
 def _available_dim(df: pd.DataFrame, logical_name: str, col_map: Dict[str, str]) -> Optional[str]:
-    """
-    Return the canonical column name for a comparison dimension if present, else None.
-    logical_name is one of: 'portfolio','team','work_type','individual','location'
-    """
     return col_map.get(logical_name) if col_map.get(logical_name) in df.columns else None
 
-def _pass_mom_by_dim(df: pd.DataFrame, dim_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _latest_pass_by_dim(df: pd.DataFrame, dim_col: str) -> Tuple[pd.DataFrame, Optional[pd.Period], Optional[pd.Period]]:
     """
-    Returns:
-      - table MoM: dim (rows) × months (columns) with Pass %
-      - latest table: dim (rows) × ['pass_%'] for latest month
+    Latest month pass% by dimension (single column 'pass_%').
+    Returns (table, latest_period, prev_period)
     """
     dfx = df.copy()
     dfx["_m"] = _coerce_month(dfx["date"])
-    start = pd.Period("2025-01")
     if dfx["_m"].dropna().empty:
-        return pd.DataFrame(), pd.DataFrame()
-    end = dfx["_m"].max()
-    months = pd.period_range(start, end, freq="M")
-    lab = [m.to_timestamp().strftime("%b-%y") for m in months]
+        return pd.DataFrame(), None, None
+    latest = dfx["_m"].max()
+    prevs = sorted(dfx["_m"].dropna().unique().tolist())
+    prev = prevs[-2] if len(prevs) >= 2 else None
 
     g = dfx.groupby([dim_col, "_m"])["result"].agg(
         total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
     ).reset_index()
     g["pass_%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0).round(0)
 
-    piv = g.pivot(index=dim_col, columns="_m", values="pass_%").reindex(columns=months)
-    piv.columns = lab
-    piv = piv.fillna(0).sort_index()
-
-    latest = end
     latest_tab = g[g["_m"] == latest][[dim_col, "pass_%"]].set_index(dim_col).sort_values("pass_%", ascending=False)
-    return piv, latest_tab
+    return latest_tab, latest, prev
 
-def _mini_bar_latest(latest_tab: pd.DataFrame, title: str):
-    if latest_tab.empty:
-        return
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
-    x = np.arange(len(latest_tab))
-    ax.bar(x, latest_tab["pass_%"].values, color="#BFD7EA")
-    ax.set_xticks(x)
-    ax.set_xticklabels(latest_tab.index.tolist(), rotation=90, ha="center", fontsize=8, color=_DARK_GREY)
-    for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.get_yaxis().set_visible(False)
-    ax.grid(False)
-    ax.set_title(title, color=_DARK_BLUE)
-    st.pyplot(fig)
+def _mom_delta_by_dim(df: pd.DataFrame, dim_col: str, latest: pd.Period, prev: Optional[pd.Period]) -> pd.Series:
+    if latest is None or prev is None:
+        return pd.Series(dtype=float)
+    dfx = df.copy()
+    dfx["_m"] = _coerce_month(dfx["date"])
+    g = dfx.groupby([dim_col, "_m"])["result"].agg(
+        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
+    ).reset_index()
+    g["pass_%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0).round(0)
+    cur = g[g["_m"] == latest].set_index(dim_col)["pass_%"]
+    prv = g[g["_m"] == prev].set_index(dim_col)["pass_%"]
+    delta = (cur - prv).dropna()
+    return delta.sort_values(ascending=False)
+
+def _comparison_insights_block(df_raw: pd.DataFrame, col_map: Dict[str, str]) -> List[str]:
+    """
+    Build 4 bullets: Administrator, Portfolio, Team manager, Location (if present).
+    Each bullet: top performer + biggest MoM mover (▲/▼).
+    """
+    bullets = []
+    for logical, label in [("administrator","Administrator"), ("portfolio","Portfolio"),
+                           ("team_manager","Team manager"), ("location","Location")]:
+        dim_col = _available_dim(df_raw, logical, col_map)
+        if not dim_col:
+            continue
+
+        latest_tab, latest, prev = _latest_pass_by_dim(df_raw, dim_col)
+        if latest_tab.empty:
+            continue
+
+        # top performer (latest)
+        top_name = latest_tab.index[0]
+        top_val = latest_tab.iloc[0, 0]
+
+        # MoM movers
+        delta = _mom_delta_by_dim(df_raw, dim_col, latest, prev)
+        mover_up = None
+        mover_dn = None
+        if not delta.empty:
+            mover_up = (delta.index[0], float(delta.iloc[0]))
+            mover_dn = (delta.index[-1], float(delta.iloc[-1]))
+
+        parts = [f"**{label}**: Top = *{top_name}* (**{top_val:.0f}%**)"]
+        if mover_up:
+            parts.append(f"  - Biggest ↑: *{mover_up[0]}* (+{mover_up[1]:.0f} pp MoM)")
+        if mover_dn and mover_dn[1] < 0:
+            parts.append(f"  - Biggest ↓: *{mover_dn[0]}* ({mover_dn[1]:.0f} pp MoM)")
+        bullets.append("\n".join(parts))
+
+        if len(bullets) == 4:
+            break
+    return bullets[:4]
 
 # ======================
 # Streamlit entry
@@ -573,6 +554,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     latest = df_raw["_m"].max()
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
+    # Sidebar filters for Overview row-2 table
     st.sidebar.header("Filters (2025) — Fail reasons")
     fails_all = _label_all(df_raw)
     if not fails_all.empty:
@@ -590,7 +572,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     # ===================== Tab 1: Overview (existing UI preserved) =====================
     with tab_overview:
-        # Insights
+        # Insights (global)
         _render_insights(mom, df_raw, fails_all)
 
         # Row 1
@@ -635,33 +617,34 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     # ===================== Tab 2: Comparisons (new) =====================
     with tab_comparisons:
-        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .75rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
-        st.caption("Explore pass percentages across different slices such as Portfolio, Team, Work Type, Individuals and Locations (where available in your data).")
+        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
+        # ---- Insights specific to Comparisons (4 bullets; one per table if available)
+        bullets = _comparison_insights_block(df_raw, col_map)
+        if bullets:
+            for b in bullets:
+                st.markdown(f"- {b}")
+        else:
+            st.caption("No comparison fields available in this dataset.")
+
+        st.divider()
+
+        # Render 4 single-column tables (latest month only)
         dims = [
+            ("administrator", "Administrator"),
             ("portfolio", "Portfolio"),
-            ("team", "Team"),
-            ("work_type", "Work Type"),
-            ("individual", "Individual"),
+            ("team_manager", "Team manager"),
             ("location", "Location"),
         ]
         for logical, label in dims:
             dim_col = _available_dim(df_raw, logical, col_map)
-            if dim_col is None:
+            if not dim_col:
                 continue
-
-            st.markdown(f"##### {label}")
-
-            mom_tab, latest_tab = _pass_mom_by_dim(df_raw, dim_col)
-
-            # Latest month mini bar
+            st.markdown(f"**{label} — Latest month Pass %**")
+            latest_tab, _, _ = _latest_pass_by_dim(df_raw, dim_col)
             if not latest_tab.empty:
-                _mini_bar_latest(latest_tab, f"{label} — Latest month Pass %")
-
-            # MoM table
-            if not mom_tab.empty:
-                st.dataframe(mom_tab, use_container_width=True)
+                st.dataframe(latest_tab.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
             else:
-                st.info(f"No data to compute {label} pass percentages.")
+                st.info(f"No latest-month data for {label}.")
 
     return ("", pd.DataFrame())
