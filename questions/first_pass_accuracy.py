@@ -13,17 +13,13 @@ import streamlit as st
 # ---------------------------
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
-_SOFT_GREY = "#E0E0E0"   # softer axis baseline
+_SOFT_GREY = "#E0E0E0"
 
-# Pastel palette for the FPA line
 _PASTEL_LINE = "#8ECAE6"
-
-# RCA1-like pastel bar palette (soft blues/greens/greys/oranges)
 _RCA1_BARS = [
     "#9ECAE1", "#A1D99B", "#BDBDBD", "#FDAE6B", "#C6DBEF", "#FDD0A2",
     "#D9F0A3", "#BCBDDC", "#C7E9C0", "#F2F0F7", "#E5F5E0", "#FEE6CE"
 ]
-# Smooth cumulative line (soft green/teal)
 _RCA1_CUM_LINE = "#74C69D"
 
 # ======================
@@ -103,30 +99,24 @@ def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"month": label, "pass_pct": pct.values})
 
 def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Portfolio (rows) × Month (columns) FPA% from Jan-25 to latest.
-    """
     df = df.copy()
     df["_m"] = _coerce_month(df["date"])
     if df["_m"].dropna().empty:
         return pd.DataFrame()
-
     start = pd.Period("2025-01")
     end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
-
     grp = df.groupby(["portfolio", "_m"])["result"].agg(
         total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
     ).reset_index()
     grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"]).round(0)
-
     piv = grp.pivot(index="portfolio", columns="_m", values="pass_%").reindex(columns=months)
     piv.columns = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in piv.columns]
     piv = piv.sort_index().fillna(0).astype(int)
     return piv
 
 # ======================
-# Fail reasons full matrix
+# Reasons + Fail matrix
 # ======================
 def _label_all(df: pd.DataFrame) -> pd.DataFrame:
     from core.reason_labeller import label_dataframe
@@ -144,9 +134,6 @@ def _label_all(df: pd.DataFrame) -> pd.DataFrame:
     return fails
 
 def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pivot: rows=(portfolio, reason), columns=months, values=count
-    """
     if fails.empty:
         return pd.DataFrame()
     months = pd.period_range(fails["_m"].min(), fails["_m"].max(), freq="M")
@@ -158,22 +145,36 @@ def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     mat = mat.sort_index()
     return mat
 
-# ======================
-# Plots (styling)
-# ======================
-def _fig_mom(df: pd.DataFrame, title: str):
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
-    ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
-    for x, y in zip(df["month"], df["pass_pct"]):
-        ax.text(x, y + 2, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+def _fig_pareto_full(df: pd.DataFrame):
+    fig, ax1 = plt.subplots(figsize=(8.0, 3.5))
+    x = np.arange(len(df))
+    colors = [_RCA1_BARS[i % len(_RCA1_BARS)] for i in range(len(df))]
+    bars = ax1.bar(x, df["count"], color=colors)
+    lift = max(df["count"]) * 0.015 if len(df) else 1
+    for b in bars:
+        ax1.text(
+            b.get_x() + b.get_width() / 2,
+            b.get_height() + lift,
+            f"{int(b.get_height())}",
+            ha="center", va="bottom", fontsize=9, color=_DARK_GREY,
+        )
+    ax2 = ax1.twinx()
+    x_dense = np.linspace(x.min(), x.max(), num=max(200, len(x) * 20))
+    y_dense = np.interp(x_dense, x, df["cum_percent"].values)
+    ax2.plot(x_dense, y_dense, linewidth=2.5, color=_RCA1_CUM_LINE)
+    for xi, cp in zip(x, df["cum_percent"]):
+        ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
     for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.spines["bottom"].set_linewidth(1.25)
-    ax.get_yaxis().set_visible(False)
-    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
-    ax.set_title(title, pad=8, color=_DARK_BLUE)
-    ax.set_ylim(bottom=0, top=100)
+        ax1.spines[sp].set_visible(False)
+    ax1.spines["bottom"].set_color(_SOFT_GREY)
+    ax1.spines["bottom"].set_linewidth(1.25)
+    ax1.get_yaxis().set_visible(False)
+    ax2.get_yaxis().set_visible(False)
+    for sp in ["left", "right", "top", "bottom"]:
+        ax2.spines[sp].set_visible(False)
+    ax1.set_xlabel(""); ax1.set_ylabel(""); ax2.set_ylabel(""); ax1.grid(False); ax2.set_ylim(0, 100)
     return fig
 
 # ======================
@@ -195,43 +196,48 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
     latest = df_raw["_m"].max()
-
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
-    # Side filter pane
-    st.sidebar.header("Filters — First Pass Accuracy")
-    all_reasons = sorted(df_raw.get("rca2", pd.Series()).dropna().unique().tolist())
-    all_portfolios = sorted(df_raw.get("portfolio", pd.Series()).dropna().unique().tolist())
-    selected_reasons = st.sidebar.multiselect("Select Fail Reasons", options=all_reasons)
-    selected_portfolios = st.sidebar.multiselect("Select Portfolios", options=all_portfolios)
+    # Sidebar filters
+    st.sidebar.header("Filters — Fail Reasons")
+    fails_all = _label_all(df_raw)
+    all_reasons = sorted(fails_all["reason"].unique().tolist())
+    all_portfolios = sorted(fails_all["portfolio"].dropna().unique().tolist())
+    sel_reasons = st.sidebar.multiselect("Select Fail Reasons", options=all_reasons, default=all_reasons)
+    sel_portfolios = st.sidebar.multiselect("Select Portfolios", options=all_portfolios, default=all_portfolios)
 
+    # Row 1
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
         st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
     with c2:
-        st.markdown(
-            f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>"
-            f"FPA % by Portfolio — Month on Month"
-            f"</h4>", unsafe_allow_html=True)
+        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA % by Portfolio — Month on Month</h4>", unsafe_allow_html=True)
         if not piv_portfolio_mom.empty:
             st.dataframe(piv_portfolio_mom, use_container_width=True)
 
-    # Row 2: Fail reasons full matrix
-    fails = _label_all(df_raw)
-    mat = _pivot_fail_matrix(fails)
-
+    # Row 2
+    reasons, lastp = _label_all(df_raw), latest
+    mat = _pivot_fail_matrix(reasons)
     if not mat.empty:
         # Apply filters
-        if selected_reasons:
-            mat = mat.loc[mat.index.get_level_values("reason").isin(selected_reasons)]
-        if selected_portfolios:
-            mat = mat.loc[mat.index.get_level_values("portfolio").isin(selected_portfolios)]
-        st.markdown(
-            f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
-            f"Fail Reasons × Portfolio — Month on Month"
-            f"</h4>", unsafe_allow_html=True)
-        st.dataframe(mat, use_container_width=True)
-    else:
-        st.info("No fail reason data available.")
+        if sel_reasons:
+            mat = mat.loc[mat.index.get_level_values("reason").isin(sel_reasons)]
+        if sel_portfolios:
+            mat = mat.loc[mat.index.get_level_values("portfolio").isin(sel_portfolios)]
+
+        agg_latest = reasons[reasons["_m"] == lastp].groupby("reason").size().reset_index(name="count")
+        total = int(agg_latest["count"].sum()) or 1
+        agg_latest["percent"] = (agg_latest["count"] * 100.0 / total).round(1)
+        agg_latest["cum_percent"] = agg_latest["percent"].cumsum().clip(upper=100.0)
+
+        r1, r2 = st.columns((1.0, 1.2), gap="large")
+        with r1:
+            if not agg_latest.empty:
+                st.pyplot(_fig_pareto_full(agg_latest))
+            else:
+                st.info("No fail reasons available for the latest month.")
+        with r2:
+            st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month</h4>", unsafe_allow_html=True)
+            st.dataframe(mat, use_container_width=True)
 
     return ("", pd.DataFrame())
