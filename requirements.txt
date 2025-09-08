@@ -13,3 +13,4 @@ python-pptx
 openai>=1.40.0
 tiktoken
 tenacity>=8.2.3
+altair>=5.0.0
