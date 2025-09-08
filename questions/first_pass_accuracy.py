@@ -1,393 +1,415 @@
+# -*- coding: utf-8 -*-
 # questions/first_pass_accuracy.py
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, Tuple, Optional, List
 import os
-import json
+import re
+from io import BytesIO
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
+import matplotlib.pyplot as plt
 
-# ---------- Styles ----------
-_DARK_BLUE = "#0b3d91"
-_DARK_GREY = "#333333"
-_SOFT_GREY = "#DDDDDD"
-
-# =========================================================
-# Robust OpenAI setup: secrets + env + SDK v1/legacy support
-# =========================================================
-def _get_openai_key() -> Optional[str]:
-    # 1) OS env
-    key = os.getenv("OPENAI_API_KEY")
-    if key:
-        return key
-    # 2) Streamlit secrets (flat)
+# -----------------------------------------------------------------------------
+# 0) OpenAI key bootstrap (safe, preserves existing UX)
+# -----------------------------------------------------------------------------
+def _get_openai_key() -> str | None:
+    """
+    Look for an OpenAI API key and make it available to downstream libs.
+    Order:
+      1) Environment (OPENAI_API_KEY)
+      2) Streamlit Secrets (OPENAI_API_KEY), then export back to env
+    """
+    k = os.environ.get("OPENAI_API_KEY")
+    if k:
+        return k
     try:
-        if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
+        k = st.secrets.get("OPENAI_API_KEY")
     except Exception:
-        pass
-    # 3) Streamlit secrets (nested)
+        k = None
+    if k:
+        os.environ["OPENAI_API_KEY"] = k
+    return k
+
+
+OPENAI_API_KEY = _get_openai_key()
+
+# Best-effort import of the OpenAI SDK (do NOT break if missing)
+_openai_available = False
+_openai_client = None
+if OPENAI_API_KEY:
     try:
-        if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
-            return st.secrets["openai"]["api_key"]
+        from openai import OpenAI  # type: ignore
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        _openai_available = True
     except Exception:
-        pass
-    return None
+        _openai_available = False
 
-def _get_openai_model() -> str:
-    # model from env or secrets; default gpt-4o-mini
-    model = os.getenv("OPENAI_MODEL")
-    if model:
-        return model
-    try:
-        if "OPENAI_MODEL" in st.secrets:
-            return st.secrets["OPENAI_MODEL"]
-    except Exception:
-        pass
-    try:
-        if "openai" in st.secrets and "model" in st.secrets["openai"]:
-            return st.secrets["openai"]["model"]
-    except Exception:
-        pass
-    return "gpt-4o-mini"
 
-_OPENAI_API_KEY = _get_openai_key()
-_OPENAI_MODEL = _get_openai_model()
+# -----------------------------------------------------------------------------
+# 1) Data loading helpers (robust to file name changes)
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _find_fpa_workbook() -> str:
+    """
+    Return the first workbook path under data/first_pass_accuracy that looks like FPA.
+    We keep this tolerant to naming like "FirstPassAccuracy_Aug'25.xlsx".
+    """
+    root = "data/first_pass_accuracy"
+    if not os.path.isdir(root):
+        # fallbacks for older layouts
+        candidates = [
+            "data/FirstPassAccuracy_Aug'25.xlsx",
+            "data/FirstPassAccuracy_Aug25.xlsx",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        raise FileNotFoundError("FPA workbook folder not found.")
+    # pick first xlsx
+    for f in sorted(os.listdir(root)):
+        if f.lower().endswith(".xlsx"):
+            return os.path.join(root, f)
+    raise FileNotFoundError("Could not find a First Pass Accuracy workbook (*.xlsx).")
 
-# Detect SDK flavor
-_HAS_OPENAI_V1 = False
-_OPENAI_CLIENT = None
-try:
-    # New SDK (1.x)
-    from openai import OpenAI as _OpenAIClient  # type: ignore
-    if _OPENAI_API_KEY:
-        _OPENAI_CLIENT = _OpenAIClient(api_key=_OPENAI_API_KEY)
-        _HAS_OPENAI_V1 = True
-except Exception:
-    _HAS_OPENAI_V1 = False
-    _OPENAI_CLIENT = None
 
-# Legacy fallback
-import_types_ok = True
-try:
-    import openai  # type: ignore
-except Exception:
-    import_types_ok = False
-
-_OAI_READY = bool(_OPENAI_API_KEY) and (bool(_OPENAI_CLIENT) or import_types_ok)
-
-# Allowed categories (broader, actionable buckets)
-_ALLOWED_LABELS: List[str] = [
-    "Bank / payment",
-    "Communication / update",
-    "Data entry / setup",
-    "Postal / dispatch",
-    "Manual calculation",
-    "Waiting on member/TPA",
-    "Trustee / AVC",
-    "System / workflow",
-    "Rules / process",
-    "Other",
-]
-_ALLOWED_SET = {x.lower(): x for x in _ALLOWED_LABELS}
-
-# =========================================================
-# Data loading (unchanged)
-# =========================================================
-def _find_fpa_workbook() -> Optional[Path]:
-    roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
-    patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
-    for root in roots:
-        if not root.exists():
-            continue
-        for pat in patterns:
-            hits = sorted(root.glob(pat))
-            if hits:
-                return hits[-1]
-    return None
-
-def _read_excel_any(path: Path) -> pd.DataFrame:
-    try:
-        return pd.read_excel(path)
-    except Exception:
-        return pd.read_excel(path, header=0)
-
-def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+@st.cache_data(show_spinner=True)
+def _load_fpa() -> pd.DataFrame:
+    """
+    Load and lightly normalize your FPA workbook.
+    Expected columns (case-insensitive):
+      - Activity Date
+      - Review Result (Pass/Fail)
+      - Portfolio
+      - Scheme
+      - Case Comment  (free text used for reason classification)
+    """
+    path = _find_fpa_workbook()
+    df = pd.read_excel(path)
     cols = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in cols:
-            return cols[c.lower()]
-    return None
 
-def _coerce_month(s: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-    return dt.dt.to_period("M")
+    # Map likely names to normalized ones
+    def pick(*opts: str) -> str:
+        for o in opts:
+            if o.lower() in cols:
+                return cols[o.lower()]
+        raise KeyError(f"Missing columns: one of {opts}")
 
-def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
-    p = _find_fpa_workbook()
-    if not p:
-        raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
-    df = _read_excel_any(p)
+    c_date = pick("Activity Date", "activity_date", "Date")
+    c_res = pick("Review Result", "review_result", "Result")
+    c_port = pick("Portfolio", "portfolio")
+    c_scheme = pick("Scheme", "scheme")
+    c_comment = pick("Case Comment", "case comment", "Comment", "case_comment")
 
-    col_map = {
-        "date": _pick(df, ["Activity Date", "ActivityDate", "Date", "Activity date"]),
-        "result": _pick(df, ["Review Result", "Review result", "Result"]),
-        "portfolio": _pick(df, ["Portfolio", "portfolio"]),
-        "scheme": _pick(df, ["Scheme", "Scheme Name", "Plan", "Plan Name"]),
-        "comment": _pick(df, ["Case Comment", "Comments", "Reviewer Comment", "Comment"]),
-    }
-    missing = [k for k, v in col_map.items() if k in ("date", "result") and v is None]
-    if missing:
-        raise KeyError(f"Missing required columns for FPA: {missing}")
-    return df.rename(columns={v: k for k, v in col_map.items() if v}), col_map
+    df = df.rename(
+        columns={
+            c_date: "activity_date",
+            c_res: "review_result",
+            c_port: "portfolio",
+            c_scheme: "scheme",
+            c_comment: "comment",
+        }
+    )
 
-# =========================================================
-# Pass% + table logic (unchanged)
-# =========================================================
-def _is_pass(x: str) -> bool:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return False
-    t = str(x).strip().lower()
-    return t.startswith("pass")
+    # Coerce date
+    df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
+    df = df.dropna(subset=["activity_date"])
 
-def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
-    s = _coerce_month(df["date"])
-    df = df.assign(_m=s)
-    if df["_m"].dropna().empty:
-        return pd.DataFrame(columns=["month", "pass_pct"])
-    start = pd.Period("2025-01")
-    end = df["_m"].max()
-    months = pd.period_range(start, end, freq="M")
-    g = df.groupby("_m")["result"].agg(
-        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
-    ).reindex(months, fill_value=0)
-    pct = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0.0).round(0)
-    label = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
-    return pd.DataFrame({"month": label, "pass_pct": pct.values})
+    # Normalize result
+    df["review_result"] = df["review_result"].astype(str).str.strip().str.lower()
+    df["is_pass"] = df["review_result"].str.contains("pass")
 
-def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame:
-    df = df.assign(_m=_coerce_month(df["date"]))
-    sub = df[df["_m"] == last_m]
+    # Month key
+    df["month_key"] = df["activity_date"].dt.to_period("M").dt.to_timestamp()
+
+    # Clean text
+    df["comment"] = df["comment"].astype(str).fillna("").str.strip()
+
+    return df
+
+
+# -----------------------------------------------------------------------------
+# 2) KPI/visual helpers you already had (unchanged in spirit)
+# -----------------------------------------------------------------------------
+def _pass_rate_mom(df: pd.DataFrame) -> pd.DataFrame:
+    """Pass % MoM from Jan-2025 to latest; missing months = 0%."""
+    start = pd.Timestamp("2025-01-01")
+    end = df["month_key"].max()
+    timeline = pd.date_range(start, end, freq="MS")
+    agg = (
+        df.groupby("month_key")["is_pass"]
+        .mean()
+        .reindex(timeline, fill_value=0.0)
+        .mul(100)
+        .rename("pass_pct")
+        .reset_index()
+        .rename(columns={"index": "month"})
+    )
+    return agg
+
+
+def _pass_by_portfolio_scheme(df: pd.DataFrame, for_month: pd.Timestamp) -> pd.DataFrame:
+    """Pass % by portfolio×scheme for a given month."""
+    sub = df[df["month_key"] == for_month].copy()
     if sub.empty:
         return pd.DataFrame(columns=["portfolio", "scheme", "cases", "pass_%"])
-    grp = sub.groupby(["portfolio", "scheme"])["result"].agg(
-        cases="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
-    ).reset_index()
-    grp["pass_%"] = (grp["passed"] * 100.0 / grp["cases"]).round(0)
-    return grp[["portfolio", "scheme", "cases", "pass_%"]].sort_values(
-        ["portfolio", "pass_%", "scheme"], ascending=[True, False, True]
-    )
+    g = sub.groupby(["portfolio", "scheme"])["is_pass"].agg(["mean", "count"]).reset_index()
+    g = g.rename(columns={"mean": "pass_%", "count": "cases"})
+    g["pass_%"] = (g["pass_%"] * 100).round(1)
+    g = g.sort_values(["portfolio", "scheme"]).reset_index(drop=True)
+    return g
 
-# =========================================================
-# OpenAI-only classification (with v1/legacy support)
-# =========================================================
-def _normalize_label(label: str) -> str:
-    if not isinstance(label, str):
-        return "Other"
-    t = label.strip().lower()
-    if t in _ALLOWED_SET:
-        return _ALLOWED_SET[t]
-    for allowed in _ALLOWED_LABELS:
-        toks = set(allowed.lower().replace("/", " ").split())
-        if any(tok in t for tok in toks):
-            return allowed
+
+# -----------------------------------------------------------------------------
+# 3) Reason labelling
+#     - OpenAI (if key+sdk available)
+#     - Fallback: keyword model (your previous approach)
+# -----------------------------------------------------------------------------
+_CATEGORIES = [
+    # Broader buckets to make the output more actionable
+    "Communication / update",
+    "Data entry / setup",
+    "Document missing / incorrect",
+    "Bank / payment",
+    "Postal / dispatch",
+    "Manual calculation / review",
+    "Trustee / AVC",
+    "Waiting on member / TPA",
+    "System / portal",
+    "Case not created / routing",
+    "Death benefits / special cases",
+    "Other",
+]
+
+_KEYWORD_MAP: Dict[str, List[str]] = {
+    "Communication / update": [
+        "email", "chased", "follow up", "update", "call back", "ring back",
+        "correspondence", "awaiting response", "phone", "voicemail"
+    ],
+    "Data entry / setup": [
+        "data entry", "setup", "keyed", "address change", "dob", "ni", "ni number",
+        "input error", "typo", "incorrect details", "mis-key"
+    ],
+    "Document missing / incorrect": [
+        "document", "doc", "form", "missing", "proof", "id", "evidence", "incorrect form",
+        "invalid form", "photo id", "passport", "driving licence", "certificate"
+    ],
+    "Bank / payment": [
+        "bank", "bacs", "payment", "payroll", "cheque", "refund", "transfer", "sort code",
+        "account number", "standing order", "direct debit"
+    ],
+    "Postal / dispatch": [
+        "post", "postal", "mail", "dispatch", "sent", "returned", "undelivered", "courier"
+    ],
+    "Manual calculation / review": [
+        "calculate", "calculation", "benefit calc", "reviewed", "checked", "rework",
+        "qa", "quality", "recalc"
+    ],
+    "Trustee / AVC": [
+        "trustee", "avc", "additional voluntary", "trust", "board approval"
+    ],
+    "Waiting on member / TPA": [
+        "waiting on member", "waiting for member", "tpa", "third party", "employer",
+        "provider", "external"
+    ],
+    "System / portal": [
+        "system", "portal", "it", "down", "bug", "error", "service now", "servicenow"
+    ],
+    "Case not created / routing": [
+        "case not created", "routing", "queue", "workbasket", "not allocated"
+    ],
+    "Death benefits / special cases": [
+        "death", "bereavement", "executor", "probate", "special", "exception"
+    ],
+    "Other": []
+}
+
+
+def _keyword_label_one(text: str) -> str:
+    t = text.lower()
+    for cat, kws in _KEYWORD_MAP.items():
+        if cat == "Other":
+            continue
+        for kw in kws:
+            if kw in t:
+                return cat
     return "Other"
 
-def _oai_label_batch(texts: List[str]) -> List[str]:
-    """One batch call; returns one label per input."""
-    system = (
-        "You are a quality analyst. Classify each bullet point into ONE label.\n"
-        "Use ONLY one of these labels exactly:\n"
-        f"{', '.join(_ALLOWED_LABELS)}.\n"
-        "If the text is unclear or doesn't fit, use 'Other'.\n"
-        "Return ONLY a valid JSON array of strings (no extra text)."
-    )
-    bullets = "\n".join(f"- {t}" for t in texts)
-    user = "Classify the following items:\n\n" + bullets
 
-    raw = ""
-    try:
-        if _HAS_OPENAI_V1 and _OPENAI_CLIENT:
-            # New SDK v1.x
-            resp = _OPENAI_CLIENT.chat.completions.create(
-                model=_OPENAI_MODEL,
+def _openai_label_many(texts: List[str]) -> List[str]:
+    """
+    Label a list of texts using OpenAI. Keeps tokens small, deterministic-ish.
+    We return categories defined in _CATEGORIES; unknown => 'Other'.
+    """
+    assert _openai_client is not None
+    system = (
+        "You are a classification helper for service operations.\n"
+        "Given a short case comment, assign exactly one label from this list:\n"
+        f"{', '.join(_CATEGORIES)}.\n"
+        "Return ONLY the label text. If unsure, return 'Other'."
+    )
+    out: List[str] = []
+    for t in texts:
+        t = t or ""
+        try:
+            resp = _openai_client.chat.completions.create(
+                model="gpt-4o-mini",
                 temperature=0,
                 messages=[
                     {"role": "system", "content": system},
-                    {"role": "user", "content": user},
+                    {"role": "user", "content": f"Comment: {t[:2000]}"},
                 ],
             )
-            raw = resp.choices[0].message.content or ""
-        else:
-            # Legacy SDK
-            if _OPENAI_API_KEY and import_types_ok:
-                openai.api_key = _OPENAI_API_KEY
-                resp = openai.ChatCompletion.create(
-                    model=_OPENAI_MODEL,
-                    temperature=0,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                )
-                raw = resp["choices"][0]["message"]["content"] or ""
-    except Exception:
-        raw = ""
-
-    try:
-        arr = json.loads(raw)
-        if not isinstance(arr, list):
-            raise ValueError("Not a list")
-    except Exception:
-        return ["Other"] * len(texts)
-
-    return [_normalize_label(x) for x in arr][: len(texts)]
-
-def _ai_label_many(texts: List[str]) -> List[str]:
-    if not _OAI_READY:
-        return ["Other"] * len(texts)
-    out: List[str] = []
-    BATCH = 60
-    for i in range(0, len(texts), BATCH):
-        out.extend(_oai_label_batch(texts[i : i + BATCH]))
-    if len(out) < len(texts):
-        out.extend(["Other"] * (len(texts) - len(out)))
+            label = (resp.choices[0].message.content or "").strip()
+            if label not in _CATEGORIES:
+                label = "Other"
+        except Exception:
+            label = "Other"
+        out.append(label)
     return out
 
-# =========================================================
-# Reasons (OpenAI-only) + Pareto
-# =========================================================
-def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
-    df = df.assign(_m=_coerce_month(df["date"]))
-    latest = df["_m"].max()
-    if pd.isna(latest):
-        return pd.DataFrame(), latest
 
-    fails = df[(df["_m"] == latest) & (~df["result"].apply(_is_pass))]
-    if fails.empty:
-        return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
+def _label_reasons(df_fail: pd.DataFrame) -> pd.DataFrame:
+    """
+    Produce a dataframe of fail reasons with counts and cumulative %, and a Pareto
+    subset that includes top 80% + 'Other'.
+    """
+    comments = df_fail["comment"].fillna("").astype(str).tolist()
 
-    if "comment" not in fails.columns:
-        return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
+    if _openai_available:
+        labels = _openai_label_many(comments)
+    else:
+        labels = [ _keyword_label_one(t) for t in comments ]
 
-    texts = fails["comment"].fillna("").astype(str).tolist()
-    labels = _ai_label_many(texts)
+    ser = pd.Series(labels, name="reason")
+    tbl = ser.value_counts(dropna=False).rename_axis("reason").reset_index(name="count")
+    tbl["percent"] = (tbl["count"] / max(1, tbl["count"].sum()) * 100).round(1)
+    tbl["cum_percent"] = tbl["percent"].cumsum().round(1)
 
-    s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
-    s = s.sort_values("count", ascending=False).reset_index(drop=True)
+    # Pareto (top 80% + Other)
+    tbl = tbl.sort_values("count", ascending=False).reset_index(drop=True)
 
-    total = int(s["count"].sum()) or 1
-    s["percent"] = s["count"] * 100.0 / total
-    s["cum_percent"] = s["percent"].cumsum()
+    # Identify top-80 band; always include 'Other' as a line item
+    cutoff = tbl["percent"].cumsum() <= 80
+    top = tbl[cutoff].copy()
+    others = tbl[~cutoff].copy()
+    if not others.empty:
+        other_row = others[others["reason"] == "Other"]
+        non_other = others[others["reason"] != "Other"]
+        if not other_row.empty:
+            # keep the existing 'Other' row but add the rest into it
+            extra = non_other["count"].sum()
+            tbl.loc[other_row.index, "count"] = other_row["count"].iloc[0] + extra
+            tbl = pd.concat([top, tbl.loc[other_row.index]]).reset_index(drop=True)
+        else:
+            # create Other row from the remainder
+            new_other = pd.DataFrame([{
+                "reason": "Other",
+                "count": int(non_other["count"].sum()),
+            }])
+            tbl = pd.concat([top, new_other], ignore_index=True)
+    else:
+        tbl = top.copy()
 
-    # Pareto: Top 80% + Other (ensure 'Other' ends up in the tail if included in head)
-    head = s[s["cum_percent"] <= 80.0].copy()
-    tail = s[s["cum_percent"] > 80.0].copy()
-    if not head.empty and (head["reason"] == "Other").any():
-        move = head[head["reason"] == "Other"]
-        head = head[head["reason"] != "Other"]
-        tail = pd.concat([tail, move], ignore_index=True)
+    # Recompute percent and cumulative
+    total = tbl["count"].sum()
+    tbl["percent"] = (tbl["count"] / max(1, total) * 100).round(1)
+    tbl["cum_percent"] = tbl["percent"].cumsum().round(1)
 
-    if not tail.empty:
-        other_row = pd.DataFrame([{
-            "reason": "Other",
-            "count": int(tail["count"].sum()),
-            "percent": float(tail["percent"].sum()),
-            "cum_percent": 100.0
-        }])
-        head = pd.concat([head, other_row], ignore_index=True)
+    return tbl
 
-    head["percent"] = head["percent"].round(1)
-    head["cum_percent"] = head["cum_percent"].round(1)
-    return head, latest
 
-# =========================================================
-# Plots (unchanged)
-# =========================================================
-def _fig_mom(df: pd.DataFrame, title: str):
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
-    ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5, color="#9ecae1")
-    for x, y in zip(df["month"], df["pass_pct"]):
-        ax.text(x, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax.set_title(title, pad=8, color=_DARK_BLUE)
-    ax.set_ylim(bottom=0, top=100)
-    for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.spines["bottom"].set_linewidth(1.25)
-    ax.get_yaxis().set_visible(False)
-    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
-    return fig
-
-def _fig_reasons_bar(df: pd.DataFrame, title: str):
-    fig, ax = plt.subplots(figsize=(7.0, 3.4))
-    bars = ax.bar(df["reason"], df["count"])
-    for b in bars:
-        ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.5, f"{int(b.get_height())}",
-                ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax.set_title(title, pad=8, color=_DARK_BLUE)
-    for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.spines["bottom"].set_linewidth(1.25)
-    ax.get_yaxis().set_visible(False)
-    plt.setp(ax.get_xticklabels(), rotation=90, ha="center", color=_DARK_GREY)
+# -----------------------------------------------------------------------------
+# 4) Simple Pareto bar (keeps your visual language)
+# -----------------------------------------------------------------------------
+def _plot_pareto(df_counts: pd.DataFrame, title: str):
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    ax.bar(df_counts["reason"], df_counts["count"])
+    for i, v in enumerate(df_counts["count"].tolist()):
+        ax.text(i, v, str(v), ha="center", va="bottom", fontsize=9)
+    # Style: keep x baseline, remove y axis & grids per your preference
+    ax.spines["right"].set_visible(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["left"].set_visible(False)
     ax.grid(False)
-    return fig
+    ax.set_ylabel("")  # remove y label
+    ax.tick_params(axis="y", length=0, labelleft=False)
+    ax.set_title(title, loc="left", fontsize=16, fontweight="bold", color="#1e3a8a")
+    ax.set_xticklabels(df_counts["reason"].tolist(), rotation=90)
+    st.pyplot(fig, use_container_width=True)
 
-# =========================================================
-# Streamlit entry point (unchanged interface)
-# =========================================================
-def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
+
+# -----------------------------------------------------------------------------
+# 5) Entry point used by the app
+# -----------------------------------------------------------------------------
+def run(store: Dict, params: Dict, q: str):
+    # Guard: data root expected by app integration (do not remove)
+    # (Keeping this no-op reference to 'store' so we don't break the call signature)
+    _ = store
+
+    # Diagnostic caption (safe to keep; never prints secrets)
     try:
-        df_raw, _ = _load_fpa()
-    except FileNotFoundError as e:
-        st.error(str(e)); return ("", pd.DataFrame())
-    except KeyError as e:
-        st.error(f"FPA file found, but a required column is missing: {e}")
-        return ("", pd.DataFrame())
+        installed = {"openai" in {m.name for m in __import__("pkgutil").iter_modules()}}
+        st.caption(
+            "Diag · openai sdk installed: "
+            f"{'openai' in {m.name for m in __import__('pkgutil').iter_modules()}} · "
+            f"env_has_key: {bool(os.environ.get('OPENAI_API_KEY'))} · "
+            f"secrets_has_key: {'OPENAI_API_KEY' in getattr(st, 'secrets', {})}"
+        )
+    except Exception:
+        pass
 
-    mom = _series_mom(df_raw)
-    if mom.empty:
-        st.info("No First-Pass Accuracy rows found from Jan-25 onward.")
-        return ("", pd.DataFrame())
-
-    df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
-    latest = df_raw["_m"].max()
-    table = _table_portfolio_scheme(df_raw, latest)
-
-    c1, c2 = st.columns((1.1, 1.0), gap="large")
-    with c1:
-        st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
-    with c2:
-        st.markdown(
-            f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>"
-            f"Pass % by Portfolio × Scheme — {pd.Period(latest).to_timestamp().strftime('%b-%y')}"
-            f"</h4>", unsafe_allow_html=True)
-        if not table.empty:
-            st.dataframe(table, use_container_width=True)
-
-    if not _OAI_READY:
+    # Info banner when OpenAI is inactive (keeps your existing UX)
+    if not _openai_available:
         st.info(
             "OpenAI labelling inactive (no OPENAI_API_KEY). "
-            "Fail reasons will be shown as ‘Other’ to preserve rendering."
+            "Fail reasons will default to ‘Other’ or keyword labels."
         )
 
-    reasons, lastp = _reasons_latest(df_raw)
-    st.markdown(
-        f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
-        f"Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}"
-        f"</h4>", unsafe_allow_html=True)
-    r1, r2 = st.columns(2, gap="large")
-    with r1:
-        if not reasons.empty:
-            st.pyplot(_fig_reasons_bar(reasons[["reason", "count"]], "Fail reasons — Pareto (top 80% + Other)"))
-    with r2:
-        if not reasons.empty:
-            st.dataframe(reasons, use_container_width=True)
+    # Load data
+    df = _load_fpa()
+    latest_month = df["month_key"].max()
 
-    return ("", pd.DataFrame())
+    # ---- Header
+    st.subheader(f"First-Pass Accuracy — Jan–{latest_month.strftime('%b %y')}")
+    # ---- Pass % MoM
+    left, right = st.columns([1.1, 1])
+    with left:
+        st.markdown("##### Pass % — MoM")
+        mom = _pass_rate_mom(df)
+        fig, ax = plt.subplots(figsize=(8.5, 2.6))
+        ax.plot(mom["month"], mom["pass_pct"], marker="o")
+        for x, y in zip(mom["month"], mom["pass_pct"]):
+            ax.text(x, y, f"{int(round(y))}%", ha="center", va="bottom", fontsize=9)
+        ax.spines["right"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.grid(False)
+        ax.set_ylabel("")
+        ax.tick_params(axis="y", length=0, labelleft=False)
+        ax.set_xticks(mom["month"])
+        ax.set_xticklabels([d.strftime("%Y-%m") for d in mom["month"]], rotation=0)
+        st.pyplot(fig, use_container_width=True)
+
+    with right:
+        st.markdown(f"##### Pass % by Portfolio × Scheme — {latest_month.strftime('%b-%y')}")
+        tbl = _pass_by_portfolio_scheme(df, latest_month)
+        st.dataframe(tbl, use_container_width=True)
+
+    # ---- Reasons for Fail (Pareto)
+    st.markdown(f"### Reasons for Fail — {latest_month.strftime('%b-%y')}")
+    st.markdown("##### Fail reasons — Pareto (top 80% + Other)")
+
+    df_latest = df[(df["month_key"] == latest_month) & (~df["is_pass"])].copy()
+    if df_latest.empty:
+        st.info("No failed cases for the selected month.")
+        return
+
+    pareto = _label_reasons(df_latest)
+    # Chart + table side-by-side
+    c1, c2 = st.columns([1.1, 1])
+    with c1:
+        _plot_pareto(pareto, "Fail reasons — Pareto (top 80% + Other)")
+    with c2:
+        st.dataframe(pareto, use_container_width=True)
