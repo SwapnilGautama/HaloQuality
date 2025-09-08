@@ -8,6 +8,38 @@ from typing import Any, Dict, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+import os, streamlit as st
+
+def _peek_openai_config():
+    # What the app sees right now
+    src = []
+    flat = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    nested = None
+    try:
+        if "openai" in st.secrets:
+            nested = st.secrets["openai"].get("api_key", None)
+    except Exception:
+        pass
+    env = os.getenv("OPENAI_API_KEY")
+
+    key = flat or nested or env
+    if flat: src.append("st.secrets['OPENAI_API_KEY']")
+    if nested: src.append("st.secrets['openai']['api_key']")
+    if env: src.append("ENV:OPENAI_API_KEY")
+
+    model = (
+        os.getenv("OPENAI_MODEL")
+        or (st.secrets.get("OPENAI_MODEL") if hasattr(st, "secrets") else None)
+        or (st.secrets.get("openai", {}).get("model") if hasattr(st, "secrets") and "openai" in st.secrets else None)
+        or "gpt-4o-mini"
+    )
+
+    masked = (key[:6] + "…" + key[-4:]) if isinstance(key, str) and len(key) > 10 else str(key)
+    st.caption(f"🔎 OpenAI debug → key sources: {', '.join(src) or 'none'} | model: {model} | key: {masked}")
+
+_peek_openai_config()
+
+
 # =============== Small import helper (keeps Q1 & Q2 isolated) ===============
 def _imp(mod: str, attr: str | None = None):
     """Import from repo root; if that fails, from core.<mod>."""
