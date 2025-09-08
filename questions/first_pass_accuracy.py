@@ -12,30 +12,49 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+# --- Styling (unchanged look & feel) -----------------------------------------
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 
-# Optional: pastel line for MoM already exists in your app; bar color uses mpl defaults
-# Pareto / line accents if you later want to style further
-_PARETO = "#6ab6e1"
-
-# Optional OpenAI assist to reduce "Other" (falls back to pure rules if no key)
+# --- Optional OpenAI (robust: safe if missing) --------------------------------
 _OPENAI = False
+_client = None
 try:
-    import openai  # type: ignore
-    if os.getenv("OPENAI_API_KEY"):
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        _OPENAI = True
+    # Prefer Streamlit secrets, else ENV
+    _key = None
+    try:
+        if hasattr(st, "secrets"):
+            _key = st.secrets.get("OPENAI_API_KEY", None)  # type: ignore[attr-defined]
+    except Exception:
+        _key = None
+    _key = _key or os.getenv("OPENAI_API_KEY")
+
+    # Try legacy SDK first (widely available on Streamlit Cloud images)
+    if _key:
+        try:
+            import openai  # type: ignore
+            openai.api_key = _key
+            _client = "legacy"
+            _OPENAI = True
+        except Exception:
+            # Try new SDK if legacy import fails
+            try:
+                from openai import OpenAI  # type: ignore
+                _client = OpenAI(api_key=_key)
+                _OPENAI = True
+            except Exception:
+                _OPENAI = False
 except Exception:
     _OPENAI = False
 
-
-# ---------------------------
-# Data loading (unchanged)
-# ---------------------------
+# --- Data loading -------------------------------------------------------------
 def _find_fpa_workbook() -> Optional[Path]:
-    roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
+    roots = [
+        Path("data/first_pass_accuracy"),
+        Path("first_pass_accuracy"),
+        Path("data/first_pass_accuracy/"),
+    ]
     patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
     for root in roots:
         if not root.exists():
@@ -52,10 +71,7 @@ def _read_excel_any(path: Path) -> pd.DataFrame:
     except Exception:
         return pd.read_excel(path, header=0)
 
-
-# ---------------------------
-# Column helpers (unchanged)
-# ---------------------------
+# --- Column helpers (unchanged) ----------------------------------------------
 def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = {c.lower(): c for c in df.columns}
     for c in candidates:
@@ -85,10 +101,7 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         raise KeyError(f"Missing required columns for FPA: {missing}")
     return df.rename(columns={v: k for k, v in col_map.items() if v}), col_map
 
-
-# ---------------------------
-# Pass% + table logic (unchanged)
-# ---------------------------
+# --- Pass% + table logic (unchanged) -----------------------------------------
 def _is_pass(x: str) -> bool:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return False
@@ -123,12 +136,7 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
         ["portfolio", "pass_%", "scheme"], ascending=[True, False, True]
     )
 
-
-# ---------------------------
-# Fail reason classification (IMPROVED)
-# ---------------------------
-
-# Expanded, ordered rulebook — earlier matches take precedence
+# --- Fail reason classification (Expanded rules + optional AI) ----------------
 _RULES = {
     "Bank / payment": [
         r"\b(bank|payment|refund|bacs|chaps|cheque|sort\s*code|iban|bic|account|transfer|credit|debit)\b",
@@ -169,7 +177,6 @@ _RULES = {
         r"\bvalidation|checklist|qa\s*(check)?\b",
     ],
 }
-
 _COMPILED = [(label, [re.compile(p, re.I) for p in pats]) for label, pats in _RULES.items()]
 
 def _clean_text(t: str) -> str:
@@ -189,33 +196,50 @@ def _label_reason_rules(text: str) -> str:
 
 def _ai_label_many(texts: List[str]) -> List[str]:
     """
-    If OPENAI_API_KEY is available, ask the model to label items using our allowed set.
-    We still validate each suggestion against the rulebook to avoid creative answers.
+    If an OpenAI key is present, try AI classification; otherwise pure rules.
+    We still validate AI outputs against the rulebook to avoid drift.
     """
     if not _OPENAI or not texts:
         return [_label_reason_rules(t) for t in texts]
 
-    labels = [_label_reason_rules(t) for t in texts]  # default fallback
+    labels = [_label_reason_rules(t) for t in texts]  # fallback defaults
     try:
         allowed = list(_RULES.keys()) + ["Other"]
-        sys_msg = "You classify complaint review comments. Only return valid JSON array of labels."
+        sys_msg = "You classify pension admin review comments into one label from a fixed set."
         instruction = (
-            "Classify each bullet into exactly one of the following labels (prefer the most specific): "
+            "Classify EACH bullet to exactly one of the following labels "
+            "(choose the most specific) and return ONLY a JSON array of strings:\n"
             + ", ".join(allowed)
-            + ".\nReturn ONLY a JSON array of strings (no prose)."
         )
-        bullets = "\n".join(f"- {t}" for t in texts[:1500])  # safety cap
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": instruction + "\n\n" + bullets},
-            ],
-        )
-        raw = resp["choices"][0]["message"]["content"]
+        bullets = "\n".join(f"- {t}" for t in texts[:1500])  # cap for safety
+
+        # Legacy SDK path
+        if _client == "legacy":
+            import openai  # type: ignore
+            resp = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": instruction + "\n\n" + bullets},
+                ],
+            )
+            raw = resp["choices"][0]["message"]["content"]
+        else:
+            # New SDK path
+            from openai import OpenAI  # type: ignore
+            resp = _client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": instruction + "\n\n" + bullets},
+                ],
+            )
+            raw = resp.choices[0].message.content
+
         ai = json.loads(raw)
-        if isinstance(ai, list) and len(ai) == len(texts[:len(ai)]):
+        if isinstance(ai, list):
             out = []
             for t, lab in zip(texts, ai):
                 lab = str(lab).strip()
@@ -226,6 +250,7 @@ def _ai_label_many(texts: List[str]) -> List[str]:
                 out.extend(_label_reason_rules(t) for t in texts[len(out):])
             labels = out
     except Exception:
+        # Any API/JSON error → fall back silently
         pass
     return labels
 
@@ -244,7 +269,7 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
 
     texts = fails["comment"].astype(str).fillna("").tolist()
 
-    # 1) AI (optional) then rulebook; force all labels through rule validation
+    # AI (optional) then rulebook; validate all labels
     ai_labels = _ai_label_many(texts)
     labels = [
         lab if lab in _RULES or lab == "Other" else _label_reason_rules(t)
@@ -254,7 +279,7 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
 
-    # 2) Pareto: Top 80% + Other (merge any pre-existing 'Other' into tail first)
+    # Pareto: Top 80% + Other (always push 'Other' to the tail before aggregating)
     total = int(s["count"].sum()) or 1
     s["percent"] = (s["count"] * 100.0 / total)
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
@@ -263,7 +288,6 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     head = s[s["cum_percent"] <= 80.0].copy()
     tail = s[s["cum_percent"] > 80.0].copy()
 
-    # keep genuine categories in head; push any 'Other' to tail so it doesn't block signal
     if not head.empty and (head["reason"] == "Other").any():
         move = head[head["reason"] == "Other"]
         head = head[head["reason"] != "Other"]
@@ -277,16 +301,12 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
             "cum_percent": 100.0
         }])
         head = pd.concat([head, other_row], ignore_index=True)
-    # else: 100% already in <=80% bucket set; leave as-is
 
     head["percent"] = head["percent"].round(1)
     head["cum_percent"] = head["cum_percent"].round(1)
     return head, latest
 
-
-# ---------------------------
-# Plots (unchanged)
-# ---------------------------
+# --- Plots (unchanged visuals) ------------------------------------------------
 def _fig_mom(df: pd.DataFrame, title: str):
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5, color="#9ecae1")
@@ -318,11 +338,9 @@ def _fig_reasons_bar(df: pd.DataFrame, title: str):
     ax.grid(False)
     return fig
 
-
-# ---------------------------
-# Streamlit entry point (unchanged interface)
-# ---------------------------
+# --- Streamlit entry (unchanged interface) ------------------------------------
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
+    # Load data
     try:
         df_raw, _ = _load_fpa()
     except FileNotFoundError as e:
@@ -331,6 +349,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         st.error(f"FPA file found, but a required column is missing: {e}")
         return ("", pd.DataFrame())
 
+    # MoM
     mom = _series_mom(df_raw)
     if mom.empty:
         st.info("No First-Pass Accuracy rows found from Jan-25 onward.")
@@ -342,7 +361,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
-        # safer: Period -> Timestamp for formatting
         st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
     with c2:
         st.markdown(
@@ -352,6 +370,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not table.empty:
             st.dataframe(table, use_container_width=True)
 
+    # Reasons (Pareto)
     reasons, lastp = _reasons_latest(df_raw)
     st.markdown(
         f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
