@@ -1,11 +1,11 @@
 # questions/first_pass_accuracy.py
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, Tuple, Optional, List
 import os
 import re
 import json
+from pathlib import Path
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -16,11 +16,7 @@ _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 
-# Optional: pastel line for MoM already exists in your app; bar color uses mpl defaults
-# Pareto / line accents if you later want to style further
-_PARETO = "#6ab6e1"
-
-# Optional OpenAI assist to reduce "Other" (falls back to pure rules if no key)
+# --- Optional OpenAI assist (kept OFF by default; safe fallback to rules) ---
 _OPENAI = False
 try:
     import openai  # type: ignore
@@ -125,36 +121,42 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
 
 
 # ---------------------------
-# Fail reason classification (IMPROVED)
+# Fail reason classification (IMPROVED, *surgical change*)
 # ---------------------------
 
-# Expanded, ordered rulebook — earlier matches take precedence
+# 1) Primary rulebook — ordered, earliest match wins (expanded)
 _RULES = {
     "Bank / payment": [
         r"\b(bank|payment|refund|bacs|chaps|cheque|sort\s*code|iban|bic|account|transfer|credit|debit)\b",
         r"\bpaid\s*to\s*wrong|duplicate\s*payment|missing\s*payment\b",
+        r"\bbank\s*(detail|form|mandate)\b",
     ],
     "Communication / update": [
         r"\b(no|missing)\s*(reply|response|update)\b",
         r"\bupdate|communicat|clarif|explain|advise|inform(ed|ation)?\b",
         r"\bconfus|unclear|mis(lead|understand)\b",
         r"\bcall(s|ed)?|email(s|ed)?|letter(s)?\b",
+        r"\bholding\s*letter|chaser|timescale(s)?\b",
     ],
     "Data entry / setup": [
         r"\bwrong|incorrect|mis-?key|typo|misallocat|miscode|set\s*up|setup\b",
         r"\bdata\s*(entry|load|issue)|capture|key(ed|ing)\b",
         r"\bdate\s*error|dob|ni\s*number|nino\b",
+        r"\baddress\s*(change|update)|postcode\b",
+        r"\bid|identity|poa|proof\s*of\s*address\b",
     ],
     "Postal / dispatch": [
         r"\b(post|mail|postal|dispatch|despatch|send|sent|deliver(y|ed)?)\b",
         r"\breturned\s*mail|wrong\s*address\b",
+        r"\bpack|document(s)?\s*(sent|received|missing)\b",
     ],
     "Manual calculation": [
         r"\bmanual\b.*calc|re-?calc|recalculation|calc(ulation)?\s*error\b",
+        r"\bquote|estimate|CETV|cash\s*equivalent\b",
     ],
     "Waiting on member/TPA": [
         r"\bawait|waiting\s*for|chase(d|s|ing)?\b",
-        r"\bthird\s*party|tpa|ifa|insurer|administrator|employer|payroll|trustee\b",
+        r"\b(3rd|third)\s*party|tpa|ifa|insurer|administrator|provider|employer|payroll|trustee\b",
         r"\bmember\s*to\s*(respond|confirm|provide)\b",
     ],
     "Trustee / AVC": [
@@ -163,14 +165,49 @@ _RULES = {
     "System / workflow": [
         r"\bsystem|portal|platform|workflow|work\s*queue|technical|bug|defect|automation|script\b",
         r"\baccess|permission|role|profile\b",
+        r"\bdowntime|outage|crash|error\s*code\b",
     ],
     "Rules / process": [
         r"\bscheme\s*rules?|policy|procedure|process|template|guidance|standard\b",
         r"\bvalidation|checklist|qa\s*(check)?\b",
+        r"\bsla|timescale(s)?\b",
+    ],
+    "Disinvestment / funds": [
+        r"\bdisinvest|switch|fund\s*(move|value|price)\b",
+    ],
+    "Bereavement / death": [
+        r"\bdeath|deceased|probate|bereave(ment)?\b",
+    ],
+    "Divorce / split": [
+        r"\bdivorce|pension\s*sharing|pension\s*split|pension\s*credit\b",
     ],
 }
 
 _COMPILED = [(label, [re.compile(p, re.I) for p in pats]) for label, pats in _RULES.items()]
+
+# 2) Token → label hints (used to split "Other" in a second pass, low risk)
+_TOKEN_HINTS = {
+    "poa": "Data entry / setup",
+    "proof address": "Data entry / setup",
+    "address": "Data entry / setup",
+    "pack": "Postal / dispatch",
+    "returned": "Postal / dispatch",
+    "holding letter": "Communication / update",
+    "timescale": "Communication / update",
+    "sla": "Rules / process",
+    "quote": "Manual calculation",
+    "cetv": "Manual calculation",
+    "gmp": "Manual calculation",
+    "disinvest": "Disinvestment / funds",
+    "payroll": "Waiting on member/TPA",
+    "employer": "Waiting on member/TPA",
+    "provider": "Waiting on member/TPA",
+    "3rd party": "Waiting on member/TPA",
+    "portal": "System / workflow",
+    "access": "System / workflow",
+    "bug": "System / workflow",
+    "error": "System / workflow",
+}
 
 def _clean_text(t: str) -> str:
     t = str(t or "").lower()
@@ -181,6 +218,8 @@ def _clean_text(t: str) -> str:
 
 def _label_reason_rules(text: str) -> str:
     t = _clean_text(text)
+    if not t:
+        return "Insufficient detail"
     for label, pats in _COMPILED:
         for p in pats:
             if p.search(t):
@@ -188,30 +227,23 @@ def _label_reason_rules(text: str) -> str:
     return "Other"
 
 def _ai_label_many(texts: List[str]) -> List[str]:
-    """
-    If OPENAI_API_KEY is available, ask the model to label items using our allowed set.
-    We still validate each suggestion against the rulebook to avoid creative answers.
-    """
     if not _OPENAI or not texts:
         return [_label_reason_rules(t) for t in texts]
 
-    labels = [_label_reason_rules(t) for t in texts]  # default fallback
+    labels = [_label_reason_rules(t) for t in texts]  # fallback
     try:
-        allowed = list(_RULES.keys()) + ["Other"]
-        sys_msg = "You classify complaint review comments. Only return valid JSON array of labels."
+        allowed = list(_RULES.keys()) + ["Other", "Insufficient detail"]
+        sys_msg = "You classify complaint review comments. Return only a JSON array of labels."
         instruction = (
             "Classify each bullet into exactly one of the following labels (prefer the most specific): "
-            + ", ".join(allowed)
-            + ".\nReturn ONLY a JSON array of strings (no prose)."
+            + ", ".join(allowed) + ".\nReturn ONLY a JSON array of strings (no prose)."
         )
-        bullets = "\n".join(f"- {t}" for t in texts[:1500])  # safety cap
+        bullets = "\n".join(f"- {t}" for t in texts[:1500])
         resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             temperature=0,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": instruction + "\n\n" + bullets},
-            ],
+            messages=[{"role": "system", "content": sys_msg},
+                      {"role": "user", "content": instruction + "\n\n" + bullets}],
         )
         raw = resp["choices"][0]["message"]["content"]
         ai = json.loads(raw)
@@ -229,6 +261,26 @@ def _ai_label_many(texts: List[str]) -> List[str]:
         pass
     return labels
 
+def _second_pass_split_other(df_other: pd.DataFrame) -> pd.Series:
+    """
+    Split 'Other' using token hints. This is intentionally lightweight (no model),
+    so it's safe and fast but breaks big 'Other' piles into meaningful buckets.
+    """
+    if df_other.empty:
+        return pd.Series(dtype=str)
+
+    def map_token(t: str) -> Optional[str]:
+        t2 = _clean_text(t)
+        for tok, lab in _TOKEN_HINTS.items():
+            # token may be two words; check as substring safely
+            if tok in t2:
+                return lab
+        return None
+
+    mapped = df_other["comment"].astype(str).map(map_token)
+    # Keep only confident mappings; None stays None and will be counted back to Other
+    return mapped
+
 def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     df = df.assign(_m=_coerce_month(df["date"]))
     latest = df["_m"].max()
@@ -239,22 +291,23 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     if fails.empty:
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
 
-    if "comment" not in fails.columns:
-        return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
-
-    texts = fails["comment"].astype(str).fillna("").tolist()
-
-    # 1) AI (optional) then rulebook; force all labels through rule validation
+    texts = fails.get("comment", pd.Series([], dtype=str)).astype(str).fillna("").tolist()
     ai_labels = _ai_label_many(texts)
-    labels = [
-        lab if lab in _RULES or lab == "Other" else _label_reason_rules(t)
-        for t, lab in zip(texts, ai_labels)
-    ]
+    labels = [lab if lab in _RULES or lab in ("Other", "Insufficient detail") else _label_reason_rules(t)
+              for t, lab in zip(texts, ai_labels)]
 
-    s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
+    base = pd.DataFrame({"reason": labels, "comment": fails["comment"].astype(str).values})
+    # second pass: try to split Other with token hints
+    oth = base[base["reason"] == "Other"]
+    if not oth.empty:
+        hinted = _second_pass_split_other(oth)
+        idx = hinted[hinted.notna()].index
+        base.loc[idx, "reason"] = hinted.loc[idx].values
+
+    s = base["reason"].value_counts().rename_axis("reason").reset_index(name="count")
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
 
-    # 2) Pareto: Top 80% + Other (merge any pre-existing 'Other' into tail first)
+    # Pareto: Top 80% + Other (ensure Other is at the end)
     total = int(s["count"].sum()) or 1
     s["percent"] = (s["count"] * 100.0 / total)
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
@@ -263,7 +316,7 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     head = s[s["cum_percent"] <= 80.0].copy()
     tail = s[s["cum_percent"] > 80.0].copy()
 
-    # keep genuine categories in head; push any 'Other' to tail so it doesn't block signal
+    # push any 'Other' in head into tail so it never hides real drivers
     if not head.empty and (head["reason"] == "Other").any():
         move = head[head["reason"] == "Other"]
         head = head[head["reason"] != "Other"]
@@ -277,7 +330,6 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
             "cum_percent": 100.0
         }])
         head = pd.concat([head, other_row], ignore_index=True)
-    # else: 100% already in <=80% bucket set; leave as-is
 
     head["percent"] = head["percent"].round(1)
     head["cum_percent"] = head["cum_percent"].round(1)
@@ -320,7 +372,7 @@ def _fig_reasons_bar(df: pd.DataFrame, title: str):
 
 
 # ---------------------------
-# Streamlit entry point (unchanged interface)
+# Streamlit entry point (UNCHANGED)
 # ---------------------------
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     try:
@@ -342,7 +394,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
-        # safer: Period -> Timestamp for formatting
         st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
     with c2:
         st.markdown(
