@@ -64,7 +64,6 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     return df, col_map
 
-
 # ======================
 # Pass% and tables
 # ======================
@@ -102,12 +101,11 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
         ["portfolio", "pass_%", "scheme"], ascending=[True, False, True]
     )
 
-
 # ======================
-# Reasons (rule-only)
+# Reasons — show ALL (no "Other" collapse) + Pareto line to 100%
 # ======================
-def _label_reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
-    from core.reason_labeller import label_dataframe  # rule-only
+def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
+    from core.reason_labeller import label_dataframe
 
     df = df.assign(_m=_coerce_month(df["date"]))
     latest = df["_m"].max()
@@ -118,77 +116,57 @@ def _label_reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     if fails.empty:
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
 
-    # Vectorised labeling on the latest-month fails
     lab_df = pd.DataFrame({
         "Case Comment": fails["comment"].fillna("").astype(str),
         "RCA2": (fails["rca2"].fillna("").astype(str) if "rca2" in fails.columns else "")
     })
-    s = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2")\
-        .replace({"": "Other", "nan": "Other"}).fillna("Other").astype(str)
+    labels = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2")\
+        .fillna("Other").astype(str)
 
-    vc = s.value_counts().rename_axis("reason").reset_index(name="count")
+    # Count ALL reasons exactly as produced (no removal, no renaming)
+    vc = labels.value_counts().rename_axis("reason").reset_index(name="count")
+    # Sort descending by count for Pareto
+    vc = vc.sort_values("count", ascending=False).reset_index(drop=True)
+
     total = int(vc["count"].sum()) or 1
     vc["percent"] = (vc["count"] * 100.0 / total)
-    vc = vc.sort_values("count", ascending=False).reset_index(drop=True)
-    vc["cum_percent"] = vc["percent"].cumsum()
+    vc["cum_percent"] = vc["percent"].cumsum().clip(upper=100.0)
+    vc["percent"] = vc["percent"].round(1)
+    vc["cum_percent"] = vc["cum_percent"].round(1)
+    return vc, latest
 
-    head = vc[vc["cum_percent"] <= 80.0].copy()
-    tail = vc[vc["cum_percent"] > 80.0].copy()
+def _fig_pareto_full(df: pd.DataFrame, title: str):
+    """
+    Bars = counts (sorted desc), line = cumulative percent (0..100).
+    """
+    fig, ax1 = plt.subplots(figsize=(8.4, 3.8))
 
-    # keep 'Other' in the tail
-    if not head.empty and (head["reason"] == "Other").any():
-        move = head[head["reason"] == "Other"]
-        head = head[head["reason"] != "Other"]
-        tail = pd.concat([tail, move], ignore_index=True)
-
-    if not tail.empty:
-        other_row = pd.DataFrame([{
-            "reason": "Other",
-            "count": int(tail["count"].sum()),
-            "percent": float(tail["percent"].sum()),
-            "cum_percent": 100.0
-        }])
-        head = pd.concat([head, other_row], ignore_index=True)
-
-    head["percent"] = head["percent"].round(1)
-    head["cum_percent"] = head["cum_percent"].round(1)
-    return head, latest
-
-
-# ======================
-# Plots
-# ======================
-def _fig_mom(df: pd.DataFrame, title: str):
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
-    ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5)
-    for x, y in zip(df["month"], df["pass_pct"]):
-        ax.text(x, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax.set_title(title, pad=8, color=_DARK_BLUE)
-    ax.set_ylim(bottom=0, top=100)
-    for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.spines["bottom"].set_linewidth(1.25)
-    ax.get_yaxis().set_visible(False)
-    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
-    return fig
-
-def _fig_reasons_bar(df: pd.DataFrame, title: str):
-    fig, ax = plt.subplots(figsize=(7.0, 3.6))
-    bars = ax.bar(df["reason"], df["count"])
+    # Bars — counts
+    x = np.arange(len(df))
+    bars = ax1.bar(x, df["count"])
+    ax1.set_ylabel("Count")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
     for b in bars:
-        ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.5, f"{int(b.get_height())}",
-                ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax.set_title(title, pad=8, color=_DARK_BLUE)
-    for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.spines["bottom"].set_linewidth(1.25)
-    ax.get_yaxis().set_visible(False)
-    plt.setp(ax.get_xticklabels(), rotation=90, ha="center", color=_DARK_GREY)
-    ax.grid(False)
-    return fig
+        ax1.text(b.get_x() + b.get_width()/2, b.get_height() + 0.5,
+                 f"{int(b.get_height())}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
 
+    # Line — cumulative %
+    ax2 = ax1.twinx()
+    ax2.plot(x, df["cum_percent"], marker="o", linewidth=2.0)
+    ax2.set_ylim(0, 100)
+    ax2.set_ylabel("Cumulative %")
+    for xi, cp in zip(x, df["cum_percent"]):
+        ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
+
+    # Title & style
+    ax1.set_title(title, pad=8, color=_DARK_BLUE)
+    for sp in ["left", "right", "top"]:
+        ax1.spines[sp].set_visible(False)
+    ax1.spines["bottom"].set_color(_SOFT_GREY)
+    ax1.spines["bottom"].set_linewidth(1.25)
+    ax1.grid(False)
+    return fig
 
 # ======================
 # Streamlit entry
@@ -223,20 +201,38 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not table.empty:
             st.dataframe(table, use_container_width=True)
 
-    # Row 2: Reasons Pareto + table (rule-only, fast, no NaN)
-    reasons, lastp = _label_reasons_latest(df_raw)
+    # Row 2: Reasons — ALL + Pareto line
+    reasons, lastp = _label_all_latest(df_raw)
     st.markdown(
         f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
         f"Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}"
         f"</h4>", unsafe_allow_html=True)
+
     r1, r2 = st.columns(2, gap="large")
     with r1:
         if not reasons.empty:
-            st.pyplot(_fig_reasons_bar(reasons[["reason", "count"]], "Fail reasons — Pareto (top 80% + Other)"))
+            st.pyplot(_fig_pareto_full(reasons, "Fail reasons — Pareto (all categories)"))
         else:
             st.info("No fail reasons available for the latest month.")
     with r2:
         if not reasons.empty:
+            # Show the full table: reason, count, percent, cum_percent
             st.dataframe(reasons, use_container_width=True)
 
     return ("", pd.DataFrame())
+
+# ---------- Small helper plots reused above ----------
+def _fig_mom(df: pd.DataFrame, title: str):
+    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+    ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5)
+    for x, y in zip(df["month"], df["pass_pct"]):
+        ax.text(x, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+    ax.set_title(title, pad=8, color=_DARK_BLUE)
+    ax.set_ylim(bottom=0, top=100)
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+    return fig
