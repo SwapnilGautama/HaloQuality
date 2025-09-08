@@ -4,7 +4,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 import os
-import re
 import json
 
 import numpy as np
@@ -12,27 +11,42 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+# ---------- Styles (unchanged) ----------
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 
-# Optional: pastel line for MoM already exists in your app; bar color uses mpl defaults
-_PARETO = "#6ab6e1"
-
-# Optional OpenAI assist to reduce "Other" (falls back to pure rules if no key)
-_OPENAI = False
+# ---------- OpenAI-only classification ----------
+_OAI_READY = False
+_OAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 try:
     import openai  # type: ignore
     if os.getenv("OPENAI_API_KEY"):
         openai.api_key = os.getenv("OPENAI_API_KEY")
-        _OPENAI = True
+        _OAI_READY = True
 except Exception:
-    _OPENAI = False
+    _OAI_READY = False
+
+# Allowed categories (broader, more actionable buckets)
+_ALLOWED_LABELS: List[str] = [
+    "Bank / payment",
+    "Communication / update",
+    "Data entry / setup",
+    "Postal / dispatch",
+    "Manual calculation",
+    "Waiting on member/TPA",
+    "Trustee / AVC",
+    "System / workflow",
+    "Rules / process",
+    "Other",
+]
+
+_ALLOWED_SET = {x.lower(): x for x in _ALLOWED_LABELS}
 
 
-# ---------------------------
+# =========================================================
 # Data loading (unchanged)
-# ---------------------------
+# =========================================================
 def _find_fpa_workbook() -> Optional[Path]:
     roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
     patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
@@ -51,10 +65,6 @@ def _read_excel_any(path: Path) -> pd.DataFrame:
     except Exception:
         return pd.read_excel(path, header=0)
 
-
-# ---------------------------
-# Column helpers (unchanged)
-# ---------------------------
 def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = {c.lower(): c for c in df.columns}
     for c in candidates:
@@ -85,9 +95,9 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     return df.rename(columns={v: k for k, v in col_map.items() if v}), col_map
 
 
-# ---------------------------
+# =========================================================
 # Pass% + table logic (unchanged)
-# ---------------------------
+# =========================================================
 def _is_pass(x: str) -> bool:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return False
@@ -123,111 +133,74 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
     )
 
 
-# ---------------------------
-# Fail reason classification (IMPROVED)
-# ---------------------------
-
-# Expanded, ordered rulebook — earlier matches take precedence
-_RULES = {
-    "Bank / payment": [
-        r"\b(bank|payment|refund|bacs|chaps|cheque|sort\s*code|iban|bic|account|transfer|credit|debit)\b",
-        r"\bpaid\s*to\s*wrong|duplicate\s*payment|missing\s*payment\b",
-    ],
-    "Communication / update": [
-        r"\b(no|missing)\s*(reply|response|update)\b",
-        r"\bupdate|communicat|clarif|explain|advise|inform(ed|ation)?\b",
-        r"\bconfus|unclear|mis(lead|understand)\b",
-        r"\bcall(s|ed)?|email(s|ed)?|letter(s)?\b",
-    ],
-    "Data entry / setup": [
-        r"\bwrong|incorrect|mis-?key|typo|misallocat|miscode|set\s*up|setup\b",
-        r"\bdata\s*(entry|load|issue)|capture|key(ed|ing)\b",
-        r"\bdate\s*error|dob|ni\s*number|nino\b",
-    ],
-    "Postal / dispatch": [
-        r"\b(post|mail|postal|dispatch|despatch|send|sent|deliver(y|ed)?)\b",
-        r"\breturned\s*mail|wrong\s*address\b",
-    ],
-    "Manual calculation": [
-        r"\bmanual\b.*calc|re-?calc|recalculation|calc(ulation)?\s*error\b",
-    ],
-    "Waiting on member/TPA": [
-        r"\bawait|waiting\s*for|chase(d|s|ing)?\b",
-        r"\bthird\s*party|tpa|ifa|insurer|administrator|employer|payroll|trustee\b",
-        r"\bmember\s*to\s*(respond|confirm|provide)\b",
-    ],
-    "Trustee / AVC": [
-        r"\btrustee|avc|additional\s*voluntary\s*contribution\b",
-    ],
-    "System / workflow": [
-        r"\bsystem|portal|platform|workflow|work\s*queue|technical|bug|defect|automation|script\b",
-        r"\baccess|permission|role|profile\b",
-    ],
-    "Rules / process": [
-        r"\bscheme\s*rules?|policy|procedure|process|template|guidance|standard\b",
-        r"\bvalidation|checklist|qa\s*(check)?\b",
-    ],
-}
-
-_COMPILED = [(label, [re.compile(p, re.I) for p in pats]) for label, pats in _RULES.items()]
-
-def _clean_text(t: str) -> str:
-    t = str(t or "").lower()
-    t = re.sub(r"[_/\\\-]+", " ", t)
-    t = re.sub(r"[^a-z0-9\s]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def _label_reason_rules(text: str) -> str:
-    t = _clean_text(text)
-    for label, pats in _COMPILED:
-        for p in pats:
-            if p.search(t):
-                return label
+# =========================================================
+# OpenAI-only classification
+# =========================================================
+def _normalize_label(label: str) -> str:
+    """Map any model output to the nearest allowed label (strict)."""
+    if not isinstance(label, str):
+        return "Other"
+    t = label.strip().lower()
+    # exact or near-exact match
+    if t in _ALLOWED_SET:
+        return _ALLOWED_SET[t]
+    # simple loose match by token overlap
+    for allowed in _ALLOWED_LABELS:
+        toks = set(allowed.lower().replace("/", " ").split())
+        if any(tok in t for tok in toks):
+            return allowed
     return "Other"
 
-def _ai_label_many(texts: List[str]) -> List[str]:
-    """
-    If OPENAI_API_KEY is available, ask the model to label items using our allowed set.
-    We still validate each suggestion against the rulebook to avoid creative answers.
-    """
-    if not _OPENAI or not texts:
-        return [_label_reason_rules(t) for t in texts]
-
-    labels = [_label_reason_rules(t) for t in texts]  # default fallback
+def _oai_label_batch(texts: List[str]) -> List[str]:
+    """Call OpenAI once for a batch of comments and return a label per item."""
+    system = (
+        "You are a quality analyst. Classify each bullet point into ONE label.\n"
+        "Use ONLY one of these labels exactly:\n"
+        f"{', '.join(_ALLOWED_LABELS)}.\n"
+        "If the text is unclear or doesn't fit, use 'Other'.\n"
+        "Return ONLY a valid JSON array of strings (no extra text)."
+    )
+    bullets = "\n".join(f"- {t}" for t in texts)
+    user = "Classify the following items:\n\n" + bullets
+    resp = openai.ChatCompletion.create(
+        model=_OAI_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    raw = resp["choices"][0]["message"]["content"]
     try:
-        allowed = list(_RULES.keys()) + ["Other"]
-        sys_msg = "You classify complaint review comments. Only return valid JSON array of labels."
-        instruction = (
-            "Classify each bullet into exactly one of the following labels (prefer the most specific): "
-            + ", ".join(allowed)
-            + ".\nReturn ONLY a JSON array of strings (no prose)."
-        )
-        bullets = "\n".join(f"- {t}" for t in texts[:1500])  # safety cap
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": instruction + "\n\n" + bullets},
-            ],
-        )
-        raw = resp["choices"][0]["message"]["content"]
-        ai = json.loads(raw)
-        if isinstance(ai, list) and len(ai) == len(texts[:len(ai)]):
-            out = []
-            for t, lab in zip(texts, ai):
-                lab = str(lab).strip()
-                if lab not in allowed:
-                    lab = _label_reason_rules(t)
-                out.append(lab)
-            if len(out) < len(texts):
-                out.extend(_label_reason_rules(t) for t in texts[len(out):])
-            labels = out
+        arr = json.loads(raw)
+        if not isinstance(arr, list):
+            raise ValueError("Not a list")
     except Exception:
-        pass
-    return labels
+        # On parsing issues, fall back to all Other (but app still renders)
+        return ["Other"] * len(texts)
+    # Normalize to allowed set
+    return [_normalize_label(x) for x in arr][: len(texts)]
 
+def _ai_label_many(texts: List[str]) -> List[str]:
+    """Chunk to stay safe on very large datasets."""
+    if not _OAI_READY:
+        # No API key => render the rest of the app; label as Other
+        return ["Other"] * len(texts)
+
+    out: List[str] = []
+    BATCH = 60  # conservative chunk size
+    for i in range(0, len(texts), BATCH):
+        chunk = texts[i : i + BATCH]
+        out.extend(_oai_label_batch(chunk))
+    # If the model returned fewer than expected for any reason, pad with Other
+    if len(out) < len(texts):
+        out.extend(["Other"] * (len(texts) - len(out)))
+    return out
+
+
+# =========================================================
+# Reasons (OpenAI-only) + Pareto
+# =========================================================
 def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     df = df.assign(_m=_coerce_month(df["date"]))
     latest = df["_m"].max()
@@ -241,28 +214,19 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     if "comment" not in fails.columns:
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
 
-    texts = fails["comment"].astype(str).fillna("").tolist()
+    texts = fails["comment"].fillna("").astype(str).tolist()
 
-    # 1) AI (optional) then rulebook; force all labels through rule validation
-    ai_labels = _ai_label_many(texts)
-    labels = [
-        lab if lab in _RULES or lab == "Other" else _label_reason_rules(t)
-        for t, lab in zip(texts, ai_labels)
-    ]
-
+    labels = _ai_label_many(texts)  # <-- OpenAI-only
     s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
 
-    # 2) Pareto: Top 80% + Other (merge any pre-existing 'Other' into tail first)
     total = int(s["count"].sum()) or 1
-    s["percent"] = (s["count"] * 100.0 / total)
-    s = s.sort_values("count", ascending=False).reset_index(drop=True)
+    s["percent"] = s["count"] * 100.0 / total
     s["cum_percent"] = s["percent"].cumsum()
 
+    # Pareto: Top 80% + Other (push pre-existing 'Other' into the tail if it's within top-80 by count)
     head = s[s["cum_percent"] <= 80.0].copy()
     tail = s[s["cum_percent"] > 80.0].copy()
-
-    # keep genuine categories in head; push any 'Other' to tail so it doesn't block signal
     if not head.empty and (head["reason"] == "Other").any():
         move = head[head["reason"] == "Other"]
         head = head[head["reason"] != "Other"]
@@ -276,16 +240,15 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
             "cum_percent": 100.0
         }])
         head = pd.concat([head, other_row], ignore_index=True)
-    # else: 100% already in <=80% bucket set; leave as-is
 
     head["percent"] = head["percent"].round(1)
     head["cum_percent"] = head["cum_percent"].round(1)
     return head, latest
 
 
-# ---------------------------
+# =========================================================
 # Plots (unchanged)
-# ---------------------------
+# =========================================================
 def _fig_mom(df: pd.DataFrame, title: str):
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5, color="#9ecae1")
@@ -318,9 +281,9 @@ def _fig_reasons_bar(df: pd.DataFrame, title: str):
     return fig
 
 
-# ---------------------------
+# =========================================================
 # Streamlit entry point (unchanged interface)
-# ---------------------------
+# =========================================================
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     try:
         df_raw, _ = _load_fpa()
@@ -341,7 +304,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
-        # safer: Period -> Timestamp for formatting
         st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
     with c2:
         st.markdown(
@@ -350,6 +312,12 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             f"</h4>", unsafe_allow_html=True)
         if not table.empty:
             st.dataframe(table, use_container_width=True)
+
+    if not _OAI_READY:
+        st.info(
+            "OpenAI labelling inactive (no OPENAI_API_KEY). "
+            "Fail reasons will be shown as ‘Other’ to preserve rendering."
+        )
 
     reasons, lastp = _reasons_latest(df_raw)
     st.markdown(
