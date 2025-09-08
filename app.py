@@ -125,6 +125,9 @@ with c1:
 with c2:
     if st.button("first pass accuracy analysis", use_container_width=True):
         st.session_state["q"] = "first pass accuracy analysis"
+with c3:
+    if st.button("first pass accuracy analysis", use_container_width=True):
+        st.session_state["q"] = "fail reasons analysis"
 
 q_default = st.session_state.get("q", "complaint analysis — June 2025 by portfolio")
 q = st.text_input(
