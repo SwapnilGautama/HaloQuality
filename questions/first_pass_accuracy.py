@@ -12,29 +12,39 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+# ---------------------------
+# Brand colours / small style
+# ---------------------------
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#DDDDDD"
 
-# Optional: pastel line for MoM already exists in your app; bar color uses mpl defaults
-# Pareto / line accents if you later want to style further
+# Optional line colour for MoM; bars use mpl defaults
 _PARETO = "#6ab6e1"
 
-# Optional OpenAI assist to reduce "Other" (falls back to pure rules if no key)
+# ---------------------------
+# Optional OpenAI assist (used only if key present)
+# ---------------------------
 _OPENAI = False
 try:
-    import openai  # type: ignore
-    if os.getenv("OPENAI_API_KEY"):
-        openai.api_key = os.getenv("OPENAI_API_KEY")
+    # prefer Streamlit secrets; then ENV
+    _OPENAI_KEY = (st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("OPENAI_API_KEY")
+    if _OPENAI_KEY:
         _OPENAI = True
+        import openai  # type: ignore
+        openai.api_key = _OPENAI_KEY
 except Exception:
     _OPENAI = False
 
 
-# ---------------------------
-# Data loading (unchanged)
-# ---------------------------
+# =====================================================================
+# Data loading — unchanged behaviour
+# =====================================================================
 def _find_fpa_workbook() -> Optional[Path]:
+    """
+    Look in the standard locations and pick the newest matching file:
+    data/first_pass_accuracy/FirstPassAccuracy*.xlsx (or .xls)
+    """
     roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
     patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
     for root in roots:
@@ -46,16 +56,15 @@ def _find_fpa_workbook() -> Optional[Path]:
                 return hits[-1]
     return None
 
+
 def _read_excel_any(path: Path) -> pd.DataFrame:
     try:
         return pd.read_excel(path)
     except Exception:
+        # fall back to safe header
         return pd.read_excel(path, header=0)
 
 
-# ---------------------------
-# Column helpers (unchanged)
-# ---------------------------
 def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = {c.lower(): c for c in df.columns}
     for c in candidates:
@@ -63,9 +72,11 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             return cols[c.lower()]
     return None
 
+
 def _coerce_month(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.to_period("M")
+
 
 def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     p = _find_fpa_workbook()
@@ -79,6 +90,8 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "portfolio": _pick(df, ["Portfolio", "portfolio"]),
         "scheme": _pick(df, ["Scheme", "Scheme Name", "Plan", "Plan Name"]),
         "comment": _pick(df, ["Case Comment", "Comments", "Reviewer Comment", "Comment"]),
+        # if you ever add RCA columns in the source, we can reference them here
+        # "rca2": _pick(df, ["RCA2", "Root Cause 2"]),
     }
     missing = [k for k, v in col_map.items() if k in ("date", "result") and v is None]
     if missing:
@@ -86,14 +99,15 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     return df.rename(columns={v: k for k, v in col_map.items() if v}), col_map
 
 
-# ---------------------------
-# Pass% + table logic (unchanged)
-# ---------------------------
+# =====================================================================
+# Pass% + table — unchanged behaviour
+# =====================================================================
 def _is_pass(x: str) -> bool:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return False
     t = str(x).strip().lower()
     return t.startswith("pass")
+
 
 def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     s = _coerce_month(df["date"])
@@ -110,6 +124,7 @@ def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     label = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
     return pd.DataFrame({"month": label, "pass_pct": pct.values})
 
+
 def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame:
     df = df.assign(_m=_coerce_month(df["date"]))
     sub = df[df["_m"] == last_m]
@@ -124,11 +139,12 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
     )
 
 
-# ---------------------------
-# Fail reason classification (IMPROVED)
-# ---------------------------
+# =====================================================================
+# Fail reason classification — now wired to core.reason_labeller
+# with safe fallbacks to in-file rules and (optionally) OpenAI
+# =====================================================================
 
-# Expanded, ordered rulebook — earlier matches take precedence
+# ---- 1) Fallback rulebook (kept in-file so Q1 remains self-contained) ----
 _RULES = {
     "Bank / payment": [
         r"\b(bank|payment|refund|bacs|chaps|cheque|sort\s*code|iban|bic|account|transfer|credit|debit)\b",
@@ -169,8 +185,8 @@ _RULES = {
         r"\bvalidation|checklist|qa\s*(check)?\b",
     ],
 }
+_COMPILED = [(lab, [re.compile(p, re.I) for p in pats]) for lab, pats in _RULES.items()]
 
-_COMPILED = [(label, [re.compile(p, re.I) for p in pats]) for label, pats in _RULES.items()]
 
 def _clean_text(t: str) -> str:
     t = str(t or "").lower()
@@ -178,6 +194,7 @@ def _clean_text(t: str) -> str:
     t = re.sub(r"[^a-z0-9\s]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
 
 def _label_reason_rules(text: str) -> str:
     t = _clean_text(text)
@@ -187,15 +204,16 @@ def _label_reason_rules(text: str) -> str:
                 return label
     return "Other"
 
+
 def _ai_label_many(texts: List[str]) -> List[str]:
     """
     If OPENAI_API_KEY is available, ask the model to label items using our allowed set.
-    We still validate each suggestion against the rulebook to avoid creative answers.
+    We still validate each suggestion against the local rulebook to avoid creative answers.
     """
     if not _OPENAI or not texts:
         return [_label_reason_rules(t) for t in texts]
 
-    labels = [_label_reason_rules(t) for t in texts]  # default fallback
+    labels = [_label_reason_rules(t) for t in texts]  # safe default
     try:
         allowed = list(_RULES.keys()) + ["Other"]
         sys_msg = "You classify complaint review comments. Only return valid JSON array of labels."
@@ -204,7 +222,9 @@ def _ai_label_many(texts: List[str]) -> List[str]:
             + ", ".join(allowed)
             + ".\nReturn ONLY a JSON array of strings (no prose)."
         )
-        bullets = "\n".join(f"- {t}" for t in texts[:1500])  # safety cap
+        bullets = "\n".join(f"- {t}" for t in texts[:1500])  # safety cap for payload
+        import openai  # type: ignore
+
         resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             temperature=0,
@@ -229,6 +249,26 @@ def _ai_label_many(texts: List[str]) -> List[str]:
         pass
     return labels
 
+
+def _label_with_reason_labeller(texts: List[str]) -> Optional[List[str]]:
+    """
+    Try to use core.reason_labeller (your centralized labelling logic that can
+    combine YAML patterns + RCA + optional OpenAI). If anything fails, return None.
+    """
+    try:
+        from core.reason_labeller import ReasonLabeller  # your shared module
+        rl = ReasonLabeller(
+            # keep paths stable with your repo
+            patterns_path="data/surveys/fpa_patterns.yml",
+            rca_patterns_path="data/surveys/rca_patterns.yml",
+            openai_key=(st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("OPENAI_API_KEY"),
+            openai_model="gpt-4o-mini",
+        )
+        return rl.label_many(texts)
+    except Exception:
+        return None  # fall back to in-file logic
+
+
 def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     df = df.assign(_m=_coerce_month(df["date"]))
     latest = df["_m"].max()
@@ -244,17 +284,15 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
 
     texts = fails["comment"].astype(str).fillna("").tolist()
 
-    # 1) AI (optional) then rulebook; force all labels through rule validation
-    ai_labels = _ai_label_many(texts)
-    labels = [
-        lab if lab in _RULES or lab == "Other" else _label_reason_rules(t)
-        for t, lab in zip(texts, ai_labels)
-    ]
+    # ---- Prefer your shared reason_labeller, then fall back to OpenAI+rules, then rules only
+    labels = _label_with_reason_labeller(texts)
+    if labels is None:
+        labels = _ai_label_many(texts)
 
     s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
 
-    # 2) Pareto: Top 80% + Other (merge any pre-existing 'Other' into tail first)
+    # ---- Pareto: Top 80% + collapse the rest into "Other"
     total = int(s["count"].sum()) or 1
     s["percent"] = (s["count"] * 100.0 / total)
     s = s.sort_values("count", ascending=False).reset_index(drop=True)
@@ -263,7 +301,7 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     head = s[s["cum_percent"] <= 80.0].copy()
     tail = s[s["cum_percent"] > 80.0].copy()
 
-    # keep genuine categories in head; push any 'Other' to tail so it doesn't block signal
+    # ensure 'Other' doesn’t occupy the head bucket if present
     if not head.empty and (head["reason"] == "Other").any():
         move = head[head["reason"] == "Other"]
         head = head[head["reason"] != "Other"]
@@ -277,16 +315,15 @@ def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
             "cum_percent": 100.0
         }])
         head = pd.concat([head, other_row], ignore_index=True)
-    # else: 100% already in <=80% bucket set; leave as-is
 
     head["percent"] = head["percent"].round(1)
     head["cum_percent"] = head["cum_percent"].round(1)
     return head, latest
 
 
-# ---------------------------
-# Plots (unchanged)
-# ---------------------------
+# =====================================================================
+# Plot helpers — unchanged visuals
+# =====================================================================
 def _fig_mom(df: pd.DataFrame, title: str):
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5, color="#9ecae1")
@@ -301,6 +338,7 @@ def _fig_mom(df: pd.DataFrame, title: str):
     ax.get_yaxis().set_visible(False)
     ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
     return fig
+
 
 def _fig_reasons_bar(df: pd.DataFrame, title: str):
     fig, ax = plt.subplots(figsize=(7.0, 3.4))
@@ -319,10 +357,11 @@ def _fig_reasons_bar(df: pd.DataFrame, title: str):
     return fig
 
 
-# ---------------------------
-# Streamlit entry point (unchanged interface)
-# ---------------------------
+# =====================================================================
+# Streamlit entry — unchanged signature/UI
+# =====================================================================
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
+    # 1) Load & validate FPA
     try:
         df_raw, _ = _load_fpa()
     except FileNotFoundError as e:
@@ -331,18 +370,19 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         st.error(f"FPA file found, but a required column is missing: {e}")
         return ("", pd.DataFrame())
 
+    # 2) Pass % MoM
     mom = _series_mom(df_raw)
     if mom.empty:
         st.info("No First-Pass Accuracy rows found from Jan-25 onward.")
         return ("", pd.DataFrame())
 
+    # 3) Latest month, portfolio×scheme table
     df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
     latest = df_raw["_m"].max()
     table = _table_portfolio_scheme(df_raw, latest)
 
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
-        # safer: Period -> Timestamp for formatting
         st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
     with c2:
         st.markdown(
@@ -352,6 +392,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not table.empty:
             st.dataframe(table, use_container_width=True)
 
+    # 4) Reasons Pareto (now via reason_labeller where available)
     reasons, lastp = _reasons_latest(df_raw)
     st.markdown(
         f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
