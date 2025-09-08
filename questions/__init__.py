@@ -17,6 +17,7 @@ __all__ = [
     "fpa_fail_drivers",
     "rca1_portfolio_process",
     "corr_nps",
+    "fail_reasons_analysis",
 
     # Ensure these two are ALWAYS present
     "complaints_june_by_portfolio",   # Q1
