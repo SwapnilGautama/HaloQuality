@@ -12,4 +12,4 @@ python-pptx
 # --- Added for GPT + robust calls ---
 openai>=1.40.0
 tiktoken
-tenacity
+tenacity>=8.2.3
