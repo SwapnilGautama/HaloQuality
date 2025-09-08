@@ -13,6 +13,7 @@ def match(q: str) -> Dict:
     Very small, safe router that only returns a slug + lightweight params.
     Q1: complaints_june_by_portfolio
     Q2: first_pass_accuracy
+    Q3: fail_reasons_analysis
     """
     text = _norm_q(q)
 
@@ -22,6 +23,14 @@ def match(q: str) -> Dict:
         m = re.search(_MONTH_RX, text)
         params = {"hint_month": m.group(0)} if m else {}
         return {"slug": "first_pass_accuracy", "params": params}
+
+
+    # Q3 trigger phrases
+    if any(p in text for p in ["fail reasons", "fra", "fail reasons analysis"]):
+        # optional: pick a month if the user mentions one; Q2 still handles full-range internally
+        m = re.search(_MONTH_RX, text)
+        params = {"hint_month": m.group(0)} if m else {}
+        return {"slug": "fail_reasons_analysis", "params": params}
 
     # Default to Q1
     return {"slug": "complaints_june_by_portfolio", "params": {}}
