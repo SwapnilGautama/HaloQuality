@@ -250,8 +250,10 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
     prev = _get_prev_period(periods, latest) if latest else None
 
     ptab = _portfolio_pass_table(df_raw)
+
     def _extract_pass(grp, at_period):
-        if at_period is None: return pd.Series(dtype=float)
+        if at_period is None:
+            return pd.Series(dtype=float)
         sub = grp[grp["_m"] == at_period][["portfolio", "pass_%"]].set_index("portfolio")["pass_%"]
         return sub
 
@@ -264,39 +266,78 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
     # 3) Top 2 fail reasons and trends + 4) top portfolio contributors
     reasons_points = []
     contrib_points = []
+    obs_points = []
+
     if not fails_all.empty and latest is not None:
         latest_fails = fails_all[fails_all["_m"] == latest]
         prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
-        top2 = latest_fails["reason"].value_counts().head(2).index.tolist()
+
+        # concentration by portfolio (share in latest)
+        by_port = latest_fails.groupby("portfolio").size().sort_values(ascending=False)
+        if not by_port.empty:
+            top_port, top_port_cnt = by_port.index[0], int(by_port.iloc[0])
+            total_latest = int(by_port.sum()) or 1
+            share = round(top_port_cnt * 100.0 / total_latest, 1)
+            obs_points.append(f"Failures concentrated in **{top_port}** ({share}% of { _format_period(latest) } fails).")
+
+        # dominant reason share
+        by_reason = latest_fails.groupby("reason").size().sort_values(ascending=False)
+        if not by_reason.empty:
+            top_reason, top_reason_cnt = by_reason.index[0], int(by_reason.iloc[0])
+            total_latest = int(by_reason.sum()) or 1
+            share_r = round(top_reason_cnt * 100.0 / total_latest, 1)
+            obs_points.append(f"**{top_reason}** accounts for **{share_r}%** of { _format_period(latest) } fails.")
+
+        # top 2 reasons with deltas + contributors
+        top2 = by_reason.head(2).index.tolist()
         for r in top2:
             c_now = _safe_int((latest_fails["reason"] == r).sum())
             c_prev = _safe_int((prev_fails["reason"] == r).sum()) if not prev_fails.empty else 0
             delta_r = c_now - c_prev
-            reasons_points.append(f"**{r}**: {c_now} in { _format_period(latest) } ({'+' if delta_r>=0 else ''}{delta_r} vs { _format_period(prev) if prev else 'prior' }).")
-            # contributors
+            reasons_points.append(
+                f"**{r}**: {c_now} in { _format_period(latest) } "
+                f"({'+' if delta_r>=0 else ''}{delta_r} vs { _format_period(prev) if prev else 'prior' })."
+            )
             tops = latest_fails[latest_fails["reason"] == r].groupby("portfolio").size().sort_values(ascending=False).head(3)
             if not tops.empty:
-                parts = ", ".join([f"{k} ({v})" for k, v in tops.items()])
+                parts = ", ".join([f"{k} ({int(v)})" for k, v in tops.items()])
                 contrib_points.append(f"Top portfolios for **{r}**: {parts}.")
 
-    # build bullets
-    bullets = []
+    # ---- Build bullets in structured + indented format ----
+    bullets: List[str] = []
+
+    # Pass rate headline
     if not np.isnan(last_val):
         if not np.isnan(delta):
-            bullets.append(f"**Pass rate** in {mom['month'].iloc[-1]}: **{last_val:.0f}%** ({'+' if delta>=0 else ''}{delta:.0f} pp MoM).")
+            bullets.append(
+                f"**Month-on-Month Pass Rate**: {mom['month'].iloc[-1]} **{last_val:.0f}%** "
+                f"({'+' if delta>=0 else ''}{delta:.0f} pp MoM)."
+            )
         else:
-            bullets.append(f"**Pass rate** latest ({mom['month'].iloc[-1]}): **{last_val:.0f}%**.")
-    if not change.empty:
-        if not top_up.empty:
-            bullets.append("**Portfolio ↑ MoM**: " + ", ".join([f"{idx} (+{val:.0f} pp)" for idx, val in top_up.items()]))
-        if not top_down.empty:
-            bullets.append("**Portfolio ↓ MoM**: " + ", ".join([f"{idx} ({val:.0f} pp)" for idx, val in top_down.items()]))
-    if reasons_points:
-        bullets.append("**Fail reasons (top 2)**: " + " ".join(reasons_points))
-    if contrib_points:
-        bullets.append("**Contributors**: " + " ".join(contrib_points))
+            bullets.append(f"**Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
 
-    # keep 3–4 concise bullets
+    # Standout portfolios (indented)
+    if not change.empty:
+        lines = []
+        # Up movers
+        for idx, val in top_up.items():
+            lines.append(f"  - *{idx}*: {('+' if val>=0 else '')}{val:.0f} pp MoM")
+        # Down movers (if distinct)
+        for idx, val in top_down.items():
+            lines.append(f"  - *{idx}*: {val:.0f} pp MoM")
+        if lines:
+            bullets.append("**Standout Portfolios**:\n" + "\n".join(lines))
+
+    # Fail reasons (top 2) (indented)
+    if reasons_points:
+        bullets.append("**Fail Reasons (Top 2)**:\n" + "\n".join([f"  - {p}" for p in reasons_points]))
+
+    # Standout observations (indented)
+    if obs_points or contrib_points:
+        combined = obs_points + contrib_points
+        bullets.append("**Standout Observations**:\n" + "\n".join([f"  - {p}" for p in combined]))
+
+    # Keep 3–4 bullets max
     if len(bullets) > 4:
         bullets = bullets[:4]
     return bullets
@@ -314,12 +355,10 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
         prevs = sorted(df_tmp["_m"].dropna().unique().tolist())
         prev = prevs[-2] if len(prevs) >= 2 else None
 
-        # prepare slim CSV-ish strings
         mom_str = mom.to_csv(index=False)
-        # portfolio pass table
         ptab = _portfolio_pass_table(df_raw)
         ptab_str = ptab.to_csv(index=False)
-        # fail reasons latest vs prev (counts)
+
         if fails_all.empty:
             fr_str = "none"
         else:
@@ -330,7 +369,6 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
             fr_df = pd.DataFrame({"latest": fr_now}).join(pd.DataFrame({"prev": fr_prev}), how="outer").fillna(0).astype(int)
             fr_str = fr_df.to_csv()
 
-        # OpenAI call (optional)
         try:
             from openai import OpenAI
         except Exception:
@@ -341,16 +379,19 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
             return None
         client = OpenAI(api_key=api_key)
 
+        # Ask for structured bullets with sub-bullets (markdown indentation)
         sys_prompt = (
-            "You are a concise analytics assistant. Produce 3–4 sharp bullets about:\n"
-            "1) month-on-month pass rate, 2) standout portfolios (big increases/decreases),\n"
-            "3) top 2 fail reasons trend, 4) top portfolio contributors for those reasons.\n"
-            "Keep bullets short and concrete. Use percentages where available. Avoid fluff."
+            "You are a concise analytics assistant. Produce 3–4 bullets using Markdown.\n"
+            "- Bullet 1: **Month-on-Month Pass Rate** with latest value and MoM delta.\n"
+            "- Bullet 2: **Standout Portfolios** with two indented sub-bullets (biggest ↑/↓), format '  - *Portfolio*: +X pp MoM'.\n"
+            "- Bullet 3: **Fail Reasons (Top 2)** with two indented sub-bullets showing counts and MoM deltas.\n"
+            "- Bullet 4: **Standout Observations** with indented sub-bullets (concentration or dominant reason share and top portfolio contributors).\n"
+            "Keep bullets terse and numeric; avoid prose."
         )
         user_prompt = (
-            f"MoM Pass% table:\n{mom_str}\n\n"
+            f"MoM Pass% table (month,pass_pct):\n{mom_str}\n\n"
             f"Portfolio pass% by month (portfolio,_m,pass_%):\n{ptab_str}\n\n"
-            f"Fail reasons (latest vs prev counts):\n{fr_str}\n"
+            f"Fail reasons counts (latest vs prev):\n{fr_str}\n"
         )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -361,27 +402,37 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
             ],
         )
         text = resp.choices[0].message.content.strip()
-        # split into bullets by lines; fall back to plain lines
-        bullets = [ln.strip("-• ").strip() for ln in text.split("\n") if ln.strip()]
-        bullets = [b for b in bullets if b]
-        if not bullets:
-            return None
-        # cap at 4
-        return bullets[:4]
+        # Keep each top-level bullet intact; if the model emits multiple lines,
+        # we keep up to 4 bullet blocks split on top-level markers.
+        lines = [ln for ln in text.split("\n") if ln.strip()]
+        # Join into one block, then split by top-level dashes
+        joined = "\n".join(lines)
+        # Normalize: ensure bullets start with "- "
+        blocks = []
+        for part in joined.split("\n- "):
+            p = part.strip()
+            if not p:
+                continue
+            if not p.startswith("- "):
+                p = "- " + p
+            blocks.append(p[2:])  # store without leading "- "
+        return blocks[:4] if blocks else None
     except Exception:
         return None
 
 def _render_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> None:
     # Try OpenAI → fallback heuristic
     bullets = _openai_insights(mom, df_raw, fails_all)
-    if bullets is None or len(bullets) == 0:
+    if not bullets:
         bullets = _heuristic_insights(mom, df_raw, fails_all)
+
     st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>AI Insights</h4>", unsafe_allow_html=True)
     if not bullets:
         st.caption("No insights available.")
         return
     for b in bullets[:4]:
         if b:
+            # Allow nested list rendering by passing the inner markdown directly
             st.markdown(f"- {b}")
 
 # ======================
@@ -484,7 +535,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
     sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
 
-    # ========= NEW: AI INSIGHTS (kept lightweight, safe fallback) =========
+    # ========= AI INSIGHTS (structured, indented) =========
     _render_insights(mom, df_raw, fails_all)
 
     # ---- Row 1 ----
