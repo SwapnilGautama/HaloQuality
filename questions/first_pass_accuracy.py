@@ -264,4 +264,160 @@ def _label_with_reason_labeller(texts: List[str], rca2_vals: Optional[List[str]]
 
         # Build a DataFrame with canonical column names that the labeller expects
         df_all_for_model = pd.DataFrame({
-            "Case Comme
+            "Case Comment": df_all["comment"].astype(str) if "comment" in df_all.columns else pd.Series([], dtype=str),
+            "RCA2": df_all["rca2"].astype(str) if "rca2" in df_all.columns else pd.Series([], dtype=str),
+        })
+
+        # Fit or load a small TF-IDF + LinearSVC model if enough RCA2 labels exist
+        bundle = get_or_fit_model(df_all_for_model, text_col="Case Comment", rca2_col="RCA2")
+
+        # Label the target rows (latest-month fails)
+        lab_df = pd.DataFrame({
+            "Case Comment": texts,
+            "RCA2": rca2_vals if rca2_vals is not None else [""] * len(texts),
+        })
+        s = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2", model_bundle=bundle)
+        return s.fillna("Other").astype(str).tolist()
+    except Exception:
+        return None  # Caller will fall back to AI/rules
+
+
+def _reasons_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
+    df = df.assign(_m=_coerce_month(df["date"]))
+    latest = df["_m"].max()
+    if pd.isna(latest):
+        return pd.DataFrame(), latest
+
+    fails = df[(df["_m"] == latest) & (~df["result"].apply(_is_pass))]
+    if fails.empty:
+        return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
+
+    if "comment" not in fails.columns:
+        return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
+
+    texts = fails["comment"].astype(str).fillna("").tolist()
+    rca2_vals = fails["rca2"].astype(str).fillna("").tolist() if "rca2" in fails.columns else None
+
+    # ---- Prefer your shared reason_labeller (fixed), then fall back to OpenAI+rules, then rules only
+    labels = _label_with_reason_labeller(texts, rca2_vals, df)
+    if labels is None:
+        labels = _ai_label_many(texts)
+
+    s = pd.Series(labels).value_counts().rename_axis("reason").reset_index(name="count")
+    s = s.sort_values("count", ascending=False).reset_index(drop=True)
+
+    # ---- Pareto: Top 80% + collapse the rest into "Other"
+    total = int(s["count"].sum()) or 1
+    s["percent"] = (s["count"] * 100.0 / total)
+    s = s.sort_values("count", ascending=False).reset_index(drop=True)
+    s["cum_percent"] = s["percent"].cumsum()
+
+    head = s[s["cum_percent"] <= 80.0].copy()
+    tail = s[s["cum_percent"] > 80.0].copy()
+
+    # ensure 'Other' doesn’t occupy the head bucket if present
+    if not head.empty and (head["reason"] == "Other").any():
+        move = head[head["reason"] == "Other"]
+        head = head[head["reason"] != "Other"]
+        tail = pd.concat([tail, move], ignore_index=True)
+
+    if not tail.empty:
+        other_row = pd.DataFrame([{
+            "reason": "Other",
+            "count": int(tail["count"].sum()),
+            "percent": float(tail["percent"].sum()),
+            "cum_percent": 100.0
+        }])
+        head = pd.concat([head, other_row], ignore_index=True)
+
+    head["percent"] = head["percent"].round(1)
+    head["cum_percent"] = head["cum_percent"].round(1)
+    return head, latest
+
+
+# =====================================================================
+# Plot helpers — unchanged visuals
+# =====================================================================
+def _fig_mom(df: pd.DataFrame, title: str):
+    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+    ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5, color="#9ecae1")
+    for x, y in zip(df["month"], df["pass_pct"]):
+        ax.text(x, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+    ax.set_title(title, pad=8, color=_DARK_BLUE)
+    ax.set_ylim(bottom=0, top=100)
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+    return fig
+
+
+def _fig_reasons_bar(df: pd.DataFrame, title: str):
+    fig, ax = plt.subplots(figsize=(7.0, 3.4))
+    bars = ax.bar(df["reason"], df["count"])
+    for b in bars:
+        ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.5, f"{int(b.get_height())}",
+                ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+    ax.set_title(title, pad=8, color=_DARK_BLUE)
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    plt.setp(ax.get_xticklabels(), rotation=90, ha="center", color=_DARK_GREY)
+    ax.grid(False)
+    return fig
+
+
+# =====================================================================
+# Streamlit entry — unchanged signature/UI
+# =====================================================================
+def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
+    # 1) Load & validate FPA
+    try:
+        df_raw, _ = _load_fpa()
+    except FileNotFoundError as e:
+        st.error(str(e)); return ("", pd.DataFrame())
+    except KeyError as e:
+        st.error(f"FPA file found, but a required column is missing: {e}")
+        return ("", pd.DataFrame())
+
+    # 2) Pass % MoM
+    mom = _series_mom(df_raw)
+    if mom.empty:
+        st.info("No First-Pass Accuracy rows found from Jan-25 onward.")
+        return ("", pd.DataFrame())
+
+    # 3) Latest month, portfolio×scheme table
+    df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
+    latest = df_raw["_m"].max()
+    table = _table_portfolio_scheme(df_raw, latest)
+
+    c1, c2 = st.columns((1.1, 1.0), gap="large")
+    with c1:
+        st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
+    with c2:
+        st.markdown(
+            f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>"
+            f"Pass % by Portfolio × Scheme — {pd.Period(latest).to_timestamp().strftime('%b-%y')}"
+            f"</h4>", unsafe_allow_html=True)
+        if not table.empty:
+            st.dataframe(table, use_container_width=True)
+
+    # 4) Reasons Pareto (now correctly using shared labeller if available)
+    reasons, lastp = _reasons_latest(df_raw)
+    st.markdown(
+        f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
+        f"Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}"
+        f"</h4>", unsafe_allow_html=True)
+    r1, r2 = st.columns(2, gap="large")
+    with r1:
+        if not reasons.empty:
+            st.pyplot(_fig_reasons_bar(reasons[["reason", "count"]], "Fail reasons — Pareto (top 80% + Other)"))
+    with r2:
+        if not reasons.empty:
+            st.dataframe(reasons, use_container_width=True)
+
+    return ("", pd.DataFrame())
