@@ -8,9 +8,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+# ---------------------------
+# Brand / palette
+# ---------------------------
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
-_SOFT_GREY = "#DDDDDD"
+_SOFT_GREY = "#E0E0E0"   # softer axis baseline
+
+# Pastel palette
+_PASTEL_LINE = "#8ECAE6"  # FPA line
+_PASTEL_LINE_DOT = "#8ECAE6"
+_PASTEL_BARS = [
+    "#8ECAE6", "#BDE0FE", "#A9DEF9", "#CDEAC0", "#B9FBC0", "#FFD6A5",
+    "#FFC8DD", "#E2E2F1", "#F1D1B5", "#C3F0CA", "#E4C1F9", "#FDE4CF"
+]
+_PASTEL_LINE_2 = "#90BE6D"  # cumulative line
 
 # ======================
 # Data loading
@@ -102,7 +114,7 @@ def _table_portfolio_scheme(df: pd.DataFrame, last_m: pd.Period) -> pd.DataFrame
     )
 
 # ======================
-# Reasons — show ALL (no "Other" collapse) + Pareto line to 100%
+# Reasons — ALL + Pareto line to 100%
 # ======================
 def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     from core.reason_labeller import label_dataframe
@@ -123,9 +135,7 @@ def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     labels = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2")\
         .fillna("Other").astype(str)
 
-    # Count ALL reasons exactly as produced (no removal, no renaming)
     vc = labels.value_counts().rename_axis("reason").reset_index(name="count")
-    # Sort descending by count for Pareto
     vc = vc.sort_values("count", ascending=False).reset_index(drop=True)
 
     total = int(vc["count"].sum()) or 1
@@ -135,37 +145,92 @@ def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     vc["cum_percent"] = vc["cum_percent"].round(1)
     return vc, latest
 
+# ======================
+# Plots (updated styling)
+# ======================
+def _fig_mom(df: pd.DataFrame, title: str):
+    """
+    Smooth pastel line, no markers, soft baseline, no y-axis.
+    """
+    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+
+    ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
+
+    # light, unobtrusive labels above points
+    for x, y in zip(df["month"], df["pass_pct"]):
+        ax.text(x, y + 2, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
+
+    # Style: remove borders & y-axis; soft bottom spine only
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+
+    ax.set_title(title, pad=8, color=_DARK_BLUE)
+    ax.set_ylim(bottom=0, top=100)
+    return fig
+
 def _fig_pareto_full(df: pd.DataFrame, title: str):
     """
-    Bars = counts (sorted desc), line = cumulative percent (0..100).
+    Bars = counts (sorted desc), smooth cumulative % line.
+    - Pastel bar palette
+    - No borders
+    - No y-axes shown (primary or secondary)
+    - Bottom x-axis in soft grey
     """
-    fig, ax1 = plt.subplots(figsize=(8.4, 3.8))
+    fig, ax1 = plt.subplots(figsize=(8.6, 4.0))
 
-    # Bars — counts
     x = np.arange(len(df))
-    bars = ax1.bar(x, df["count"])
-    ax1.set_ylabel("Count")
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
-    for b in bars:
-        ax1.text(b.get_x() + b.get_width()/2, b.get_height() + 0.5,
-                 f"{int(b.get_height())}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
 
-    # Line — cumulative %
+    # Bars with pastel palette
+    colors = [_PASTEL_BARS[i % len(_PASTEL_BARS)] for i in range(len(df))]
+    bars = ax1.bar(x, df["count"], color=colors)
+
+    # Count labels on bars
+    for b in bars:
+        ax1.text(
+            b.get_x() + b.get_width() / 2,
+            b.get_height() + (max(df["count"]) * 0.015),
+            f"{int(b.get_height())}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color=_DARK_GREY,
+        )
+
+    # Smooth cumulative line: interpolate to a denser grid for a gentle curve
     ax2 = ax1.twinx()
-    ax2.plot(x, df["cum_percent"], marker="o", linewidth=2.0)
-    ax2.set_ylim(0, 100)
-    ax2.set_ylabel("Cumulative %")
+    x_dense = np.linspace(x.min(), x.max(), num=max(200, len(x) * 20))
+    y_dense = np.interp(x_dense, x, df["cum_percent"].values)
+    ax2.plot(x_dense, y_dense, linewidth=2.5, color=_PASTEL_LINE_2)
+
+    # Minimal labels on the line at coarse intervals
     for xi, cp in zip(x, df["cum_percent"]):
         ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
 
-    # Title & style
-    ax1.set_title(title, pad=8, color=_DARK_BLUE)
+    # X ticks / labels
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
+
+    # Style: remove borders & both y-axes; keep soft bottom spine
     for sp in ["left", "right", "top"]:
         ax1.spines[sp].set_visible(False)
     ax1.spines["bottom"].set_color(_SOFT_GREY)
     ax1.spines["bottom"].set_linewidth(1.25)
+
+    # Hide both y-axes completely
+    ax1.get_yaxis().set_visible(False)
+    ax2.get_yaxis().set_visible(False)
+
+    ax1.set_xlabel("")
+    ax1.set_ylabel("")
+    ax2.set_ylabel("")
     ax1.grid(False)
+
+    ax1.set_title(title, pad=8, color=_DARK_BLUE)
+    ax2.set_ylim(0, 100)
     return fig
 
 # ======================
@@ -216,23 +281,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.info("No fail reasons available for the latest month.")
     with r2:
         if not reasons.empty:
-            # Show the full table: reason, count, percent, cum_percent
             st.dataframe(reasons, use_container_width=True)
 
     return ("", pd.DataFrame())
-
-# ---------- Small helper plots reused above ----------
-def _fig_mom(df: pd.DataFrame, title: str):
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
-    ax.plot(df["month"], df["pass_pct"], marker="o", linewidth=2.5)
-    for x, y in zip(df["month"], df["pass_pct"]):
-        ax.text(x, y + 1, f"{y:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax.set_title(title, pad=8, color=_DARK_BLUE)
-    ax.set_ylim(bottom=0, top=100)
-    for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.spines["bottom"].set_linewidth(1.25)
-    ax.get_yaxis().set_visible(False)
-    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
-    return fig
