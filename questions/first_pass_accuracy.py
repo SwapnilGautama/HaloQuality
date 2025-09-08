@@ -27,16 +27,6 @@ _RCA1_BARS = [
 _RCA1_CUM_LINE = "#74C69D"
 
 # ======================
-# Safe/optional Altair import (prevents module import crash)
-# ======================
-def _get_altair():
-    try:
-        import altair as alt  # type: ignore
-        return alt
-    except Exception:
-        return None
-
-# ======================
 # Data loading
 # ======================
 def _find_fpa_workbook() -> Optional[Path]:
@@ -136,12 +126,9 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
     return piv
 
 # ======================
-# Reasons — data
+# Fail reasons full matrix
 # ======================
 def _label_all(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return FAIL rows across all months with a 'reason' column (rule-based).
-    """
     from core.reason_labeller import label_dataframe
     df = df.copy()
     df["_m"] = _coerce_month(df["date"])
@@ -156,47 +143,25 @@ def _label_all(df: pd.DataFrame) -> pd.DataFrame:
         .fillna("Other").astype(str)
     return fails
 
-def _reasons_latest(fails_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
+def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     """
-    Pareto-ready counts for the latest month only.
+    Pivot: rows=(portfolio, reason), columns=months, values=count
     """
-    latest = fails_all["_m"].max()
-    sub = fails_all[fails_all["_m"] == latest]
-    vc = sub["reason"].value_counts().rename_axis("reason").reset_index(name="count")
-    if vc.empty:
-        return pd.DataFrame(columns=["reason","count","cum_percent"]), latest
-    vc = vc.sort_values("count", ascending=False).reset_index(drop=True)
-    total = int(vc["count"].sum()) or 1
-    vc["percent"] = vc["count"] * 100.0 / total
-    vc["cum_percent"] = vc["percent"].cumsum().clip(upper=100.0).round(1)
-    return vc[["reason","count","cum_percent"]], latest
-
-def _reason_portfolio_month_matrix(fails_all: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """
-    Build a matrix (rows: reason × portfolio; columns: months) with counts.
-    Returns (matrix_df, ordered_reasons, ordered_month_labels)
-    """
-    if fails_all.empty:
-        return pd.DataFrame(), [], []
-    months = pd.period_range(fails_all["_m"].min(), fails_all["_m"].max(), freq="M")
+    if fails.empty:
+        return pd.DataFrame()
+    months = pd.period_range(fails["_m"].min(), fails["_m"].max(), freq="M")
     month_labels = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
-    g = fails_all.groupby(["reason", "portfolio", "_m"]).size().reset_index(name="count")
-    if g.empty:
-        return pd.DataFrame(), [], month_labels
-    mat = g.pivot_table(index=["reason","portfolio"], columns="_m", values="count", fill_value=0)
+    g = fails.groupby(["portfolio", "reason", "_m"]).size().reset_index(name="count")
+    mat = g.pivot_table(index=["portfolio", "reason"], columns="_m", values="count", fill_value=0)
     mat = mat.reindex(columns=months, fill_value=0)
     mat.columns = month_labels
     mat = mat.sort_index()
-    ordered_reasons = list(fails_all["reason"].value_counts().index)
-    return mat, ordered_reasons, month_labels
+    return mat
 
 # ======================
-# Plots (Row 1 = Matplotlib line)
+# Plots (styling)
 # ======================
 def _fig_mom(df: pd.DataFrame, title: str):
-    """
-    Smooth pastel line, soft baseline, no y-axis.
-    """
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
     for x, y in zip(df["month"], df["pass_pct"]):
@@ -212,114 +177,9 @@ def _fig_mom(df: pd.DataFrame, title: str):
     return fig
 
 # ======================
-# Altair interactive (optional) + fallbacks
-# ======================
-def _altair_reason_pareto_plus_matrix(vc_latest: pd.DataFrame,
-                                      mat: pd.DataFrame,
-                                      ordered_reasons: List[str],
-                                      month_labels: List[str]):
-    alt = _get_altair()
-    if alt is None or vc_latest.empty or mat.empty:
-        return None
-
-    vc = vc_latest.copy()
-    vc["reason"] = vc["reason"].astype("string")
-    vc["order"] = np.arange(1, len(vc) + 1)
-    mat_disp = mat.reset_index().melt(id_vars=["reason","portfolio"], var_name="month", value_name="count")
-
-    sel = alt.selection_single(fields=["reason"], on="click", empty="all")
-
-    bars = (
-        alt.Chart(vc)
-        .mark_bar()
-        .encode(
-            x=alt.X("reason:N", sort=ordered_reasons, axis=alt.Axis(title=None, labelColor=_DARK_GREY, labelAngle=90)),
-            y=alt.Y("count:Q", axis=None),
-            color=alt.condition(sel, alt.value(_RCA1_BARS[0]), alt.value("#DCE6F2")),
-            tooltip=["reason:N","count:Q","cum_percent:Q"]
-        )
-        .add_selection(sel)
-        .properties(width=420, height=280)
-    )
-    labels = (
-        alt.Chart(vc)
-        .mark_text(dy=-6, color=_DARK_GREY, size=11)
-        .encode(x=alt.X("reason:N", sort=ordered_reasons), y="count:Q", text="count:Q")
-        .properties(width=420, height=280)
-    )
-    line = (
-        alt.Chart(vc)
-        .mark_line(color=_RCA1_CUM_LINE, strokeWidth=2.8)
-        .encode(x=alt.X("reason:N", sort=ordered_reasons, axis=alt.Axis(title=None, labels=False, ticks=False)),
-                y=alt.Y("cum_percent:Q", scale=alt.Scale(domain=[0, 100]), axis=None))
-        .properties(width=420, height=280)
-    )
-    llabels = (
-        alt.Chart(vc)
-        .mark_text(dy=-8, color=_DARK_GREY, size=10)
-        .encode(x=alt.X("reason:N", sort=ordered_reasons), y="cum_percent:Q", text=alt.Text("cum_percent:Q", format=".0f"))
-        .properties(width=420, height=280)
-    )
-
-    left = (bars + labels + line + llabels)
-
-    base_heat = (
-        alt.Chart(mat_disp)
-        .transform_filter(sel)
-        .encode(
-            x=alt.X("month:N", sort=month_labels, axis=alt.Axis(title=None, labelColor=_DARK_GREY)),
-            y=alt.Y("portfolio:N", sort=alt.SortField(field="portfolio", order="ascending"),
-                    axis=alt.Axis(title=None, labelColor=_DARK_GREY)),
-        )
-        .properties(width=420, height=280)
-    )
-    rects = base_heat.mark_rect().encode(color=alt.Color("count:Q", scale=alt.Scale(scheme="blues"), legend=None))
-    texts = base_heat.mark_text(color=_DARK_GREY, size=11).encode(text="count:Q")
-
-    return alt.hconcat(left, (rects + texts)).resolve_scale(y="independent")
-
-def _fallback_static_reasons(vc_latest: pd.DataFrame, mat: pd.DataFrame):
-    """
-    Static Matplotlib Pareto + Streamlit table fallback with a dropdown filter.
-    """
-    # Pareto bars (counts) + cumulative line
-    fig, ax1 = plt.subplots(figsize=(8.6, 4.0))
-    x = np.arange(len(vc_latest))
-    colors = [_RCA1_BARS[i % len(_RCA1_BARS)] for i in range(len(vc_latest))]
-    bars = ax1.bar(x, vc_latest["count"], color=colors)
-    lift = max(vc_latest["count"]) * 0.015 if len(vc_latest) else 1
-    for b in bars:
-        ax1.text(b.get_x()+b.get_width()/2, b.get_height()+lift, f"{int(b.get_height())}",
-                 ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax2 = ax1.twinx()
-    ax2.plot(x, vc_latest["cum_percent"], linewidth=2.8, color=_RCA1_CUM_LINE)
-    for xi, cp in zip(x, vc_latest["cum_percent"]):
-        ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(vc_latest["reason"], rotation=90, ha="center", color=_DARK_GREY)
-    for sp in ["left", "right", "top"]:
-        ax1.spines[sp].set_visible(False)
-    ax1.spines["bottom"].set_color(_SOFT_GREY); ax1.spines["bottom"].set_linewidth(1.25)
-    ax1.get_yaxis().set_visible(False); ax2.get_yaxis().set_visible(False)
-    for sp in ["left","right","top","bottom"]:
-        ax2.spines[sp].set_visible(False)
-    ax2.set_ylim(0, 100)
-    st.pyplot(fig)
-
-    # Dropdown filter table (reason × portfolio × month counts)
-    reason_list = list(vc_latest["reason"])
-    sel_reason = st.selectbox("Filter portfolio × month counts by reason", reason_list, index=0)
-    if not mat.empty:
-        sub = mat.loc[mat.index.get_level_values("reason") == sel_reason]
-        # collapse reasons level
-        sub = sub.droplevel("reason")
-        st.dataframe(sub, use_container_width=True)
-
-# ======================
 # Streamlit entry
 # ======================
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
-    # Row 1: FPA MoM + table
     try:
         df_raw, _ = _load_fpa()
     except FileNotFoundError as e:
@@ -338,6 +198,13 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
+    # Side filter pane
+    st.sidebar.header("Filters — First Pass Accuracy")
+    all_reasons = sorted(df_raw.get("rca2", pd.Series()).dropna().unique().tolist())
+    all_portfolios = sorted(df_raw.get("portfolio", pd.Series()).dropna().unique().tolist())
+    selected_reasons = st.sidebar.multiselect("Select Fail Reasons", options=all_reasons)
+    selected_portfolios = st.sidebar.multiselect("Select Portfolios", options=all_portfolios)
+
     c1, c2 = st.columns((1.1, 1.0), gap="large")
     with c1:
         st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
@@ -349,23 +216,22 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if not piv_portfolio_mom.empty:
             st.dataframe(piv_portfolio_mom, use_container_width=True)
 
-    # Row 2: Reasons — interactive chart + cross-filtered matrix table (with safe fallback)
-    st.markdown(
-        f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
-        f"Reasons for Fail — {pd.Period(latest).to_timestamp().strftime('%b-%y')}"
-        f"</h4>", unsafe_allow_html=True)
+    # Row 2: Fail reasons full matrix
+    fails = _label_all(df_raw)
+    mat = _pivot_fail_matrix(fails)
 
-    fails_all = _label_all(df_raw)  # all months, only FAILs with reason labels
-    vc_latest, _ = _reasons_latest(fails_all)
-    mat, ordered_reasons, month_labels = _reason_portfolio_month_matrix(fails_all)
-
-    alt_chart = _altair_reason_pareto_plus_matrix(vc_latest, mat, ordered_reasons, month_labels)
-
-    if alt_chart is not None:
-        # Streamlit >=1.49 prefers width="stretch"
-        st.altair_chart(alt_chart, width="stretch")
+    if not mat.empty:
+        # Apply filters
+        if selected_reasons:
+            mat = mat.loc[mat.index.get_level_values("reason").isin(selected_reasons)]
+        if selected_portfolios:
+            mat = mat.loc[mat.index.get_level_values("portfolio").isin(selected_portfolios)]
+        st.markdown(
+            f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>"
+            f"Fail Reasons × Portfolio — Month on Month"
+            f"</h4>", unsafe_allow_html=True)
+        st.dataframe(mat, use_container_width=True)
     else:
-        # Fallback so the module never crashes and users still see insights
-        _fallback_static_reasons(vc_latest, mat)
+        st.info("No fail reason data available.")
 
     return ("", pd.DataFrame())
