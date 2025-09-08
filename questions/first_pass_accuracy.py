@@ -131,7 +131,6 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
 def _label_all(df: pd.DataFrame) -> pd.DataFrame:
     """
     Label ALL failed rows across all months with a 'reason' column.
-    Uses the same rule-based labeller as the latest-month view.
     """
     from core.reason_labeller import label_dataframe
     df = df.copy()
@@ -149,7 +148,7 @@ def _label_all(df: pd.DataFrame) -> pd.DataFrame:
 
 def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     """
-    Existing latest-month aggregation (kept as-is for the Pareto chart).
+    Latest-month aggregation for the Pareto chart.
     """
     from core.reason_labeller import label_dataframe
 
@@ -181,18 +180,24 @@ def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
 
 def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     """
-    Pivot for the second-row table:
+    Pivot for the second-row table (2025 only):
       rows   -> (portfolio, reason)
-      cols   -> months (Jan–latest)
+      cols   -> months (Jan–latest) within calendar year 2025
       values -> count of failed cases
     """
     if fails.empty:
         return pd.DataFrame()
 
-    months = pd.period_range(fails["_m"].min(), fails["_m"].max(), freq="M")
+    # Limit to 2025 only
+    start_2025 = pd.Period("2025-01")
+    fails_2025 = fails[fails["_m"] >= start_2025].copy()
+    if fails_2025.empty:
+        return pd.DataFrame()
+
+    months = pd.period_range(start_2025, fails_2025["_m"].max(), freq="M")
     month_labels = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
 
-    g = fails.groupby(["portfolio", "reason", "_m"]).size().reset_index(name="count")
+    g = fails_2025.groupby(["portfolio", "reason", "_m"]).size().reset_index(name="count")
     mat = g.pivot_table(index=["portfolio", "reason"], columns="_m", values="count", fill_value=0)
     mat = mat.reindex(columns=months, fill_value=0)
     mat.columns = month_labels
@@ -204,7 +209,7 @@ def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
 # ======================
 def _fig_mom(df: pd.DataFrame, title: str):
     """
-    Smooth pastel line, no markers, soft baseline, no y-axis.
+    Smooth pastel line, soft baseline, no y-axis.
     """
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
@@ -223,7 +228,6 @@ def _fig_mom(df: pd.DataFrame, title: str):
 def _fig_pareto_full(df: pd.DataFrame):
     """
     Bars = counts (sorted desc), smooth cumulative % line.
-    RCA1-style: soft pastel bars, teal line, soft bottom spine, no y-axes.
     """
     fig, ax1 = plt.subplots(figsize=(8.6, 4.0))
     x = np.arange(len(df))
@@ -284,14 +288,19 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
     latest = df_raw["_m"].max()
 
-    # Month-on-Month FPA% by portfolio (rows × columns)
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
-    # ---- Sidebar filters for Row 2 matrix ----
-    st.sidebar.header("Filters — Fail reasons view")
+    # ---- Left filter pane (sidebar) for Row 2 matrix (2025 only) ----
+    st.sidebar.header("Filters (2025) — Fail reasons")
     fails_all = _label_all(df_raw)
-    all_reasons = sorted(fails_all["reason"].unique().tolist()) if not fails_all.empty else []
-    all_portfolios = sorted(fails_all["portfolio"].dropna().unique().tolist()) if not fails_all.empty else []
+    if not fails_all.empty:
+        # limit side-panel options to items that appear in 2025
+        start_2025 = pd.Period("2025-01")
+        fails_2025 = fails_all[fails_all["_m"] >= start_2025].copy()
+        all_reasons = sorted(fails_2025["reason"].unique().tolist())
+        all_portfolios = sorted(fails_2025["portfolio"].dropna().unique().tolist())
+    else:
+        all_reasons, all_portfolios = [], []
     sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
     sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
 
@@ -308,11 +317,8 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.dataframe(piv_portfolio_mom, use_container_width=True)
 
     # ---- Row 2 ----
-    # Left: Pareto chart (latest month) — unchanged
     reasons_latest, lastp = _label_all_latest(df_raw)
-
-    # Right: New matrix (portfolio × reason rows; months columns; counts)
-    fail_matrix = _pivot_fail_matrix(fails_all)
+    matrix_2025 = _pivot_fail_matrix(fails_all)
 
     st.markdown(
         f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}</h4>",
@@ -324,21 +330,19 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.pyplot(_fig_pareto_full(reasons_latest))
         else:
             st.info("No fail reasons available for the latest month.")
-
     with r2:
-        if not fail_matrix.empty:
+        if not matrix_2025.empty:
             # Apply sidebar filters
             if sel_reasons:
-                fail_matrix = fail_matrix.loc[fail_matrix.index.get_level_values("reason").isin(sel_reasons)]
+                matrix_2025 = matrix_2025.loc[matrix_2025.index.get_level_values("reason").isin(sel_reasons)]
             if sel_portfolios:
-                fail_matrix = fail_matrix.loc[fail_matrix.index.get_level_values("portfolio").isin(sel_portfolios)]
-
+                matrix_2025 = matrix_2025.loc[matrix_2025.index.get_level_values("portfolio").isin(sel_portfolios)]
             st.markdown(
-                f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month</h4>",
+                f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month (2025)</h4>",
                 unsafe_allow_html=True
             )
-            st.dataframe(fail_matrix, use_container_width=True)
+            st.dataframe(matrix_2025, use_container_width=True)
         else:
-            st.info("No fail reason data available to populate the matrix.")
+            st.info("No 2025 fail reason data available to populate the matrix.")
 
     return ("", pd.DataFrame())
