@@ -1,14 +1,12 @@
 # app.py
 from __future__ import annotations
 import importlib
+import os
 import traceback
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import streamlit as st
-
-import os, streamlit as st
 
 def _peek_openai_config():
     # What the app sees right now
@@ -39,7 +37,6 @@ def _peek_openai_config():
 
 _peek_openai_config()
 
-
 # =============== Small import helper (keeps Q1 & Q2 isolated) ===============
 def _imp(mod: str, attr: str | None = None):
     """Import from repo root; if that fails, from core.<mod>."""
@@ -55,7 +52,6 @@ sem_router = _imp("semantic_router")  # must define match(q) -> {"slug": ..., "p
 
 # Question modules are always looked up here (keeps them sandboxed from each other)
 QUESTION_MODULE_PREFIXES = ("questions", "core.questions")
-
 
 def _run_question(store: Dict[str, Any], slug: str, params: Dict[str, Any], user_text: Optional[str] = None):
     """
@@ -73,7 +69,6 @@ def _run_question(store: Dict[str, Any], slug: str, params: Dict[str, Any], user
 
     err = f"That question module failed to import.\n\nslug={slug}\n\n{traceback.format_exc()}"
     return err, pd.DataFrame()
-
 
 # ===================== Page setup (branding + no sidebar) ====================
 st.set_page_config(page_title="Halo Quality — AI Assistant", layout="wide")
@@ -118,7 +113,7 @@ with st.spinner("Loading data..."):
         store = load_store()
 
 # ============================== Chips + router ==============================
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns(3)  # <-- (fix) need three columns because we use c3 below
 with c1:
     if st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True):
         st.session_state["q"] = "complaint analysis — June 2025 by portfolio"
@@ -131,7 +126,7 @@ with c3:
 
 q_default = st.session_state.get("q", "complaint analysis — June 2025 by portfolio")
 q = st.text_input(
-    "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis')",
+    "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis' or 'fail reasons analysis')",
     value=q_default,
 )
 
