@@ -8,35 +8,6 @@ from typing import Any, Dict, Optional
 import pandas as pd
 import streamlit as st
 
-def _peek_openai_config():
-    # What the app sees right now
-    src = []
-    flat = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
-    nested = None
-    try:
-        if "openai" in st.secrets:
-            nested = st.secrets["openai"].get("api_key", None)
-    except Exception:
-        pass
-    env = os.getenv("OPENAI_API_KEY")
-
-    key = flat or nested or env
-    if flat: src.append("st.secrets['OPENAI_API_KEY']")
-    if nested: src.append("st.secrets['openai']['api_key']")
-    if env: src.append("ENV:OPENAI_API_KEY")
-
-    model = (
-        os.getenv("OPENAI_MODEL")
-        or (st.secrets.get("OPENAI_MODEL") if hasattr(st, "secrets") else None)
-        or (st.secrets.get("openai", {}).get("model") if hasattr(st, "secrets") and "openai" in st.secrets else None)
-        or "gpt-4o-mini"
-    )
-
-    masked = (key[:6] + "…" + key[-4:]) if isinstance(key, str) and len(key) > 10 else str(key)
-    st.caption(f"🔎 OpenAI debug → key sources: {', '.join(src) or 'none'} | model: {model} | key: {masked}")
-
-_peek_openai_config()
-
 # =============== Small import helper (keeps Q1 & Q2 isolated) ===============
 def _imp(mod: str, attr: str | None = None):
     """Import from repo root; if that fails, from core.<mod>."""
@@ -71,7 +42,7 @@ def _run_question(store: Dict[str, Any], slug: str, params: Dict[str, Any], user
     return err, pd.DataFrame()
 
 # ===================== Page setup (branding + no sidebar) ====================
-st.set_page_config(page_title="Halo Quality — AI Assistant", layout="wide")
+st.set_page_config(page_title="Halo - Quality - AI Assistant", layout="wide")
 
 # kill the sidebar & toolbar permanently (and keep the clean look)
 st.markdown(
@@ -80,55 +51,57 @@ st.markdown(
       [data-testid="stSidebar"], [data-testid="stSidebarNav"] { display: none !important; }
       section[data-testid="stSidebar"] { display: none !important; }
       [data-testid="stToolbar"] { display:none !important; }  /* top-right hamburger */
-      /* HALO pill + brand sizes */
-      .halo-wrap{display:flex;align-items:baseline;gap:.5rem;margin:8px 0 22px 0;}
-      .halo-pill{
-        background:#FF7A00; color:white; font-weight:800; letter-spacing:1px;
-        border-radius:10px; padding:6px 12px; display:inline-block; font-size:20px;
+
+      /* HALO branding */
+      .halo-wrap{
+        display:flex; align-items:baseline; gap:.75rem; margin:8px 0 22px 0;
       }
-      .brand-quality{color:#0B3B8C; font-weight:800; font-size:32px;}
-      .brand-chat{color:#3c3c3c; font-size:28px; margin-left:.25rem;}
+      .halo-pill{
+        background: linear-gradient(90deg, #FF7A00 0%, #FFD54F 50%, #66BB6A 100%);
+        color:white; font-weight:900; letter-spacing:1.2px;
+        border-radius:12px; padding:8px 16px; display:inline-block; font-size:28px;
+        text-shadow: 0 1px 1px rgba(0,0,0,.18);
+      }
+      .brand-title{
+        color:#0B3B8C; font-weight:800; font-size:36px; line-height:1.1;
+      }
+      .brand-subtle{
+        color:#3c3c3c; font-size:20px; margin-left:.25rem;
+      }
+
+      /* tighten input spacing a bit */
+      div[data-baseweb="input"] { margin-top: -6px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+# ---------- Header ----------
 st.markdown(
     """
     <div class="halo-wrap">
       <div class="halo-pill">HALO</div>
-      <div class="brand-quality">Quality</div>
-      <div class="brand-chat">— Chat</div>
+      <div class="brand-title">- Quality - AI Assistant</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 # ============================== Load “store” ==============================
-# Keep compatibility with Q1 loader (assume 2025 if the function supports it)
 with st.spinner("Loading data..."):
     try:
         store = load_store(assume_year_for_complaints=2025)
     except TypeError:
         store = load_store()
 
-# ============================== Chips + router ==============================
-c1, c2, c3 = st.columns(3)  # <-- (fix) need three columns because we use c3 below
-with c1:
-    if st.button("complaint analysis — June 2025 (by portfolio)", use_container_width=True):
-        st.session_state["q"] = "complaint analysis — June 2025 by portfolio"
-with c2:
-    if st.button("first pass accuracy analysis", use_container_width=True):
-        st.session_state["q"] = "first pass accuracy analysis"
-with c3:
-    if st.button("fail reasons analysis", use_container_width=True):
-        st.session_state["q"] = "fail reasons analysis"
-
-q_default = st.session_state.get("q", "complaint analysis — June 2025 by portfolio")
+# ============================== Router + query box ==============================
+# (Removed the 3 chips as requested)
+q_default = st.session_state.get("q", "first pass accuracy analysis")
 q = st.text_input(
     "Type your question (e.g., 'complaint analysis — June 2025 by portfolio' or 'first pass accuracy analysis' or 'fail reasons analysis')",
     value=q_default,
 )
+st.session_state["q"] = q
 
 match = sem_router.match(q) if hasattr(sem_router, "match") else {"slug": "complaints_june_by_portfolio", "params": {}}
 slug = match.get("slug", "complaints_june_by_portfolio")
