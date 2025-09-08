@@ -335,6 +335,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
     # Interactive composition (bars + cumulative line) ⟷ (matrix heatmap)
     chart = _altair_reason_pareto_plus_matrix(vc_latest, mat, ordered_reasons, month_labels)
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
     return ("", pd.DataFrame())
