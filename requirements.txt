@@ -9,4 +9,4 @@ plotly
 PyYAML>=6.0.2
 matplotlib
 python-pptx
-openai>=1.46.0
+openai>=1.51.0
