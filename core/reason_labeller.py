@@ -1,115 +1,165 @@
 # core/reason_labeller.py
 from __future__ import annotations
+
+import os
 import re
+import json
+import hashlib
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 
-# High-level buckets as per your slide
-BUCKETS = {
-    "Delay": [
-        r"\bdelay\b", r"\bmanual calc", r"\bmanual calculation", r"\bpostal\b",
-        r"\b2(nd|nd)? review\b", r"\btimescale", r"\bslow\b", r"\blate\b",
+# ------- OpenAI optional import (safe if not installed / no key) -------
+OPENAI_READY = False
+_openai_client = None
+_openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+try:
+    # Streamlit secrets (optional). Don't fail if streamlit not present.
+    try:
+        import streamlit as st  # type: ignore
+        _OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
+    except Exception:
+        _OPENAI_API_KEY = None
+
+    # Env fallback
+    if not _OPENAI_API_KEY:
+        _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY") or os.getenv("OPENAI_KEY")
+
+    if _OPENAI_API_KEY:
+        from openai import OpenAI  # type: ignore
+        _openai_client = OpenAI(api_key=_OPENAI_API_KEY)
+        OPENAI_READY = True
+except Exception:
+    OPENAI_READY = False
+    _openai_client = None
+
+# ------------------ Category taxonomy (+ keywords) ------------------
+# Keep taxonomy broad + actionable. These are intentionally inclusive.
+_CATEGORIES: Dict[str, List[str]] = {
+    "Communication / update": [
+        r"update", r"chase", r"follow[- ]?up", r"await", r"waiting", r"no response",
+        r"respond(ed|ing)?", r"email", r"call(ed|ing)?", r"letter", r"advise", r"inform"
     ],
-    "Procedure": [
-        r"\bscheme rules?\b", r"\brule\b", r"\bstandard timescale\b", r"\bSLA\b",
-        r"\bprocess\b", r"\bprocedure\b",
+    "Data entry / setup": [
+        r"data (entry|issue|error)", r"setup", r"set[- ]?up", r"record(s)?", r"index", r"scan",
+        r"document(ation)?", r"upload", r"capture", r"input"
     ],
-    "Communication": [
-        r"\bletter\b", r"\bcommunication\b", r"\bnot (informed|told|clear)",
-        r"\bno reply\b", r"\bno response\b", r"\bupdate\b",
+    "Bank / payment": [
+        r"payment", r"bank", r"bacs", r"faster payment", r"cheque", r"refund", r"overpayment",
+        r"underpayment", r"remit", r"remittance"
+    ],
+    "Trustee / AVC": [
+        r"trustee", r"avc", r"additional voluntary", r"additional contribution", r"external provider"
+    ],
+    "Postal / dispatch": [
+        r"post(al)?", r"dispatch", r"mail(ed|ing)?", r"courier", r"deliver(y|ed)"
+    ],
+    "Manual calculation": [
+        r"manual (calc|calculation|workaround)", r"hand[- ]?calc", r"complex", r"bespoke"
     ],
     "System": [
-        r"\bsystem\b", r"\bit issue\b", r"\bworkflow\b", r"\bplatform\b",
-        r"\bbug\b", r"\berror\b",
+        r"system (issue|error|down)", r"access", r"permission", r"it ticket", r"bug", r"crash"
     ],
-    "Incorrect/Incomplete information": [
-        r"\bincorrect\b", r"\bwrong\b", r"\bincomplete\b", r"\bmissing\b",
-        r"\bnot provided\b", r"\bno evidence\b",
+    "Case not created": [
+        r"case not created", r"no case", r"missing case"
+    ],
+    "Death benefits payout": [
+        r"death benefit", r"bereave(d|ment)", r"executor", r"probate"
+    ],
+    "Waiting on member/TPA": [
+        r"waiting on (member|tpa|third party)", r"await(ing)? member", r"await(ing)? tpa"
     ],
 }
 
-# Sub-reasons from the slide (used only when we can be sure)
-SUBREASONS = {
-    "Delay Manual calculation": [r"\bmanual calc(ulation)?\b"],
-    "Aptia standard Timescale": [r"\bstandard timescale\b", r"\btimescale\b", r"\bSLA\b"],
-    "Delay Pension set up": [r"\bpension set up\b", r"\bsetup\b"],
-    "Delay Postal Delay": [r"\bpostal\b", r"\bpost\b", r"\bmail\b"],
-    "Delay – AVC": [r"\bAVC\b"],
-    "Delay Requirement not checked": [r"\brequirement not checked\b", r"\bnot checked\b"],
-    "Delay Case not created": [r"\bcase not created\b"],
-    "Delay 2nd Review": [r"\b2(nd)? review\b", r"\bsecond review\b"],
-    "Delay – Trustee": [r"\btrustee\b"],
-    "Scheme Rules": [r"\bscheme rules?\b"],
-    "Drop in value/ factor change": [r"\bfactor change\b", r"\bdrop in value\b"],
-    "Death benefits payout": [r"\bdeath benefit(s)?\b"],
-    "Overpayment": [r"\boverpayment\b"],
-    "Pension Increase": [r"\bpension increase\b"],
-    "Transfer Documentation": [r"\btransfer doc(umentation)?\b"],
-}
+# join into compiled regex
+_COMPILED = {k: re.compile("|".join(v), re.I) for k, v in _CATEGORIES.items()}
 
-def _first_match(text: str, patterns: list[str]) -> bool:
-    for pat in patterns:
-        if re.search(pat, text, flags=re.I):
-            return True
-    return False
+def _keyword_match(text: str) -> str:
+    """Simple semantic-ish keyword pass. Returns first category hit."""
+    if not isinstance(text, str) or not text.strip():
+        return "Other"
+    t = text.strip()
+    for cat, rx in _COMPILED.items():
+        if rx.search(t):
+            return cat
+    return "Other"
 
-def label_reasons(df: pd.DataFrame, text_col: str) -> pd.DataFrame:
+def _hashable_id(text: str) -> str:
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:12]
+
+def _gpt_refine(comments: List[str], seed_labels: List[str]) -> List[str]:
     """
-    Returns df with two new columns:
-      - reason_bucket
-      - reason_detail (best sub-reason where confidently matched)
-    Unmatched → reason_bucket='Other', reason_detail=None
+    Ask GPT to refine the 'Other' labels into the taxonomy above.
+    Returns a list of final labels aligned with comments order.
     """
-    out = df.copy()
-    text = out[text_col].fillna("").astype(str)
+    if not OPENAI_READY or _openai_client is None or not comments:
+        return seed_labels
 
-    # bucket
-    buckets = []
-    for t in text:
-        t2 = t.lower()
-        assigned = None
-        for bucket, pats in BUCKETS.items():
-            if _first_match(t2, pats):
-                assigned = bucket
-                break
-        buckets.append(assigned or "Other")
-    out["reason_bucket"] = buckets
+    # Build concise instruction with categories.
+    cats = list(_CATEGORIES.keys())
+    sys_msg = (
+        "You are an assistant that classifies short case comments into exactly one of the given categories. "
+        "Return an array of JSON objects with fields: idx (int), reason (string chosen from categories). "
+        "Be decisive; never return 'Other' if a category plausibly fits.\n\n"
+        f"Categories: {cats}\n"
+    )
 
-    # sub-reason
-    details = []
-    for t in text:
-        t2 = t.lower()
-        chosen = None
-        for label, pats in SUBREASONS.items():
-            if _first_match(t2, pats):
-                chosen = label
-                break
-        details.append(chosen)
-    out["reason_detail"] = details
+    # Minimize tokens. Send compact examples.
+    items = [{"idx": i, "comment": c} for i, c in enumerate(comments)]
+    user_msg = "Classify these:\n" + json.dumps(items, ensure_ascii=False)
 
-    return out
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=_openai_model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+        )
+        txt = resp.choices[0].message.content or "[]"
+        parsed = json.loads(txt)
+        out = seed_labels[:]
+        for row in parsed:
+            i = int(row.get("idx", -1))
+            r = str(row.get("reason", "")).strip()
+            if 0 <= i < len(out) and r:
+                # Keep only valid known categories
+                out[i] = r if r in _CATEGORIES else out[i]
+        return out
+    except Exception:
+        # Any issue: fall back silently to seed labels
+        return seed_labels
 
-def summarize_reasons(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def classify_comments(series: pd.Series, use_openai: Optional[bool] = None,
+                      sample_cap: int = 220) -> pd.Series:
     """
-    Returns (bucket_summary, detail_summary) with counts and %.
+    Main entry: classify a pandas Series of comment strings -> Series of final categories.
+    1) Keyword/semantic pass
+    2) (optional) GPT pass to refine only 'Other' rows (up to sample_cap to keep usage bounded)
     """
-    if df.empty:
-        return (pd.DataFrame(columns=["reason_bucket","count","pct"]),
-                pd.DataFrame(columns=["reason_detail","count","pct"]))
+    if series is None or series.empty:
+        return pd.Series([], dtype="object")
 
-    bucket = (df["reason_bucket"]
-              .value_counts(dropna=False)
-              .rename_axis("reason_bucket")
-              .reset_index(name="count"))
-    bucket["pct"] = (bucket["count"] / bucket["count"].sum() * 100).round(1)
+    # 1) keyword pass
+    seed = series.astype(str).map(_keyword_match)
 
-    details = (df.dropna(subset=["reason_detail"])
-                 .groupby("reason_detail", dropna=False)
-                 .size()
-                 .reset_index(name="count")
-                 .sort_values("count", ascending=False))
-    if not details.empty:
-        details["pct"] = (details["count"] / details["count"].sum() * 100).round(1)
-    else:
-        details = pd.DataFrame(columns=["reason_detail","count","pct"])
+    # Decide GPT usage
+    do_gpt = OPENAI_READY if use_openai is None else bool(use_openai)
+    if not do_gpt:
+        return seed
 
-    return bucket, details
+    # 2) refine only Others (sample to bound cost)
+    idx_other = seed[seed.eq("Other")].index.tolist()
+    if not idx_other:
+        return seed
+
+    if len(idx_other) > sample_cap:
+        idx_other = idx_other[:sample_cap]
+
+    refined_labels = _gpt_refine(series.loc[idx_other].tolist(), ["Other"] * len(idx_other))
+    if refined_labels:
+        seed.loc[idx_other] = refined_labels
+
+    return seed
