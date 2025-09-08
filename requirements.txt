@@ -4,7 +4,7 @@ python-dateutil
 openpyxl
 rapidfuzz==3.9.6
 scikit-learn
-streamlit
+streamlit>=1.22.0
 plotly
 PyYAML>=6.0.2
 matplotlib
