@@ -29,6 +29,8 @@ _RCA1_BARS = [
 # Smooth cumulative line (soft green/teal)
 _RCA1_CUM_LINE = "#74C69D"
 
+JAN_2025 = pd.Period("2025-01")
+
 # ======================
 # Data loading
 # ======================
@@ -45,6 +47,7 @@ def _find_fpa_workbook() -> Optional[Path]:
     return None
 
 def _read_excel_any(path: Path) -> pd.DataFrame:
+    # try default engine then fall back; this is wrapped by a cache below
     try:
         return pd.read_excel(path)
     except Exception:
@@ -61,11 +64,23 @@ def _coerce_month(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.to_period("M")
 
+def _workbook_cache_key(p: Path) -> str:
+    try:
+        return f"{p.resolve()}::{p.stat().st_mtime_ns}"
+    except Exception:
+        return str(p)
+
+@st.cache_data(show_spinner=False)
+def _read_fpa_cached(path_str: str, path_key: str) -> pd.DataFrame:
+    # Cache the raw read; invalidates when the file changes (via path_key)
+    return _read_excel_any(Path(path_str))
+
 def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     p = _find_fpa_workbook()
     if not p:
         raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
-    df = _read_excel_any(p)
+
+    df = _read_fpa_cached(str(p), _workbook_cache_key(p))
 
     # --- EXPANDED CANDIDATES (adds Administrator→individual, Team manager→team, more location variants) ---
     col_map = {
@@ -76,12 +91,9 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "comment": _pick(df, ["Case Comment", "Comments", "Reviewer Comment", "Comment"]),
         "rca2": _pick(df, ["RCA2", "Root Cause 2", "RCA 2"]),
         # potential comparison fields (optional; detected later)
-        # Team manager → team (keep previous candidates too)
         "team": _pick(df, ["Team manager", "Team Manager", "Manager", "Team", "Assign To Team", "Department", "TeamManager"]),
         "work_type": _pick(df, ["Work Type", "WorkType", "Activity Type"]),
-        # Administrator → individual (keep previous candidates too)
         "individual": _pick(df, ["Administrator", "Reviewer", "User", "Owner", "Analyst"]),
-        # broaden location
         "location": _pick(df, ["Location", "Region", "Site", "Office", "Branch"]),
     }
 
@@ -90,29 +102,31 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         raise KeyError(f"Missing required columns for FPA: {missing}")
 
     df = df.rename(columns={v: k for k, v in col_map.items() if v})
+    # Vectorized parse once
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    # Precompute month + pass flag ONCE; reused everywhere
+    df["_m"] = df["date"].dt.to_period("M")
+    # robust pass flag (no python loops)
+    res = df["result"].astype(str).str.strip().str.lower()
+    df["is_pass"] = res.str.startswith("pass")
+    # compact memory for heavy dims
+    for opt in ("portfolio", "team", "individual", "location"):
+        if opt in df.columns:
+            df[opt] = df[opt].astype("category")
     return df, col_map
 
 # ======================
 # Pass% and tables
 # ======================
-def _is_pass(x: str) -> bool:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return False
-    t = str(x).strip().lower()
-    return t.startswith("pass")
-
 def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
-    s = _coerce_month(df["date"])
-    df = df.assign(_m=s)
     if df["_m"].dropna().empty:
         return pd.DataFrame(columns=["month", "pass_pct"])
-    start = pd.Period("2025-01")
+    start = JAN_2025
     end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
-    g = df.groupby("_m")["result"].agg(
-        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
-    ).reindex(months, fill_value=0)
+    g = (df.groupby("_m")
+           .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
+           .reindex(months, fill_value=0))
     pct = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0.0).round(0)
     label = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
     return pd.DataFrame({"month": label, "pass_pct": pct.values})
@@ -121,19 +135,17 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
     """
     Portfolio (rows) × Month (columns) FPA% from Jan-25 to latest.
     """
-    df = df.copy()
-    df["_m"] = _coerce_month(df["date"])
     if df["_m"].dropna().empty:
         return pd.DataFrame()
 
-    start = pd.Period("2025-01")
+    start = JAN_2025
     end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
 
-    grp = df.groupby(["portfolio", "_m"])["result"].agg(
-        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
-    ).reset_index()
-    grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"]).round(0)
+    grp = (df.groupby(["portfolio", "_m"])
+             .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
+             .reset_index())
+    grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"].replace(0, np.nan)).fillna(0).round(0)
 
     piv = grp.pivot(index="portfolio", columns="_m", values="pass_%").reindex(columns=months)
     piv.columns = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in piv.columns]
@@ -141,51 +153,49 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
     return piv
 
 # ======================
-# Reason labelling helpers
+# Reason labelling helpers  (cached)
 # ======================
-def _label_all(df: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def _label_all_cached_for_2025(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Label ALL failed rows across all months with a 'reason' column.
+    Label ALL failed rows for 2025+ with a 'reason' column (cached).
     """
     from core.reason_labeller import label_dataframe
-    df = df.copy()
-    df["_m"] = _coerce_month(df["date"])
-    fails = df[~df["result"].apply(_is_pass)].copy()
+    df = df_raw.copy()
+    # keep 2025+ only to avoid work on older months (UI is 2025-focused)
+    fails = df[(df["_m"] >= JAN_2025) & (~df["is_pass"])].copy()
     if fails.empty:
         return pd.DataFrame(columns=list(df.columns) + ["reason"])
     lab_df = pd.DataFrame({
-        "Case Comment": fails["comment"].fillna("").astype(str),
+        "Case Comment": fails["comment"].fillna("").astype(str) if "comment" in fails.columns else "",
         "RCA2": (fails["rca2"].fillna("").astype(str) if "rca2" in fails.columns else "")
     })
     fails["reason"] = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2")\
         .fillna("Other").astype(str)
     return fails
 
-def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
+def _label_all(df: pd.DataFrame) -> pd.DataFrame:
+    # proxy that hits the cache
+    return _label_all_cached_for_2025(df)
+
+def _label_all_latest(df: pd.DataFrame, fails_precomputed: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, pd.Period]:
     """
     Latest-month aggregation for the Pareto chart.
+    If pre-labeled fails are provided, reuse them (avoids double labelling).
     """
-    from core.reason_labeller import label_dataframe
-
-    df = df.assign(_m=_coerce_month(df["date"]))
+    if "_m" not in df.columns:
+        df = df.assign(_m=_coerce_month(df["date"]))
     latest = df["_m"].max()
     if pd.isna(latest):
-        return pd.DataFrame(), latest
-
-    fails = df[(df["_m"] == latest) & (~df["result"].apply(_is_pass))].copy()
-    if fails.empty:
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
 
-    lab_df = pd.DataFrame({
-        "Case Comment": fails["comment"].fillna("").astype(str),
-        "RCA2": (fails["rca2"].fillna("").astype(str) if "rca2" in fails.columns else "")
-    })
-    labels = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2")\
-        .fillna("Other").astype(str)
+    fails = fails_precomputed if fails_precomputed is not None else _label_all(df)
+    fails_latest = fails[fails["_m"] == latest].copy()
+    if fails_latest.empty:
+        return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
 
-    vc = labels.value_counts().rename_axis("reason").reset_index(name="count")
+    vc = fails_latest["reason"].value_counts().rename_axis("reason").reset_index(name="count")
     vc = vc.sort_values("count", ascending=False).reset_index(drop=True)
-
     total = int(vc["count"].sum()) or 1
     vc["percent"] = (vc["count"] * 100.0 / total)
     vc["cum_percent"] = vc["percent"].cumsum().clip(upper=100.0)
@@ -203,13 +213,11 @@ def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     if fails.empty:
         return pd.DataFrame()
 
-    # Limit to 2025 only
-    start_2025 = pd.Period("2025-01")
-    fails_2025 = fails[fails["_m"] >= start_2025].copy()
+    fails_2025 = fails[fails["_m"] >= JAN_2025].copy()
     if fails_2025.empty:
         return pd.DataFrame()
 
-    months = pd.period_range(start_2025, fails_2025["_m"].max(), freq="M")
+    months = pd.period_range(JAN_2025, fails_2025["_m"].max(), freq="M")
     month_labels = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
 
     g = fails_2025.groupby(["portfolio", "reason", "_m"]).size().reset_index(name="count")
@@ -236,11 +244,9 @@ def _safe_int(x) -> int:
 
 def _portfolio_pass_table(df: pd.DataFrame) -> pd.DataFrame:
     # helper for insights calcs: portfolio × month with pass %
-    df = df.copy()
-    df["_m"] = _coerce_month(df["date"])
-    grp = df.groupby(["portfolio", "_m"])["result"].agg(
-        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
-    ).reset_index()
+    grp = (df.groupby(["portfolio", "_m"])
+             .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
+             .reset_index())
     grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"].replace(0, np.nan)).fillna(0).round(0)
     return grp
 
@@ -249,14 +255,11 @@ def _get_prev_period(periods: List[pd.Period], latest: pd.Period) -> Optional[pd
     return prevs[-1] if prevs else None
 
 def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> List[str]:
-    # (unchanged – existing logic preserved)
     overall_series = mom["pass_pct"].astype(float)
     last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
     prev_val = overall_series.iloc[-2] if len(overall_series) >= 2 else np.nan
     delta = (last_val - prev_val) if not (np.isnan(last_val) or np.isnan(prev_val)) else np.nan
 
-    df_raw = df_raw.copy()
-    df_raw["_m"] = _coerce_month(df_raw["date"])
     periods = sorted(df_raw["_m"].dropna().unique().tolist())
     latest = periods[-1] if periods else None
     prev = _get_prev_period(periods, latest) if latest else None
@@ -338,10 +341,10 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
     return bullets
 
 def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> Optional[List[str]]:
-    # (unchanged)
+    # unchanged logic; kept here, minor refactor not needed
     try:
         df_tmp = df_raw.copy()
-        df_tmp["_m"] = _coerce_month(df_tmp["date"])
+        df_tmp["_m"] = df_tmp["_m"]  # already computed
         latest = df_tmp["_m"].max()
         prevs = sorted(df_tmp["_m"].dropna().unique().tolist())
         prev = prevs[-2] if len(prevs) >= 2 else None
@@ -476,18 +479,16 @@ def _available_dim(df: pd.DataFrame, logical_name: str, col_map: Dict[str, str])
     return logical_name if logical_name in df.columns else None
 
 def _pass_mom_by_dim(df: pd.DataFrame, dim_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    dfx = df.copy()
-    dfx["_m"] = _coerce_month(dfx["date"])
-    start = pd.Period("2025-01")
-    if dfx["_m"].dropna().empty:
+    if df["_m"].dropna().empty:
         return pd.DataFrame(), pd.DataFrame()
-    end = dfx["_m"].max()
+    start = JAN_2025
+    end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
     lab = [m.to_timestamp().strftime("%b-%y") for m in months]
 
-    g = dfx.groupby([dim_col, "_m"])["result"].agg(
-        total="count", passed=lambda x: np.sum([_is_pass(v) for v in x])
-    ).reset_index()
+    g = (df.groupby([dim_col, "_m"])
+           .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
+           .reset_index())
     g["pass_%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0).round(0)
 
     piv = g.pivot(index=dim_col, columns="_m", values="pass_%").reindex(columns=months)
@@ -514,9 +515,8 @@ def _mini_bar_latest(latest_tab: pd.DataFrame, title: str):
     ax.set_title(title, color=_DARK_BLUE)
     st.pyplot(fig)
 
-# ------------- NEW HELPERS: Complaints & Accuracy (joins + plotting) ----------------
+# ------------- Complaints & Accuracy (joins + plotting) ----------------
 def _build_month_any(s: pd.Series, assume_year_if_name_is_month: bool = False) -> pd.Series:
-    """Coerce a series to Month period; support text month names."""
     if s is None:
         return pd.Series(dtype="period[M]")
     if assume_year_if_name_is_month:
@@ -528,21 +528,17 @@ def _build_month_any(s: pd.Series, assume_year_if_name_is_month: bool = False) -
     return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M")
 
 def _complaints_cases_series_2025(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
-    """Return Jan–latest 2025: month label + complaints/1000 (overall across portfolios)."""
     if cases is None or comp is None or cases.empty or comp.empty:
         return pd.DataFrame(columns=["month", "per_1000"])
 
-    # Detect columns
     cases_date = _pick(cases, ["Create Date (cases)", "Create Date", "Create date", "Start Date", "StartDate", "Created On", "CreateDt"])
     comp_date = _pick(comp, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Complaint Date", "Received Date", "Month"])
     if cases_date is None or comp_date is None:
         return pd.DataFrame(columns=["month", "per_1000"])
 
-    # Build months (complaints "Month" might be just names)
     cases_m = _build_month_any(cases[cases_date])
     comp_m = _build_month_any(comp[comp_date], assume_year_if_name_is_month=(comp_date.lower()=="month"))
 
-    # Restrict to 2025
     mask_cases = (cases_m.dt.year == 2025)
     mask_comp = (comp_m.dt.year == 2025)
     cases = cases.loc[mask_cases].copy()
@@ -553,7 +549,7 @@ def _complaints_cases_series_2025(cases: pd.DataFrame, comp: pd.DataFrame) -> pd
     if cases.empty:
         return pd.DataFrame(columns=["month", "per_1000"])
 
-    months = pd.period_range(pd.Period("2025-01"), max(cases["_m"].max(), comp["_m"].max() if not comp.empty else pd.Period("2025-01")), freq="M")
+    months = pd.period_range(JAN_2025, max(cases["_m"].max(), comp["_m"].max() if not comp.empty else JAN_2025), freq="M")
     cs = cases.groupby("_m").size().reindex(months, fill_value=0)
     cp = comp.groupby("_m").size().reindex(months, fill_value=0)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -562,7 +558,6 @@ def _complaints_cases_series_2025(cases: pd.DataFrame, comp: pd.DataFrame) -> pd
     return pd.DataFrame({"month": lab, "per_1000": per.round(1).values})
 
 def _merge_complaints_fpa_for_chart(m_comp: pd.DataFrame, m_fpa: pd.DataFrame) -> pd.DataFrame:
-    """Join the MoM complaints/1000 and pass% by month label."""
     if m_comp.empty and m_fpa.empty:
         return pd.DataFrame(columns=["month", "complaints_per_1000", "pass_pct"])
     df = pd.merge(
@@ -577,16 +572,13 @@ def _merge_complaints_fpa_for_chart(m_comp: pd.DataFrame, m_fpa: pd.DataFrame) -
     return df
 
 def _fig_complaints_accuracy(df: pd.DataFrame):
-    """Dual soft-pastel lines: Complaints/1000 and Pass% (no borders/grid/y-axis; soft grey x-axis)."""
     fig, ax = plt.subplots(figsize=(8.4, 3.6))
     ax.plot(df["month"], df["complaints_per_1000"], linewidth=2.8, marker=None, color=_PASTEL_LINE, label="Complaints / 1000")
     ax.plot(df["month"], df["pass_pct"], linewidth=2.8, marker=None, color=_PASTEL_LINE_2, label="Pass %")
-    # Labels above points (sparse to avoid clutter)
     for x, y in zip(df["month"], df["complaints_per_1000"]):
         ax.text(x, y + max(0.05, 0.02*y), f"{y:.1f}", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
     for x, y in zip(df["month"], df["pass_pct"]):
         ax.text(x, y + 1.2, f"{y:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
-    # Cosmetics
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY)
@@ -609,21 +601,19 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         st.error(f"FPA file found, but a required column is missing: {e}")
         return ("", pd.DataFrame())
 
-    # Overview computations
+    # Overview computations (cached via vectorization)
     mom = _series_mom(df_raw)
     if mom.empty:
         st.info("No First-Pass Accuracy rows found from Jan-25 onward.")
         return ("", pd.DataFrame())
 
-    df_raw = df_raw.assign(_m=_coerce_month(pd.to_datetime(df_raw["date"], errors="coerce", dayfirst=True)))
     latest = df_raw["_m"].max()
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
     st.sidebar.header("Filters (2025) — Fail reasons")
-    fails_all = _label_all(df_raw)
+    fails_all = _label_all(df_raw)  # cached + 2025+ only
     if not fails_all.empty:
-        start_2025 = pd.Period("2025-01")
-        fails_2025 = fails_all[fails_all["_m"] >= start_2025].copy()
+        fails_2025 = fails_all[fails_all["_m"] >= JAN_2025].copy()
         all_reasons = sorted(fails_2025["reason"].unique().tolist())
         all_portfolios = sorted(fails_2025["portfolio"].dropna().unique().tolist())
     else:
@@ -634,7 +624,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     # Tabs ------------- (THIRD TAB WILL GET A LOCAL PORTFOLIO FILTER)
     tab_overview, tab_comparisons, tab_comp_acc = st.tabs(["Overview", "Comparisons", "Complaints and Accuracy"])
 
-    # ---------------- Overview (unchanged) ----------------
+    # ---------------- Overview ----------------
     with tab_overview:
         _render_insights(mom, df_raw, fails_all)
 
@@ -649,7 +639,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if not piv_portfolio_mom.empty:
                 st.dataframe(piv_portfolio_mom, use_container_width=True)
 
-        reasons_latest, lastp = _label_all_latest(df_raw)
+        reasons_latest, lastp = _label_all_latest(df_raw, fails_precomputed=fails_all)
         matrix_2025 = _pivot_fail_matrix(fails_all)
 
         st.markdown(
@@ -676,7 +666,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Comparisons (unchanged from your working build) =====================
+    # ===================== Comparisons (unchanged behaviour) =====================
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
@@ -687,15 +677,14 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
         def _overall_latest_pass_pct(df_sel: pd.DataFrame) -> Optional[float]:
             dfx = df_sel.copy()
-            dfx["_m"] = _coerce_month(dfx["date"])
             if dfx["_m"].dropna().empty:
                 return None
             latest_local = dfx["_m"].max()
-            sub = dfx[dfx["_m"] == latest_local]["result"]
-            total = len(sub)
+            sub = dfx[dfx["_m"] == latest_local]["is_pass"]
+            total = int(sub.size)
             if total == 0:
                 return None
-            passed = int(np.sum([_is_pass(v) for v in sub]))
+            passed = int(sub.sum())
             return round(passed * 100.0 / total, 0)
 
         def _bar_with_avg(latest_tab: pd.DataFrame, title: str, overall_pct: Optional[float]):
@@ -841,7 +830,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         else:
             st.info("Portfolio column not present in data.")
 
-    # ===================== NEW TAB: Complaints and Accuracy (with LOCAL PORTFOLIO FILTER) =====================
+    # ===================== Complaints and Accuracy (unchanged behaviour) =====================
     with tab_comp_acc:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Complaints and Accuracy — Jan to latest 2025</h4>", unsafe_allow_html=True)
 
@@ -851,7 +840,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if cases is None or complaints is None or cases.empty or complaints.empty:
             st.info("Cases and/or Complaints data not found in the app store. This tab uses `store['cases']` and `store['complaints']`.")
         else:
-            # ---------- NEW: Local Portfolio filter (applies to BOTH lines and the table) ----------
             cases_port = _pick(cases, ["Portfolio", "portfolio"])
             comp_port = _pick(complaints, ["Portfolio", "portfolio"])
             fpa_port = "portfolio" if "portfolio" in df_raw.columns else None
@@ -884,9 +872,8 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                 if fpa_port:
                     df_fpa_f = df_fpa_f[df_fpa_f[fpa_port].astype(str).isin(sel_ports_local)]
 
-            # Build monthly series from filtered subsets
             comp_mom = _complaints_cases_series_2025(cases_f, complaints_f)
-            fpa_mom = _series_mom(df_fpa_f)  # Jan→latest 2025 for the selected portfolios
+            fpa_mom = _series_mom(df_fpa_f)
             merged = _merge_complaints_fpa_for_chart(comp_mom, fpa_mom)
 
             c1, c2 = st.columns((1.2, 1.0), gap="large")
