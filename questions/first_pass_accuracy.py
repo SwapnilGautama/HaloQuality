@@ -19,6 +19,7 @@ _SOFT_GREY = "#E0E0E0"   # softer axis baseline
 
 # Pastel palette for the FPA line
 _PASTEL_LINE = "#8ECAE6"
+_PASTEL_LINE_2 = "#A1D99B"  # soft green for the second line
 
 # RCA1-like pastel bar palette (soft blues/greens/greys/oranges)
 _RCA1_BARS = [
@@ -513,6 +514,88 @@ def _mini_bar_latest(latest_tab: pd.DataFrame, title: str):
     ax.set_title(title, color=_DARK_BLUE)
     st.pyplot(fig)
 
+# ------------- NEW HELPERS: Complaints & Accuracy (joins + plotting) ----------------
+def _build_month_any(s: pd.Series, assume_year_if_name_is_month: bool = False) -> pd.Series:
+    """Coerce a series to Month period; support text month names."""
+    if s is None:
+        return pd.Series(dtype="period[M]")
+    if assume_year_if_name_is_month:
+        try:
+            coerced = pd.to_datetime(s.astype(str) + " 2025", format="%B %Y", errors="coerce")
+        except Exception:
+            coerced = pd.to_datetime(s.astype(str) + " 2025", errors="coerce")
+        return coerced.dt.to_period("M")
+    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M")
+
+def _complaints_cases_series_2025(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
+    """Return Jan–latest 2025: month label + complaints/1000 (overall across portfolios)."""
+    if cases is None or comp is None or cases.empty or comp.empty:
+        return pd.DataFrame(columns=["month", "per_1000"])
+
+    # Detect columns
+    cases_date = _pick(cases, ["Create Date (cases)", "Create Date", "Create date", "Start Date", "StartDate", "Created On", "CreateDt"])
+    comp_date = _pick(comp, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Complaint Date", "Received Date", "Month"])
+    if cases_date is None or comp_date is None:
+        return pd.DataFrame(columns=["month", "per_1000"])
+
+    # Build months (complaints "Month" might be just names)
+    cases_m = _build_month_any(cases[cases_date])
+    comp_m = _build_month_any(comp[comp_date], assume_year_if_name_is_month=(comp_date.lower()=="month"))
+
+    # Restrict to 2025
+    mask_cases = (cases_m.dt.year == 2025)
+    mask_comp = (comp_m.dt.year == 2025)
+    cases = cases.loc[mask_cases].copy()
+    comp = comp.loc[mask_comp].copy()
+    cases["_m"] = cases_m[mask_cases]
+    comp["_m"] = comp_m[mask_comp]
+
+    if cases.empty:
+        return pd.DataFrame(columns=["month", "per_1000"])
+
+    months = pd.period_range(pd.Period("2025-01"), max(cases["_m"].max(), comp["_m"].max() if not comp.empty else pd.Period("2025-01")), freq="M")
+    cs = cases.groupby("_m").size().reindex(months, fill_value=0)
+    cp = comp.groupby("_m").size().reindex(months, fill_value=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per = (cp * 1000.0 / cs.replace(0, np.nan)).fillna(0.0)
+    lab = [m.to_timestamp().strftime("%b-%y") for m in months]
+    return pd.DataFrame({"month": lab, "per_1000": per.round(1).values})
+
+def _merge_complaints_fpa_for_chart(m_comp: pd.DataFrame, m_fpa: pd.DataFrame) -> pd.DataFrame:
+    """Join the MoM complaints/1000 and pass% by month label."""
+    if m_comp.empty and m_fpa.empty:
+        return pd.DataFrame(columns=["month", "complaints_per_1000", "pass_pct"])
+    df = pd.merge(
+        m_comp.rename(columns={"per_1000": "complaints_per_1000"}),
+        m_fpa.rename(columns={"pass_pct": "pass_pct"}),
+        on="month",
+        how="outer",
+    )
+    df = df.sort_values("month", key=lambda s: pd.to_datetime(s, format="%b-%y"))
+    df["complaints_per_1000"] = df["complaints_per_1000"].fillna(0).astype(float).round(1)
+    df["pass_pct"] = df["pass_pct"].fillna(0).astype(float).round(0)
+    return df
+
+def _fig_complaints_accuracy(df: pd.DataFrame):
+    """Dual soft-pastel lines: Complaints/1000 and Pass% (no borders/grid/y-axis; soft grey x-axis)."""
+    fig, ax = plt.subplots(figsize=(8.4, 3.6))
+    ax.plot(df["month"], df["complaints_per_1000"], linewidth=2.8, marker=None, color=_PASTEL_LINE, label="Complaints / 1000")
+    ax.plot(df["month"], df["pass_pct"], linewidth=2.8, marker=None, color=_PASTEL_LINE_2, label="Pass %")
+    # Labels above points (sparse to avoid clutter)
+    for x, y in zip(df["month"], df["complaints_per_1000"]):
+        ax.text(x, y + max(0.05, 0.02*y), f"{y:.1f}", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
+    for x, y in zip(df["month"], df["pass_pct"]):
+        ax.text(x, y + 1.2, f"{y:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
+    # Cosmetics
+    for sp in ["left", "right", "top"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY)
+    ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False)
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+    ax.legend(frameon=False, loc="upper right")
+    return fig
+
 # ======================
 # Streamlit entry
 # ======================
@@ -548,8 +631,8 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
     sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
 
-    # Tabs
-    tab_overview, tab_comparisons = st.tabs(["Overview", "Comparisons"])
+    # Tabs ------------- (NEW TAB ADDED)
+    tab_overview, tab_comparisons, tab_comp_acc = st.tabs(["Overview", "Comparisons", "Complaints and Accuracy"])
 
     # ---------------- Overview (unchanged) ----------------
     with tab_overview:
@@ -593,7 +676,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Comparisons (UPDATED: spinners + labels + defaults + overall % + avg line) =====================
+    # ===================== Comparisons (unchanged from your working build) =====================
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
@@ -602,7 +685,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         have_individual = "individual" in df_raw.columns
         have_location = "location" in df_raw.columns
 
-        # Local helpers (scoped to Comparisons tab only)
         def _overall_latest_pass_pct(df_sel: pd.DataFrame) -> Optional[float]:
             dfx = df_sel.copy()
             dfx["_m"] = _coerce_month(dfx["date"])
@@ -623,15 +705,12 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             x = np.arange(len(latest_tab))
             vals = latest_tab["pass_%"].values.astype(float)
             bars = ax.bar(x, vals, color="#BFD7EA")
-            # Data labels
             lift = (np.nanmax(vals) if len(vals) else 0) * 0.02 + 1
             for i, b in enumerate(bars):
                 ax.text(b.get_x()+b.get_width()/2, b.get_height()+lift, f"{vals[i]:.0f}%", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-            # Average line
             if overall_pct is not None:
                 ax.axhline(y=overall_pct, linewidth=2.2, color=_PASTEL_LINE)
                 ax.text(len(x)-0.5, overall_pct + 1.5, f"Avg {overall_pct:.0f}%", ha="right", va="bottom", fontsize=9, color=_DARK_GREY)
-            # Cosmetics
             ax.set_xticks(x)
             ax.set_xticklabels(latest_tab.index.tolist(), rotation=90, ha="center", fontsize=8, color=_DARK_GREY)
             for sp in ["left", "right", "top"]:
@@ -642,146 +721,157 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             ax.set_title(title, color=_DARK_BLUE)
             st.pyplot(fig)
 
-        # ---------- Section 1: MANAGERS (local Portfolio filter) ----------
         st.markdown("### Managers")
         if have_team:
-            with st.spinner("Updating managers…"):
-                if have_portfolio:
-                    p_opts = sorted(df_raw["portfolio"].dropna().unique().tolist())
-                    p_default = 0 if p_opts else 0
-                    sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=p_default, key="cmp_mgr_portfolio")
-                    df_mgr = df_raw[df_raw["portfolio"] == sel_p_for_mgr].copy()
+            if have_portfolio:
+                p_opts = sorted(df_raw["portfolio"].dropna().unique().tolist())
+                p_default = 0 if p_opts else 0
+                sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=p_default, key="cmp_mgr_portfolio")
+                df_mgr = df_raw[df_raw["portfolio"] == sel_p_for_mgr].copy()
+            else:
+                st.caption("Portfolio column not found; showing all portfolios for Managers section.")
+                df_mgr = df_raw.copy()
+
+            _, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
+            overall_mgr = _overall_latest_pass_pct(df_mgr)
+            if overall_mgr is not None and not latest_tab_team.empty:
+                latest_tab_team = latest_tab_team.copy(); latest_tab_team.loc["Overall"] = overall_mgr
+
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
+                if not latest_tab_team.empty:
+                    _bar_with_avg(latest_tab_team, f"Team managers — {sel_p_for_mgr if have_portfolio else 'All'} (latest Pass %)", overall_mgr)
                 else:
-                    st.caption("Portfolio column not found; showing all portfolios for Managers section.")
-                    df_mgr = df_raw.copy()
-
-                # Tables and chart
-                _, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
-
-                # Append Overall row
-                overall_mgr = _overall_latest_pass_pct(df_mgr)
-                if overall_mgr is not None and not latest_tab_team.empty:
-                    latest_tab_team = latest_tab_team.copy()
-                    latest_tab_team.loc["Overall"] = overall_mgr
-
-                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-                with col_chart:
-                    if not latest_tab_team.empty:
-                        _bar_with_avg(latest_tab_team, f"Team managers — {sel_p_for_mgr if have_portfolio else 'All'} (latest Pass %)", overall_mgr)
-                    else:
-                        st.info("No latest-month data for selected portfolio.")
-                with col_table:
-                    if not latest_tab_team.empty:
-                        st.dataframe(latest_tab_team.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                    st.info("No latest-month data for selected portfolio.")
+            with col_table:
+                if not latest_tab_team.empty:
+                    st.dataframe(latest_tab_team.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Team manager column not present in data.")
         st.divider()
 
-        # ---------- Section 2: INDIVIDUALS (local Team manager filter; default Divya Dayanidhi) ----------
         st.markdown("### Individuals")
         if have_individual:
-            with st.spinner("Updating individuals…"):
-                if have_team:
-                    mgr_opts = sorted(df_raw["team"].dropna().unique().tolist())
-                    # Default = "Divya Dayanidhi" if present; else all managers
-                    default_mgrs = ["Divya Dayanidhi"] if "Divya Dayanidhi" in mgr_opts else mgr_opts
-                    sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=default_mgrs, key="cmp_ind_managers")
-                    if sel_mgrs_for_ind:
-                        df_ind = df_raw[df_raw["team"].isin(sel_mgrs_for_ind)].copy()
-                    else:
-                        df_ind = df_raw.head(0).copy()  # empty selection -> empty result
+            if have_team:
+                mgr_opts = sorted(df_raw["team"].dropna().unique().tolist())
+                default_mgrs = ["Divya Dayanidhi"] if "Divya Dayanidhi" in mgr_opts else mgr_opts
+                sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=default_mgrs, key="cmp_ind_managers")
+                if sel_mgrs_for_ind:
+                    df_ind = df_raw[df_raw["team"].isin(sel_mgrs_for_ind)].copy()
                 else:
-                    st.caption("Team manager column not found; Individuals section will not filter by manager.")
-                    df_ind = df_raw.copy()
+                    df_ind = df_raw.head(0).copy()
+            else:
+                st.caption("Team manager column not found; Individuals section will not filter by manager.")
+                df_ind = df_raw.copy()
 
-                _, latest_tab_ind = _pass_mom_by_dim(df_ind, "individual")
+            _, latest_tab_ind = _pass_mom_by_dim(df_ind, "individual")
+            overall_ind = _overall_latest_pass_pct(df_ind)
+            if overall_ind is not None and not latest_tab_ind.empty:
+                latest_tab_ind = latest_tab_ind.copy(); latest_tab_ind.loc["Overall"] = overall_ind
 
-                # Append Overall row
-                overall_ind = _overall_latest_pass_pct(df_ind)
-                if overall_ind is not None and not latest_tab_ind.empty:
-                    latest_tab_ind = latest_tab_ind.copy()
-                    latest_tab_ind.loc["Overall"] = overall_ind
-
-                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-                with col_chart:
-                    if not latest_tab_ind.empty:
-                        _bar_with_avg(latest_tab_ind, "Individuals — (latest Pass %)", overall_ind)
-                    else:
-                        st.info("No latest-month data for selected managers.")
-                with col_table:
-                    if not latest_tab_ind.empty:
-                        st.dataframe(latest_tab_ind.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
+                if not latest_tab_ind.empty:
+                    _bar_with_avg(latest_tab_ind, "Individuals — (latest Pass %)", overall_ind)
+                else:
+                    st.info("No latest-month data for selected managers.")
+            with col_table:
+                if not latest_tab_ind.empty:
+                    st.dataframe(latest_tab_ind.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Individuals column not present in data.")
         st.divider()
 
-        # ---------- Section 3: LOCATIONS (local Portfolio filter) ----------
         st.markdown("### Locations")
         if have_location:
-            with st.spinner("Updating locations…"):
-                if have_portfolio:
-                    p_opts_loc = sorted(df_raw["portfolio"].dropna().unique().tolist())
-                    p_default_loc = 0 if p_opts_loc else 0
-                    sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=p_default_loc, key="cmp_loc_portfolio")
-                    df_loc = df_raw[df_raw["portfolio"] == sel_p_for_loc].copy()
+            if have_portfolio:
+                p_opts_loc = sorted(df_raw["portfolio"].dropna().unique().tolist())
+                p_default_loc = 0 if p_opts_loc else 0
+                sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=p_default_loc, key="cmp_loc_portfolio")
+                df_loc = df_raw[df_raw["portfolio"] == sel_p_for_loc].copy()
+            else:
+                st.caption("Portfolio column not found; showing all portfolios for Locations section.")
+                df_loc = df_raw.copy()
+
+            _, latest_tab_loc = _pass_mom_by_dim(df_loc, "location")
+            overall_loc = _overall_latest_pass_pct(df_loc)
+            if overall_loc is not None and not latest_tab_loc.empty:
+                latest_tab_loc = latest_tab_loc.copy(); latest_tab_loc.loc["Overall"] = overall_loc
+
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
+                if not latest_tab_loc.empty:
+                    _bar_with_avg(latest_tab_loc, f"Locations — {sel_p_for_loc if have_portfolio else 'All'} (latest Pass %)", overall_loc)
                 else:
-                    st.caption("Portfolio column not found; showing all portfolios for Locations section.")
-                    df_loc = df_raw.copy()
-
-                _, latest_tab_loc = _pass_mom_by_dim(df_loc, "location")
-
-                # Append Overall row
-                overall_loc = _overall_latest_pass_pct(df_loc)
-                if overall_loc is not None and not latest_tab_loc.empty:
-                    latest_tab_loc = latest_tab_loc.copy()
-                    latest_tab_loc.loc["Overall"] = overall_loc
-
-                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-                with col_chart:
-                    if not latest_tab_loc.empty:
-                        _bar_with_avg(latest_tab_loc, f"Locations — {sel_p_for_loc if have_portfolio else 'All'} (latest Pass %)", overall_loc)
-                    else:
-                        st.info("No latest-month data for selected portfolio.")
-                with col_table:
-                    if not latest_tab_loc.empty:
-                        st.dataframe(latest_tab_loc.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                    st.info("No latest-month data for selected portfolio.")
+            with col_table:
+                if not latest_tab_loc.empty:
+                    st.dataframe(latest_tab_loc.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Location column not present in data.")
         st.divider()
 
-        # ---------- Section 4: PORTFOLIO (local Location filter) ----------
         st.markdown("### Portfolio")
         if have_portfolio:
-            with st.spinner("Updating portfolios…"):
-                if have_location:
-                    loc_opts = sorted(df_raw["location"].dropna().unique().tolist())
-                    sel_loc_for_port = st.multiselect("Location (Portfolio section)", options=loc_opts, default=loc_opts, key="cmp_port_locations")
-                    if sel_loc_for_port:
-                        df_port = df_raw[df_raw["location"].isin(sel_loc_for_port)].copy()
-                    else:
-                        df_port = df_raw.head(0).copy()
+            if have_location:
+                loc_opts = sorted(df_raw["location"].dropna().unique().tolist())
+                sel_loc_for_port = st.multiselect("Location (Portfolio section)", options=loc_opts, default=loc_opts, key="cmp_port_locations")
+                if sel_loc_for_port:
+                    df_port = df_raw[df_raw["location"].isin(sel_loc_for_port)].copy()
                 else:
-                    st.caption("Location column not found; Portfolio section will not filter by location.")
-                    df_port = df_raw.copy()
+                    df_port = df_raw.head(0).copy()
+            else:
+                st.caption("Location column not found; Portfolio section will not filter by location.")
+                df_port = df_raw.copy()
 
-                _, latest_tab_port = _pass_mom_by_dim(df_port, "portfolio")
+            _, latest_tab_port = _pass_mom_by_dim(df_port, "portfolio")
+            overall_port = _overall_latest_pass_pct(df_port)
+            if overall_port is not None and not latest_tab_port.empty:
+                latest_tab_port = latest_tab_port.copy(); latest_tab_port.loc["Overall"] = overall_port
 
-                # Append Overall row
-                overall_port = _overall_latest_pass_pct(df_port)
-                if overall_port is not None and not latest_tab_port.empty:
-                    latest_tab_port = latest_tab_port.copy()
-                    latest_tab_port.loc["Overall"] = overall_port
-
-                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-                with col_chart:
-                    if not latest_tab_port.empty:
-                        _bar_with_avg(latest_tab_port, "Portfolio — (latest Pass %)", overall_port)
-                    else:
-                        st.info("No latest-month data for selected locations.")
-                with col_table:
-                    if not latest_tab_port.empty:
-                        st.dataframe(latest_tab_port.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
+                if not latest_tab_port.empty:
+                    _bar_with_avg(latest_tab_port, "Portfolio — (latest Pass %)", overall_port)
+                else:
+                    st.info("No latest-month data for selected locations.")
+            with col_table:
+                if not latest_tab_port.empty:
+                    st.dataframe(latest_tab_port.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Portfolio column not present in data.")
+
+    # ===================== NEW TAB: Complaints and Accuracy =====================
+    with tab_comp_acc:
+        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Complaints and Accuracy — Jan to latest 2025</h4>", unsafe_allow_html=True)
+
+        cases: pd.DataFrame = store.get("cases", pd.DataFrame())
+        complaints: pd.DataFrame = store.get("complaints", pd.DataFrame())
+
+        if cases is None or complaints is None or cases.empty or complaints.empty:
+            st.info("Cases and/or Complaints data not found in the app store. This tab uses `store['cases']` and `store['complaints']`.")
+        else:
+            # Build monthly series
+            comp_mom = _complaints_cases_series_2025(cases, complaints)
+            fpa_mom = _series_mom(df_raw)  # already Jan→latest 2025
+            merged = _merge_complaints_fpa_for_chart(comp_mom, fpa_mom)
+
+            c1, c2 = st.columns((1.2, 1.0), gap="large")
+            with c1:
+                if not merged.empty:
+                    fig = _fig_complaints_accuracy(merged)
+                    st.pyplot(fig)
+                else:
+                    st.info("No overlapping months available to plot.")
+
+            with c2:
+                if not merged.empty:
+                    tbl = merged.rename(columns={
+                        "complaints_per_1000": "Complaints / 1000",
+                        "pass_pct": "Pass %",
+                    })
+                    st.dataframe(tbl, use_container_width=True)
+                else:
+                    st.info("No data to display in the table.")
 
     return ("", pd.DataFrame())
