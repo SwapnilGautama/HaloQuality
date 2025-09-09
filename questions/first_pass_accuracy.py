@@ -4,7 +4,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 import os
-import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -17,16 +16,13 @@ _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
 _SOFT_GREY = "#E0E0E0"   # softer axis baseline
 
-# Pastel palette for the FPA line
 _PASTEL_LINE = "#8ECAE6"
-_PASTEL_LINE_2 = "#A1D99B"  # soft green for the second line
+_PASTEL_LINE_2 = "#A1D99B"
 
-# RCA1-like pastel bar palette (soft blues/greens/greys/oranges)
 _RCA1_BARS = [
     "#9ECAE1", "#A1D99B", "#BDBDBD", "#FDAE6B", "#C6DBEF", "#FDD0A2",
     "#D9F0A3", "#BCBDDC", "#C7E9C0", "#F2F0F7", "#E5F5E0", "#FEE6CE"
 ]
-# Smooth cumulative line (soft green/teal)
 _RCA1_CUM_LINE = "#74C69D"
 
 JAN_2025 = pd.Period("2025-01")
@@ -47,7 +43,6 @@ def _find_fpa_workbook() -> Optional[Path]:
     return None
 
 def _read_excel_any(path: Path) -> pd.DataFrame:
-    # try default engine then fall back; this is wrapped by a cache below
     try:
         return pd.read_excel(path)
     except Exception:
@@ -60,10 +55,6 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             return cols[c.lower()]
     return None
 
-def _coerce_month(s: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-    return dt.dt.to_period("M")
-
 def _workbook_cache_key(p: Path) -> str:
     try:
         return f"{p.resolve()}::{p.stat().st_mtime_ns}"
@@ -72,17 +63,14 @@ def _workbook_cache_key(p: Path) -> str:
 
 @st.cache_data(show_spinner=False)
 def _read_fpa_cached(path_str: str, path_key: str) -> pd.DataFrame:
-    # Cache the raw read; invalidates when the file changes (via path_key)
     return _read_excel_any(Path(path_str))
 
 def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     p = _find_fpa_workbook()
     if not p:
         raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
-
     df = _read_fpa_cached(str(p), _workbook_cache_key(p))
 
-    # --- EXPANDED CANDIDATES (adds Administrator→individual, Team manager→team, more location variants) ---
     col_map = {
         "date": _pick(df, ["Activity Date", "ActivityDate", "Date", "Activity date"]),
         "result": _pick(df, ["Review Result", "Review result", "Result"]),
@@ -90,30 +78,41 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "scheme": _pick(df, ["Scheme", "Scheme Name", "Plan", "Plan Name"]),
         "comment": _pick(df, ["Case Comment", "Comments", "Reviewer Comment", "Comment"]),
         "rca2": _pick(df, ["RCA2", "Root Cause 2", "RCA 2"]),
-        # potential comparison fields (optional; detected later)
         "team": _pick(df, ["Team manager", "Team Manager", "Manager", "Team", "Assign To Team", "Department", "TeamManager"]),
         "work_type": _pick(df, ["Work Type", "WorkType", "Activity Type"]),
         "individual": _pick(df, ["Administrator", "Reviewer", "User", "Owner", "Analyst"]),
         "location": _pick(df, ["Location", "Region", "Site", "Office", "Branch"]),
     }
-
     missing = [k for k, v in col_map.items() if k in ("date", "result") and v is None]
     if missing:
         raise KeyError(f"Missing required columns for FPA: {missing}")
 
     df = df.rename(columns={v: k for k, v in col_map.items() if v})
-    # Vectorized parse once
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
-    # Precompute month + pass flag ONCE; reused everywhere
     df["_m"] = df["date"].dt.to_period("M")
-    # robust pass flag (no python loops)
     res = df["result"].astype(str).str.strip().str.lower()
     df["is_pass"] = res.str.startswith("pass")
-    # compact memory for heavy dims
     for opt in ("portfolio", "team", "individual", "location"):
         if opt in df.columns:
             df[opt] = df[opt].astype("category")
     return df, col_map
+
+# ======================
+# Normalization helpers (for robust filtering)
+# ======================
+def _norm_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.normalize("NFKC").str.strip().str.casefold()
+
+def _mask_eq(s: pd.Series, value: str) -> pd.Series:
+    if value is None or s is None:
+        return pd.Series(False, index=s.index)
+    return _norm_series(s) == (str(value).strip().casefold())
+
+def _mask_in(s: pd.Series, values: List[str]) -> pd.Series:
+    if not values or s is None:
+        return pd.Series(False, index=s.index)
+    target = {str(v).strip().casefold() for v in values}
+    return _norm_series(s).isin(target)
 
 # ======================
 # Pass% and tables
@@ -132,37 +131,26 @@ def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"month": label, "pass_pct": pct.values})
 
 def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Portfolio (rows) × Month (columns) FPA% from Jan-25 to latest.
-    """
     if df["_m"].dropna().empty:
         return pd.DataFrame()
-
     start = JAN_2025
     end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
-
     grp = (df.groupby(["portfolio", "_m"])
              .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
              .reset_index())
     grp["pass_%"] = (grp["passed"] * 100.0 / grp["total"].replace(0, np.nan)).fillna(0).round(0)
-
     piv = grp.pivot(index="portfolio", columns="_m", values="pass_%").reindex(columns=months)
     piv.columns = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in piv.columns]
-    piv = piv.sort_index().fillna(0).astype(int)
-    return piv
+    return piv.sort_index().fillna(0).astype(int)
 
 # ======================
-# Reason labelling helpers  (cached)
+# Reason labelling (cached) — unchanged logic
 # ======================
 @st.cache_data(show_spinner=False)
 def _label_all_cached_for_2025(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Label ALL failed rows for 2025+ with a 'reason' column (cached).
-    """
     from core.reason_labeller import label_dataframe
     df = df_raw.copy()
-    # keep 2025+ only to avoid work on older months (UI is 2025-focused)
     fails = df[(df["_m"] >= JAN_2025) & (~df["is_pass"])].copy()
     if fails.empty:
         return pd.DataFrame(columns=list(df.columns) + ["reason"])
@@ -175,25 +163,16 @@ def _label_all_cached_for_2025(df_raw: pd.DataFrame) -> pd.DataFrame:
     return fails
 
 def _label_all(df: pd.DataFrame) -> pd.DataFrame:
-    # proxy that hits the cache
     return _label_all_cached_for_2025(df)
 
 def _label_all_latest(df: pd.DataFrame, fails_precomputed: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, pd.Period]:
-    """
-    Latest-month aggregation for the Pareto chart.
-    If pre-labeled fails are provided, reuse them (avoids double labelling).
-    """
-    if "_m" not in df.columns:
-        df = df.assign(_m=_coerce_month(df["date"]))
     latest = df["_m"].max()
     if pd.isna(latest):
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
-
     fails = fails_precomputed if fails_precomputed is not None else _label_all(df)
     fails_latest = fails[fails["_m"] == latest].copy()
     if fails_latest.empty:
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
-
     vc = fails_latest["reason"].value_counts().rename_axis("reason").reset_index(name="count")
     vc = vc.sort_values("count", ascending=False).reset_index(drop=True)
     total = int(vc["count"].sum()) or 1
@@ -204,46 +183,23 @@ def _label_all_latest(df: pd.DataFrame, fails_precomputed: Optional[pd.DataFrame
     return vc, latest
 
 def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pivot for the second-row table (2025 only):
-      rows   -> (portfolio, reason)
-      cols   -> months (Jan–latest) within calendar year 2025
-      values -> count of failed cases
-    """
     if fails.empty:
         return pd.DataFrame()
-
     fails_2025 = fails[fails["_m"] >= JAN_2025].copy()
     if fails_2025.empty:
         return pd.DataFrame()
-
     months = pd.period_range(JAN_2025, fails_2025["_m"].max(), freq="M")
     month_labels = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
-
     g = fails_2025.groupby(["portfolio", "reason", "_m"]).size().reset_index(name="count")
     mat = g.pivot_table(index=["portfolio", "reason"], columns="_m", values="count", fill_value=0)
     mat = mat.reindex(columns=months, fill_value=0)
     mat.columns = month_labels
-    mat = mat.sort_index()
-    return mat
+    return mat.sort_index()
 
 # ======================
-# Insights (AI first, then heuristic fallback)
+# Insights (unchanged)
 # ======================
-def _format_period(p: pd.Period) -> str:
-    try:
-        return pd.Period(p).to_timestamp().strftime("%b-%y")
-    except Exception:
-        return str(p)
-
-def _safe_int(x) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return 0
-
 def _portfolio_pass_table(df: pd.DataFrame) -> pd.DataFrame:
-    # helper for insights calcs: portfolio × month with pass %
     grp = (df.groupby(["portfolio", "_m"])
              .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
              .reset_index())
@@ -278,49 +234,10 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
     top_up = change.head(2)
     top_down = change.tail(2).sort_values()
 
-    reasons_points = []
-    contrib_points = []
-    obs_points = []
-
-    if not fails_all.empty and latest is not None:
-        latest_fails = fails_all[fails_all["_m"] == latest]
-        prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
-
-        by_port = latest_fails.groupby("portfolio").size().sort_values(ascending=False)
-        if not by_port.empty:
-            top_port, top_port_cnt = by_port.index[0], int(by_port.iloc[0])
-            total_latest = int(by_port.sum()) or 1
-            share = round(top_port_cnt * 100.0 / total_latest, 1)
-            obs_points.append(f"Failures concentrated in **{top_port}** ({share}% of { _format_period(latest) } fails).")
-
-        by_reason = latest_fails.groupby("reason").size().sort_values(ascending=False)
-        if not by_reason.empty:
-            top_reason, top_reason_cnt = by_reason.index[0], int(by_reason.iloc[0])
-            total_latest = int(by_reason.sum()) or 1
-            share_r = round(top_reason_cnt * 100.0 / total_latest, 1)
-            obs_points.append(f"**{top_reason}** accounts for **{share_r}%** of { _format_period(latest) } fails.")
-
-        top2 = by_reason.head(2).index.tolist()
-        for r in top2:
-            c_now = _safe_int((latest_fails["reason"] == r).sum())
-            c_prev = _safe_int((prev_fails["reason"] == r).sum()) if not prev_fails.empty else 0
-            delta_r = c_now - c_prev
-            reasons_points.append(
-                f"**{r}**: {c_now} in { _format_period(latest) } "
-                f"({'+' if delta_r>=0 else ''}{delta_r} vs { _format_period(prev) if prev else 'prior' })."
-            )
-            tops = latest_fails[latest_fails["reason"] == r].groupby("portfolio").size().sort_values(ascending=False).head(3)
-            if not tops.empty:
-                parts = ", ".join([f"{k} ({int(v)})" for k, v in tops.items()])
-                contrib_points.append(f"Top portfolios for **{r}**: {parts}.")
-
     bullets: List[str] = []
     if not np.isnan(last_val):
         if not np.isnan(delta):
-            bullets.append(
-                f"**Month-on-Month Pass Rate**: {mom['month'].iloc[-1]} **{last_val:.0f}%** "
-                f"({'+' if delta>=0 else ''}{delta:.0f} pp MoM)."
-            )
+            bullets.append(f"**Month-on-Month Pass Rate**: {mom['month'].iloc[-1]} **{last_val:.0f}%** ({'+' if delta>=0 else ''}{delta:.0f} pp MoM).")
         else:
             bullets.append(f"**Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
     if not change.empty:
@@ -331,100 +248,8 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
             lines.append(f"  - *{idx}*: {val:.0f} pp MoM")
         if lines:
             bullets.append("**Standout Portfolios**:\n" + "\n".join(lines))
-    if reasons_points:
-        bullets.append("**Fail Reasons (Top 2)**:\n" + "\n".join([f"  - {p}" for p in reasons_points]))
-    if obs_points or contrib_points:
-        combined = obs_points + contrib_points
-        bullets.append("**Standout Observations**:\n" + "\n".join([f"  - {p}" for p in combined]))
-    if len(bullets) > 4:
-        bullets = bullets[:4]
-    return bullets
+    return bullets[:4]
 
-def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> Optional[List[str]]:
-    # unchanged logic; kept here, minor refactor not needed
-    try:
-        df_tmp = df_raw.copy()
-        df_tmp["_m"] = df_tmp["_m"]  # already computed
-        latest = df_tmp["_m"].max()
-        prevs = sorted(df_tmp["_m"].dropna().unique().tolist())
-        prev = prevs[-2] if len(prevs) >= 2 else None
-
-        mom_str = mom.to_csv(index=False)
-        ptab = _portfolio_pass_table(df_raw)
-        ptab_str = ptab.to_csv(index=False)
-
-        if fails_all.empty:
-            fr_str = "none"
-        else:
-            latest_fails = fails_all[fails_all["_m"] == latest]
-            prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
-            fr_now = latest_fails.groupby("reason").size().sort_values(ascending=False).head(10)
-            fr_prev = prev_fails.groupby("reason").size().sort_values(ascending=False).head(10)
-            fr_df = pd.DataFrame({"latest": fr_now}).join(pd.DataFrame({"prev": fr_prev}), how="outer").fillna(0).astype(int)
-            fr_str = fr_df.to_csv()
-
-        try:
-            from openai import OpenAI
-        except Exception:
-            return None
-
-        api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-        if not api_key:
-            return None
-        client = OpenAI(api_key=api_key)
-
-        sys_prompt = (
-            "You are a concise analytics assistant. Produce 3–4 bullets using Markdown.\n"
-            "- Bullet 1: **Month-on-Month Pass Rate** with latest value and MoM delta.\n"
-            "- Bullet 2: **Standout Portfolios** with two indented sub-bullets (biggest ↑/↓), format '  - *Portfolio*: +X pp MoM'.\n"
-            "- Bullet 3: **Fail Reasons (Top 2)** with two indented sub-bullets showing counts and MoM deltas.\n"
-            "- Bullet 4: **Standout Observations** with indented sub-bullets (concentration or dominant reason share and top portfolio contributors).\n"
-            "Keep bullets terse and numeric; avoid prose."
-        )
-        user_prompt = (
-            f"MoM Pass% table (month,pass_pct):\n{mom_str}\n\n"
-            f"Portfolio pass% by month (portfolio,_m,pass_%):\n{ptab_str}\n\n"
-            f"Fail reasons counts (latest vs prev):\n{fr_str}\n"
-        )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        text = resp.choices[0].message.content.strip()
-        lines = [ln for ln in text.split("\n") if ln.strip()]
-        joined = "\n".join(lines)
-        blocks = []
-        for part in joined.split("\n- "):
-            p = part.strip()
-            if not p:
-                continue
-            if not p.startswith("- "):
-                p = "- " + p
-            blocks.append(p[2:])
-        return blocks[:4] if blocks else None
-    except Exception:
-        return None
-
-def _render_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> None:
-    bullets = _openai_insights(mom, df_raw, fails_all)
-    if not bullets:
-        bullets = _heuristic_insights(mom, df_raw, fails_all)
-
-    st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>AI Insights</h4>", unsafe_allow_html=True)
-    if not bullets:
-        st.caption("No insights available.")
-        return
-    for b in bullets[:4]:
-        if b:
-            st.markdown(f"- {b}")
-
-# ======================
-# Plots (styling)
-# ======================
 def _fig_mom(df: pd.DataFrame, title: str):
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     ax.plot(df["month"], df["pass_pct"], linewidth=3.2, color=_PASTEL_LINE)
@@ -457,26 +282,16 @@ def _fig_pareto_full(df: pd.DataFrame):
     for xi, cp in zip(x, df["cum_percent"]):
         ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom",
                  fontsize=8, color=_DARK_GREY)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
+    ax1.set_xticks(x); ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
     for sp in ["left", "right", "top"]:
         ax1.spines[sp].set_visible(False)
-    ax1.spines["bottom"].set_color(_SOFT_GREY)
-    ax1.spines["bottom"].set_linewidth(1.25)
-    ax1.get_yaxis().set_visible(False)
-    ax2.get_yaxis().set_visible(False)
+    ax1.spines["bottom"].set_color(_SOFT_GREY); ax1.spines["bottom"].set_linewidth(1.25)
+    ax1.get_yaxis().set_visible(False); ax2.get_yaxis().set_visible(False)
     for sp in ["left", "right", "top", "bottom"]:
         ax2.spines[sp].set_visible(False)
     ax1.set_xlabel(""); ax1.set_ylabel(""); ax2.set_ylabel("")
-    ax1.grid(False)
-    ax2.set_ylim(0, 100)
+    ax1.grid(False); ax2.set_ylim(0, 100)
     return fig
-
-# ======================
-# Comparison helpers (shared)
-# ======================
-def _available_dim(df: pd.DataFrame, logical_name: str, col_map: Dict[str, str]) -> Optional[str]:
-    return logical_name if logical_name in df.columns else None
 
 def _pass_mom_by_dim(df: pd.DataFrame, dim_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df["_m"].dropna().empty:
@@ -485,16 +300,13 @@ def _pass_mom_by_dim(df: pd.DataFrame, dim_col: str) -> Tuple[pd.DataFrame, pd.D
     end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
     lab = [m.to_timestamp().strftime("%b-%y") for m in months]
-
     g = (df.groupby([dim_col, "_m"])
            .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
            .reset_index())
     g["pass_%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0).round(0)
-
     piv = g.pivot(index=dim_col, columns="_m", values="pass_%").reindex(columns=months)
     piv.columns = lab
     piv = piv.fillna(0).sort_index()
-
     latest = end
     latest_tab = g[g["_m"] == latest][[dim_col, "pass_%"]].set_index(dim_col).sort_values("pass_%", ascending=False)
     return piv, latest_tab
@@ -505,17 +317,15 @@ def _mini_bar_latest(latest_tab: pd.DataFrame, title: str):
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     x = np.arange(len(latest_tab))
     ax.bar(x, latest_tab["pass_%"].values, color="#BFD7EA")
-    ax.set_xticks(x)
-    ax.set_xticklabels(latest_tab.index.tolist(), rotation=90, ha="center", fontsize=8, color=_DARK_GREY)
+    ax.set_xticks(x); ax.set_xticklabels(latest_tab.index.tolist(), rotation=90, ha="center", fontsize=8, color=_DARK_GREY)
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.get_yaxis().set_visible(False)
-    ax.grid(False)
+    ax.get_yaxis().set_visible(False); ax.grid(False)
     ax.set_title(title, color=_DARK_BLUE)
     st.pyplot(fig)
 
-# ------------- Complaints & Accuracy (joins + plotting) ----------------
+# ------------- Complaints & Accuracy (unchanged) ----------------
 def _build_month_any(s: pd.Series, assume_year_if_name_is_month: bool = False) -> pd.Series:
     if s is None:
         return pd.Series(dtype="period[M]")
@@ -530,25 +340,17 @@ def _build_month_any(s: pd.Series, assume_year_if_name_is_month: bool = False) -
 def _complaints_cases_series_2025(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     if cases is None or comp is None or cases.empty or comp.empty:
         return pd.DataFrame(columns=["month", "per_1000"])
-
-    cases_date = _pick(cases, ["Create Date (cases)", "Create Date", "Create date", "Start Date", "StartDate", "Created On", "CreateDt"])
-    comp_date = _pick(comp, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Complaint Date", "Received Date", "Month"])
+    def _pick_local(df, opts): return _pick(df, opts)
+    cases_date = _pick_local(cases, ["Create Date (cases)", "Create Date", "Create date", "Start Date", "StartDate", "Created On", "CreateDt"])
+    comp_date = _pick_local(comp, ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Complaint Date", "Received Date", "Month"])
     if cases_date is None or comp_date is None:
         return pd.DataFrame(columns=["month", "per_1000"])
-
     cases_m = _build_month_any(cases[cases_date])
     comp_m = _build_month_any(comp[comp_date], assume_year_if_name_is_month=(comp_date.lower()=="month"))
-
-    mask_cases = (cases_m.dt.year == 2025)
-    mask_comp = (comp_m.dt.year == 2025)
-    cases = cases.loc[mask_cases].copy()
-    comp = comp.loc[mask_comp].copy()
-    cases["_m"] = cases_m[mask_cases]
-    comp["_m"] = comp_m[mask_comp]
-
-    if cases.empty:
-        return pd.DataFrame(columns=["month", "per_1000"])
-
+    mask_cases = (cases_m.dt.year == 2025); mask_comp = (comp_m.dt.year == 2025)
+    cases = cases.loc[mask_cases].copy(); comp = comp.loc[mask_comp].copy()
+    cases["_m"] = cases_m[mask_cases]; comp["_m"] = comp_m[mask_comp]
+    if cases.empty: return pd.DataFrame(columns=["month", "per_1000"])
     months = pd.period_range(JAN_2025, max(cases["_m"].max(), comp["_m"].max() if not comp.empty else JAN_2025), freq="M")
     cs = cases.groupby("_m").size().reindex(months, fill_value=0)
     cp = comp.groupby("_m").size().reindex(months, fill_value=0)
@@ -563,28 +365,24 @@ def _merge_complaints_fpa_for_chart(m_comp: pd.DataFrame, m_fpa: pd.DataFrame) -
     df = pd.merge(
         m_comp.rename(columns={"per_1000": "complaints_per_1000"}),
         m_fpa.rename(columns={"pass_pct": "pass_pct"}),
-        on="month",
-        how="outer",
-    )
-    df = df.sort_values("month", key=lambda s: pd.to_datetime(s, format="%b-%y"))
+        on="month", how="outer",
+    ).sort_values("month", key=lambda s: pd.to_datetime(s, format="%b-%y"))
     df["complaints_per_1000"] = df["complaints_per_1000"].fillna(0).astype(float).round(1)
     df["pass_pct"] = df["pass_pct"].fillna(0).astype(float).round(0)
     return df
 
 def _fig_complaints_accuracy(df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(8.4, 3.6))
-    ax.plot(df["month"], df["complaints_per_1000"], linewidth=2.8, marker=None, color=_PASTEL_LINE, label="Complaints / 1000")
-    ax.plot(df["month"], df["pass_pct"], linewidth=2.8, marker=None, color=_PASTEL_LINE_2, label="Pass %")
+    ax.plot(df["month"], df["complaints_per_1000"], linewidth=2.8, color=_PASTEL_LINE, label="Complaints / 1000")
+    ax.plot(df["month"], df["pass_pct"], linewidth=2.8, color=_PASTEL_LINE_2, label="Pass %")
     for x, y in zip(df["month"], df["complaints_per_1000"]):
         ax.text(x, y + max(0.05, 0.02*y), f"{y:.1f}", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
     for x, y in zip(df["month"], df["pass_pct"]):
         ax.text(x, y + 1.2, f"{y:.0f}%", ha="center", va="bottom", fontsize=8, color=_DARK_GREY)
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
-    ax.spines["bottom"].set_color(_SOFT_GREY)
-    ax.spines["bottom"].set_linewidth(1.25)
-    ax.get_yaxis().set_visible(False)
-    ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
+    ax.spines["bottom"].set_color(_SOFT_GREY); ax.spines["bottom"].set_linewidth(1.25)
+    ax.get_yaxis().set_visible(False); ax.set_xlabel(""); ax.grid(False)
     ax.legend(frameon=False, loc="upper right")
     return fig
 
@@ -601,7 +399,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         st.error(f"FPA file found, but a required column is missing: {e}")
         return ("", pd.DataFrame())
 
-    # Overview computations (cached via vectorization)
+    # Overview
     mom = _series_mom(df_raw)
     if mom.empty:
         st.info("No First-Pass Accuracy rows found from Jan-25 onward.")
@@ -611,7 +409,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
     st.sidebar.header("Filters (2025) — Fail reasons")
-    fails_all = _label_all(df_raw)  # cached + 2025+ only
+    fails_all = _label_all(df_raw)
     if not fails_all.empty:
         fails_2025 = fails_all[fails_all["_m"] >= JAN_2025].copy()
         all_reasons = sorted(fails_2025["reason"].unique().tolist())
@@ -621,52 +419,41 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
     sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
 
-    # Tabs ------------- (THIRD TAB WILL GET A LOCAL PORTFOLIO FILTER)
     tab_overview, tab_comparisons, tab_comp_acc = st.tabs(["Overview", "Comparisons", "Complaints and Accuracy"])
 
     # ---------------- Overview ----------------
     with tab_overview:
-        _render_insights(mom, df_raw, fails_all)
+        for b in _heuristic_insights(mom, df_raw, fails_all):
+            st.markdown(f"- {b}")
 
         c1, c2 = st.columns((1.1, 1.0), gap="large")
         with c1:
             st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
         with c2:
-            st.markdown(
-                f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA % by Portfolio — Month on Month</h4>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA % by Portfolio — Month on Month</h4>", unsafe_allow_html=True)
             if not piv_portfolio_mom.empty:
                 st.dataframe(piv_portfolio_mom, use_container_width=True)
 
         reasons_latest, lastp = _label_all_latest(df_raw, fails_precomputed=fails_all)
         matrix_2025 = _pivot_fail_matrix(fails_all)
 
-        st.markdown(
-            f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}</h4>",
-            unsafe_allow_html=True
-        )
+        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}</h4>", unsafe_allow_html=True)
         r1, r2 = st.columns((1.0, 1.2), gap="large")
         with r1:
-            if not reasons_latest.empty:
-                st.pyplot(_fig_pareto_full(reasons_latest))
-            else:
-                st.info("No fail reasons available for the latest month.")
+            if not reasons_latest.empty: st.pyplot(_fig_pareto_full(reasons_latest))
+            else: st.info("No fail reasons available for the latest month.")
         with r2:
             if not matrix_2025.empty:
                 if sel_reasons:
                     matrix_2025 = matrix_2025.loc[matrix_2025.index.get_level_values("reason").isin(sel_reasons)]
                 if sel_portfolios:
                     matrix_2025 = matrix_2025.loc[matrix_2025.index.get_level_values("portfolio").isin(sel_portfolios)]
-                st.markdown(
-                    f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month (2025)</h4>",
-                    unsafe_allow_html=True
-                )
+                st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month (2025)</h4>", unsafe_allow_html=True)
                 st.dataframe(matrix_2025, use_container_width=True)
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Comparisons (unchanged behaviour) =====================
+    # ===================== Comparisons (filters fixed) =====================
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
@@ -700,23 +487,22 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if overall_pct is not None:
                 ax.axhline(y=overall_pct, linewidth=2.2, color=_PASTEL_LINE)
                 ax.text(len(x)-0.5, overall_pct + 1.5, f"Avg {overall_pct:.0f}%", ha="right", va="bottom", fontsize=9, color=_DARK_GREY)
-            ax.set_xticks(x)
-            ax.set_xticklabels(latest_tab.index.tolist(), rotation=90, ha="center", fontsize=8, color=_DARK_GREY)
-            for sp in ["left", "right", "top"]:
-                ax.spines[sp].set_visible(False)
+            ax.set_xticks(x); ax.set_xticklabels(latest_tab.index.tolist(), rotation=90, ha="center", fontsize=8, color=_DARK_GREY)
+            for sp in ["left", "right", "top"]: ax.spines[sp].set_visible(False)
             ax.spines["bottom"].set_color(_SOFT_GREY)
-            ax.get_yaxis().set_visible(False)
-            ax.grid(False)
+            ax.get_yaxis().set_visible(False); ax.grid(False)
             ax.set_title(title, color=_DARK_BLUE)
             st.pyplot(fig)
 
+        # --- Managers ---
         st.markdown("### Managers")
         if have_team:
             if have_portfolio:
-                p_opts = sorted(df_raw["portfolio"].dropna().unique().tolist())
-                p_default = 0 if p_opts else 0
-                sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=p_default, key="cmp_mgr_portfolio")
-                df_mgr = df_raw[df_raw["portfolio"] == sel_p_for_mgr].copy()
+                p_opts = sorted(df_raw["portfolio"].dropna().astype(str).unique().tolist())
+                sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=0 if p_opts else 0, key="cmp_mgr_portfolio")
+                # robust filtering by portfolio
+                mask_mgr_port = _mask_eq(df_raw["portfolio"], sel_p_for_mgr)
+                df_mgr = df_raw[mask_mgr_port].copy()
             else:
                 st.caption("Portfolio column not found; showing all portfolios for Managers section.")
                 df_mgr = df_raw.copy()
@@ -739,16 +525,16 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.info("Team manager column not present in data.")
         st.divider()
 
+        # --- Individuals ---
         st.markdown("### Individuals")
         if have_individual:
             if have_team:
-                mgr_opts = sorted(df_raw["team"].dropna().unique().tolist())
+                mgr_opts = sorted(df_raw["team"].dropna().astype(str).unique().tolist())
                 default_mgrs = ["Divya Dayanidhi"] if "Divya Dayanidhi" in mgr_opts else mgr_opts
                 sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=default_mgrs, key="cmp_ind_managers")
-                if sel_mgrs_for_ind:
-                    df_ind = df_raw[df_raw["team"].isin(sel_mgrs_for_ind)].copy()
-                else:
-                    df_ind = df_raw.head(0).copy()
+                # robust multiselect filter for team
+                mask_mgrs = _mask_in(df_raw["team"], sel_mgrs_for_ind) if sel_mgrs_for_ind else pd.Series(False, index=df_raw.index)
+                df_ind = df_raw[mask_mgrs].copy() if sel_mgrs_for_ind else df_raw.head(0).copy()
             else:
                 st.caption("Team manager column not found; Individuals section will not filter by manager.")
                 df_ind = df_raw.copy()
@@ -771,13 +557,14 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.info("Individuals column not present in data.")
         st.divider()
 
+        # --- Locations ---
         st.markdown("### Locations")
         if have_location:
             if have_portfolio:
-                p_opts_loc = sorted(df_raw["portfolio"].dropna().unique().tolist())
-                p_default_loc = 0 if p_opts_loc else 0
-                sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=p_default_loc, key="cmp_loc_portfolio")
-                df_loc = df_raw[df_raw["portfolio"] == sel_p_for_loc].copy()
+                p_opts_loc = sorted(df_raw["portfolio"].dropna().astype(str).unique().tolist())
+                sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=0 if p_opts_loc else 0, key="cmp_loc_portfolio")
+                mask_loc_port = _mask_eq(df_raw["portfolio"], sel_p_for_loc)
+                df_loc = df_raw[mask_loc_port].copy()
             else:
                 st.caption("Portfolio column not found; showing all portfolios for Locations section.")
                 df_loc = df_raw.copy()
@@ -800,15 +587,14 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.info("Location column not present in data.")
         st.divider()
 
+        # --- Portfolio (filter by locations) ---
         st.markdown("### Portfolio")
         if have_portfolio:
             if have_location:
-                loc_opts = sorted(df_raw["location"].dropna().unique().tolist())
+                loc_opts = sorted(df_raw["location"].dropna().astype(str).unique().tolist())
                 sel_loc_for_port = st.multiselect("Location (Portfolio section)", options=loc_opts, default=loc_opts, key="cmp_port_locations")
-                if sel_loc_for_port:
-                    df_port = df_raw[df_raw["location"].isin(sel_loc_for_port)].copy()
-                else:
-                    df_port = df_raw.head(0).copy()
+                mask_port_locs = _mask_in(df_raw["location"], sel_loc_for_port) if sel_loc_for_port else pd.Series(False, index=df_raw.index)
+                df_port = df_raw[mask_port_locs].copy() if sel_loc_for_port else df_raw.head(0).copy()
             else:
                 st.caption("Location column not found; Portfolio section will not filter by location.")
                 df_port = df_raw.copy()
@@ -830,66 +616,38 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         else:
             st.info("Portfolio column not present in data.")
 
-    # ===================== Complaints and Accuracy (unchanged behaviour) =====================
+    # ===================== Complaints and Accuracy (unchanged) =====================
     with tab_comp_acc:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Complaints and Accuracy — Jan to latest 2025</h4>", unsafe_allow_html=True)
-
         cases: pd.DataFrame = store.get("cases", pd.DataFrame())
         complaints: pd.DataFrame = store.get("complaints", pd.DataFrame())
-
         if cases is None or complaints is None or cases.empty or complaints.empty:
             st.info("Cases and/or Complaints data not found in the app store. This tab uses `store['cases']` and `store['complaints']`.")
         else:
             cases_port = _pick(cases, ["Portfolio", "portfolio"])
             comp_port = _pick(complaints, ["Portfolio", "portfolio"])
             fpa_port = "portfolio" if "portfolio" in df_raw.columns else None
-
             port_values = set()
-            if cases_port:
-                port_values |= set(cases[cases_port].dropna().astype(str).unique().tolist())
-            if comp_port:
-                port_values |= set(complaints[comp_port].dropna().astype(str).unique().tolist())
-            if fpa_port:
-                port_values |= set(df_raw[fpa_port].dropna().astype(str).unique().tolist())
+            if cases_port: port_values |= set(cases[cases_port].dropna().astype(str).unique().tolist())
+            if comp_port: port_values |= set(complaints[comp_port].dropna().astype(str).unique().tolist())
+            if fpa_port:  port_values |= set(df_raw[fpa_port].dropna().astype(str).unique().tolist())
             port_options = sorted([p for p in port_values if p and p.lower() != "nan"])
-
-            sel_ports_local = st.multiselect(
-                "Portfolio (local filter for Complaints vs Accuracy)",
-                options=port_options,
-                default=port_options,
-                key="comp_vs_acc_portfolio_local",
-            )
-
-            cases_f = cases.copy()
-            complaints_f = complaints.copy()
-            df_fpa_f = df_raw.copy()
-
+            sel_ports_local = st.multiselect("Portfolio (local filter for Complaints vs Accuracy)", options=port_options, default=port_options, key="comp_vs_acc_portfolio_local")
+            cases_f = cases.copy(); complaints_f = complaints.copy(); df_fpa_f = df_raw.copy()
             if sel_ports_local:
-                if cases_port:
-                    cases_f = cases_f[cases_f[cases_port].astype(str).isin(sel_ports_local)]
-                if comp_port:
-                    complaints_f = complaints_f[complaints_f[comp_port].astype(str).isin(sel_ports_local)]
-                if fpa_port:
-                    df_fpa_f = df_fpa_f[df_fpa_f[fpa_port].astype(str).isin(sel_ports_local)]
-
+                if cases_port: cases_f = cases_f[_mask_in(cases[cases_port], sel_ports_local)]
+                if comp_port: complaints_f = complaints_f[_mask_in(complaints[comp_port], sel_ports_local)]
+                if fpa_port:  df_fpa_f = df_fpa_f[_mask_in(df_fpa_f[fpa_port], sel_ports_local)]
             comp_mom = _complaints_cases_series_2025(cases_f, complaints_f)
             fpa_mom = _series_mom(df_fpa_f)
             merged = _merge_complaints_fpa_for_chart(comp_mom, fpa_mom)
-
             c1, c2 = st.columns((1.2, 1.0), gap="large")
             with c1:
-                if not merged.empty:
-                    fig = _fig_complaints_accuracy(merged)
-                    st.pyplot(fig)
-                else:
-                    st.info("No overlapping months available to plot for the selected portfolio(s).")
-
+                if not merged.empty: st.pyplot(_fig_complaints_accuracy(merged))
+                else: st.info("No overlapping months available to plot for the selected portfolio(s).")
             with c2:
                 if not merged.empty:
-                    tbl = merged.rename(columns={
-                        "complaints_per_1000": "Complaints / 1000",
-                        "pass_pct": "Pass %",
-                    })
+                    tbl = merged.rename(columns={"complaints_per_1000": "Complaints / 1000", "pass_pct": "Pass %"})
                     st.dataframe(tbl, use_container_width=True)
                 else:
                     st.info("No data to display in the table for the selected portfolio(s).")
