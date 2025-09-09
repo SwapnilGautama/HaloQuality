@@ -32,17 +32,6 @@ _RCA1_CUM_LINE = "#74C69D"
 # ======================
 # Data loading
 # ======================
-
-# Cache-busting file signature for the FPA workbook
-def _fpa_file_sig():
-    try:
-        p = _find_fpa_workbook()
-        if p is None:
-            return ("", 0)
-        return (str(p), int(p.stat().st_mtime))
-    except Exception:
-        return ("", 0)
-
 def _find_fpa_workbook() -> Optional[Path]:
     roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
     patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
@@ -72,10 +61,7 @@ def _coerce_month(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.to_period("M")
 
-@st.cache_data(show_spinner=False)
-
-
-def _load_fpa(_fpa_file_sig()) -> Tuple[pd.DataFrame, Dict[str, str]]:
+def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     p = _find_fpa_workbook()
     if not p:
         raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
@@ -116,9 +102,6 @@ def _is_pass(x: str) -> bool:
     t = str(x).strip().lower()
     return t.startswith("pass")
 
-@st.cache_data(show_spinner=False)
-
-
 def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     s = _coerce_month(df["date"])
     df = df.assign(_m=s)
@@ -133,9 +116,6 @@ def _series_mom(df: pd.DataFrame) -> pd.DataFrame:
     pct = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0.0).round(0)
     label = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in months]
     return pd.DataFrame({"month": label, "pass_pct": pct.values})
-
-@st.cache_data(show_spinner=False)
-
 
 def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -163,8 +143,6 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
 # ======================
 # Reason labelling helpers
 # ======================
-@st.cache_data(show_spinner=False)
-
 def _label_all(df: pd.DataFrame) -> pd.DataFrame:
     """
     Label ALL failed rows across all months with a 'reason' column.
@@ -182,9 +160,6 @@ def _label_all(df: pd.DataFrame) -> pd.DataFrame:
     fails["reason"] = label_dataframe(lab_df, text_col="Case Comment", rca2_col="RCA2")\
         .fillna("Other").astype(str)
     return fails
-
-@st.cache_data(show_spinner=False)
-
 
 def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     """
@@ -217,9 +192,6 @@ def _label_all_latest(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Period]:
     vc["percent"] = vc["percent"].round(1)
     vc["cum_percent"] = vc["cum_percent"].round(1)
     return vc, latest
-
-@st.cache_data(show_spinner=False)
-
 
 def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     """
@@ -630,7 +602,7 @@ def _fig_complaints_accuracy(df: pd.DataFrame):
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     # Load
     try:
-        df_raw, col_map = _load_fpa(_fpa_file_sig())
+        df_raw, col_map = _load_fpa()
     except FileNotFoundError as e:
         st.error(str(e)); return ("", pd.DataFrame())
     except KeyError as e:
