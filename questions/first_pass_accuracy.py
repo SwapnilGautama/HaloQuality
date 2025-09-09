@@ -61,9 +61,7 @@ def _coerce_month(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.to_period("M")
 
-def _load_fpa
-() -> Tuple[pd.DataF
-rame, Dict[str, str]]:
+def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     p = _find_fpa_workbook()
     if not p:
         raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
@@ -604,7 +602,7 @@ def _fig_complaints_accuracy(df: pd.DataFrame):
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     # Load
     try:
-        df_raw, col_map = _load_fpa_cached()
+        df_raw, col_map = _load_fpa()
     except FileNotFoundError as e:
         st.error(str(e)); return ("", pd.DataFrame())
     except KeyError as e:
@@ -633,7 +631,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
     sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
 
-    # Tabs ------------- (THIRD TAB WILL GET A LOCAL PORTFOLIO FILTER)
+    # Tabs ------------- (NEW TAB ADDED)
     tab_overview, tab_comparisons, tab_comp_acc = st.tabs(["Overview", "Comparisons", "Complaints and Accuracy"])
 
     # ---------------- Overview (unchanged) ----------------
@@ -843,7 +841,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         else:
             st.info("Portfolio column not present in data.")
 
-    # ===================== NEW TAB: Complaints and Accuracy (with LOCAL PORTFOLIO FILTER) =====================
+    # ===================== NEW TAB: Complaints and Accuracy =====================
     with tab_comp_acc:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Complaints and Accuracy — Jan to latest 2025</h4>", unsafe_allow_html=True)
 
@@ -853,42 +851,9 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if cases is None or complaints is None or cases.empty or complaints.empty:
             st.info("Cases and/or Complaints data not found in the app store. This tab uses `store['cases']` and `store['complaints']`.")
         else:
-            # ---------- NEW: Local Portfolio filter (applies to BOTH lines and the table) ----------
-            cases_port = _pick(cases, ["Portfolio", "portfolio"])
-            comp_port = _pick(complaints, ["Portfolio", "portfolio"])
-            fpa_port = "portfolio" if "portfolio" in df_raw.columns else None
-
-            port_values = set()
-            if cases_port:
-                port_values |= set(cases[cases_port].dropna().astype(str).unique().tolist())
-            if comp_port:
-                port_values |= set(complaints[comp_port].dropna().astype(str).unique().tolist())
-            if fpa_port:
-                port_values |= set(df_raw[fpa_port].dropna().astype(str).unique().tolist())
-            port_options = sorted([p for p in port_values if p and p.lower() != "nan"])
-
-            sel_ports_local = st.multiselect(
-                "Portfolio (local filter for Complaints vs Accuracy)",
-                options=port_options,
-                default=port_options,
-                key="comp_vs_acc_portfolio_local",
-            )
-
-            cases_f = cases.copy()
-            complaints_f = complaints.copy()
-            df_fpa_f = df_raw.copy()
-
-            if sel_ports_local:
-                if cases_port:
-                    cases_f = cases_f[cases_f[cases_port].astype(str).isin(sel_ports_local)]
-                if comp_port:
-                    complaints_f = complaints_f[complaints_f[comp_port].astype(str).isin(sel_ports_local)]
-                if fpa_port:
-                    df_fpa_f = df_fpa_f[df_fpa_f[fpa_port].astype(str).isin(sel_ports_local)]
-
-            # Build monthly series from filtered subsets
-            comp_mom = _complaints_cases_series_2025(cases_f, complaints_f)
-            fpa_mom = _series_mom(df_fpa_f)  # Jan→latest 2025 for the selected portfolios
+            # Build monthly series
+            comp_mom = _complaints_cases_series_2025(cases, complaints)
+            fpa_mom = _series_mom(df_raw)  # already Jan→latest 2025
             merged = _merge_complaints_fpa_for_chart(comp_mom, fpa_mom)
 
             c1, c2 = st.columns((1.2, 1.0), gap="large")
@@ -897,7 +862,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                     fig = _fig_complaints_accuracy(merged)
                     st.pyplot(fig)
                 else:
-                    st.info("No overlapping months available to plot for the selected portfolio(s).")
+                    st.info("No overlapping months available to plot.")
 
             with c2:
                 if not merged.empty:
@@ -907,6 +872,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                     })
                     st.dataframe(tbl, use_container_width=True)
                 else:
-                    st.info("No data to display in the table for the selected portfolio(s).")
+                    st.info("No data to display in the table.")
 
     return ("", pd.DataFrame())
