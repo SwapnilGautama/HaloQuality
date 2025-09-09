@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 
 # =============== utils ===============
 def _find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    """Return the real column name matching any lower-cased candidate."""
     if df is None or df.empty:
         return None
     m = {str(c).strip().lower(): c for c in df.columns}
@@ -31,7 +30,6 @@ def _norm_portfolio(x: str) -> str:
     t = t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
     return t
 
-# simple offline lexical sentiment
 _POS = {"good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
         "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"}
 _NEG = {"bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
@@ -50,12 +48,9 @@ def _lex_sentiment(text: str) -> float:
 def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame()
     df = df_raw.copy()
-
-    # Portfolio
     pcol = _find_col(df, ["portfolio"])
     df["Portfolio"] = df[pcol].map(_norm_portfolio) if pcol else "Unknown"
 
-    # Month_received
     mcol = _find_col(df, ["month_received","month received","month"])
     if mcol:
         parsed = pd.to_datetime(df[mcol], errors="coerce", dayfirst=True, infer_datetime_format=True)
@@ -67,20 +62,16 @@ def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     else:
         df["_month"] = pd.NaT
 
-    # NPS score → bucket
     scol = _find_col(df, ["nps","nps score","nps_score","nps (0-10)","score","rating"])
     score = pd.to_numeric(df[scol], errors="coerce") if scol else pd.Series([np.nan]*len(df))
-    bucket = np.where(score >= 9, "promoter", np.where(score >= 7, "passive", np.where(score >= 0, "detractor", "unknown")))
-    df["nps_bucket"] = bucket
+    df["nps_bucket"] = np.where(score >= 9, "promoter", np.where(score >= 7, "passive", np.where(score >= 0, "detractor", "unknown")))
 
-    # Suggestions text
     sugcol = _find_col(df, ["suggestions","suggestion","comments","comment","feedback"])
     if sugcol:
         df["Suggestions"] = df[sugcol].astype(str).str.strip()
         df.loc[df["Suggestions"].str.lower().isin(["","nan","none","null"]), "Suggestions"] = np.nan
     else:
         df["Suggestions"] = np.nan
-
     return df
 
 def _aggregate_nps(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,20 +96,14 @@ def _sentiments(df: pd.DataFrame) -> pd.DataFrame:
 def _prep_ops(df_ops: pd.DataFrame) -> pd.DataFrame:
     if df_ops is None or df_ops.empty: return pd.DataFrame()
     d = df_ops.copy()
-
-    # columns are lower-cased by data_store -> find case-insensitively
     pcol = _find_col(d, ["portfolio"])
     d["Portfolio"] = d[pcol].map(_norm_portfolio) if pcol else "Unknown"
-
     rcol = _find_col(d, ["report_date","report date","date","createddate","create_date"])
     d["_month"] = pd.to_datetime(d[rcol], errors="coerce").dt.to_period("M") if rcol else pd.NaT
-
     wcol = _find_col(d, ["within sla","sla_status","sla status"])
     d["_within"] = d[wcol].astype(str).str.lower().str.contains("within").astype(int) if wcol else 0
-
     ccol = _find_col(d, ["completes","completed","checks","volume","total"])
     d["_completes"] = pd.to_numeric(d[ccol], errors="coerce").fillna(0.0) if ccol else 1.0
-
     return d
 
 def _ops_kpis(d_ops: pd.DataFrame) -> pd.DataFrame:
@@ -137,12 +122,10 @@ def _prep_complaints(df_comp: pd.DataFrame) -> pd.DataFrame:
     c = df_comp.copy()
     pcol = _find_col(c, ["portfolio"])
     c["Portfolio"] = c[pcol].map(_norm_portfolio) if pcol else "Unknown"
-
     rm = _find_col(c, ["report month","report_month","month"])
     m1 = pd.to_datetime(c[rm].astype(str).str[:3].str.title() + " 1 2025", errors="coerce", format="%b %d %Y") if rm else pd.NaT
     dcol = _find_col(c, ["date complaint received - dd/mm/yy","date complaint received","received_date","date"])
     m2 = pd.to_datetime(c[dcol], dayfirst=True, errors="coerce") if dcol else pd.NaT
-
     months = m1 if isinstance(m1, pd.Series) else pd.Series([pd.NaT]*len(c))
     if isinstance(m2, pd.Series):
         months = months.fillna(m2)
@@ -151,9 +134,7 @@ def _prep_complaints(df_comp: pd.DataFrame) -> pd.DataFrame:
 
 # =============== UI entry ===============
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
-    """Always returns ((title, subtitle), dataframe) and never raises to the host."""
     try:
-        # ---- load frames from store ----
         surveys = store.get("surveys", pd.DataFrame())
         ops_raw = store.get("ops", store.get("fpa", pd.DataFrame()))
         complaints_raw = store.get("complaints", pd.DataFrame())
@@ -163,7 +144,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             msg = pd.DataFrame([{"Message": "No usable surveys (check Month_received, NPS, Suggestions)."}])
             return ("NPS by Portfolio", "Surveys (Sheet 1)"), msg
 
-        # sidebar filters
         with st.sidebar:
             st.header("Filters")
             ports = ["(All)"] + sorted(s["Portfolio"].dropna().unique().tolist())
@@ -172,13 +152,11 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             start = st.selectbox("From month", months, index=0) if months else None
             end = st.selectbox("To month", months, index=len(months)-1) if months else None
 
-        # NPS aggregates
         nps = _aggregate_nps(s)
         if sel_port != "(All)": nps = nps[nps["Portfolio"] == sel_port]
         if start is not None:  nps = nps[nps["_month"] >= start]
         if end   is not None:  nps = nps[nps["_month"] <= end]
 
-        # overall NPS (weighted)
         if not nps.empty:
             weights = nps[["promoter","passive","detractor","unknown"]].sum(axis=1)
             overall_nps = float((nps["NPS%"] * weights).sum() / weights.sum()) if weights.sum() else np.nan
@@ -186,7 +164,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             overall_nps = np.nan
         st.markdown(f"### Overall NPS (selected range): **{overall_nps:.1f}**")
 
-        # tabs
         tab1, tab2, tab3 = st.tabs(["Overview", "Sentiments", "NPS Correlation"])
 
         # ---- Tab 1: overview ----
@@ -253,14 +230,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     st.markdown("#### Sentiment Summary (filtered range)")
                     st.dataframe(cat[["Sugg","Pos%","Neg%","NetSent%"]], use_container_width=True)
 
-        # ---- Tab 3: correlation (NPS × Sentiment × SLA%) ----
+        # ---- Tab 3: correlation (NPS × Sentiment × SLA% + Complaints chart) ----
         combined_df = pd.DataFrame()
         with tab3:
             ops = _prep_ops(ops_raw)
             ops_kpi = _ops_kpis(ops)
             comp = _prep_complaints(complaints_raw)
 
-            # month-level sentiment kpis
             sd_all = _sentiments(s)
             sent_m = (sd_all.groupby(["Portfolio","_month"])
                         .agg(Sugg=("Suggestions","count"),
@@ -280,61 +256,76 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 comp_m = comp.groupby(["Portfolio","_month"]).size().to_frame("Complaints").reset_index()
                 combined_df = combined_df.merge(comp_m, how="left", on=["Portfolio","_month"])
 
-            # same filters
             if sel_port != "(All)": combined_df = combined_df[combined_df["Portfolio"] == sel_port]
             if start is not None:  combined_df = combined_df[combined_df["_month"] >= start]
             if end   is not None:  combined_df = combined_df[combined_df["_month"] <= end]
 
-            if combined_df.empty:
-                st.info("No overlapped data across NPS, Sentiment, and Service for the selected range.")
-            else:
-                latest_m = combined_df["_month"].max()
-                latest = combined_df[combined_df["_month"] == latest_m].copy()
+            latest_m = combined_df["_month"].max() if not combined_df.empty else None
+            latest = combined_df[combined_df["_month"] == latest_m].copy() if latest_m is not None else pd.DataFrame()
 
-                c_left, c_right = st.columns([1,1])
-                with c_left:
-                    if "SLA%" in latest.columns and latest["SLA%"].notna().any():
-                        fig3, ax3 = plt.subplots()
-                        x = latest["NPS"]; y = latest["SLA%"]; s = (latest["Sugg"].fillna(0)+1)*3
-                        ax3.scatter(x, y, s=s)
-                        for _, r in latest.iterrows():
-                            ax3.annotate(r["Portfolio"], (r["NPS"], r["SLA%"]), fontsize=8, xytext=(3,3), textcoords="offset points")
-                        for sp in ["top","right","left"]: ax3.spines[sp].set_visible(False)
-                        ax3.spines["bottom"].set_color("#D3D3D3")
-                        ax3.get_yaxis().set_visible(False); ax3.grid(False)
-                        ax3.set_xlabel("NPS %"); ax3.set_title(f"NPS vs SLA% (Latest: {str(latest_m)})", fontsize=12)
-                        st.pyplot(fig3, use_container_width=True)
+            c_left, c_right = st.columns([1,1])
+            with c_left:
+                # keep old SLA info if missing
+                if (latest.empty) or ("SLA%" not in latest.columns) or (latest["SLA%"].notna().sum() == 0):
+                    st.info("SLA/Service data not available for the latest month; showing table only.")
+
+                # NEW: NPS vs Complaints (or Complaints/1000) chart
+                if not latest.empty and "NPS" in latest.columns and "Complaints" in latest.columns:
+                    # numeric complaints
+                    compl = pd.to_numeric(latest["Complaints"], errors="coerce")
+                    y = compl.copy()
+                    y_label = "Complaints (count)"
+                    if "Completes" in latest.columns:
+                        completes = pd.to_numeric(latest["Completes"], errors="coerce")
+                        rate = compl / completes * 1000
+                        # use rate where completes>0, else fallback to counts
+                        y = np.where((completes > 0) & np.isfinite(rate), rate, compl)
+                        y = pd.Series(y, index=latest.index)
+                        y_label = "Complaints per 1000 (fallback to count if completes=0)"
+
+                    dfp = latest.copy()
+                    dfp["y"] = y
+                    dfp = dfp[dfp["NPS"].notna() & dfp["y"].notna()]
+                    if len(dfp) >= 2:
+                        figc, axc = plt.subplots()
+                        size = (dfp["Sugg"].fillna(0).astype(float) + 1) * 3
+                        axc.scatter(dfp["NPS"], dfp["y"], s=size)
+                        for _, r in dfp.iterrows():
+                            axc.annotate(r["Portfolio"], (r["NPS"], r["y"]), fontsize=8, xytext=(3,3), textcoords="offset points")
+                        for sp in ["top","right","left"]: axc.spines[sp].set_visible(False)
+                        axc.spines["bottom"].set_color("#D3D3D3")
+                        axc.get_yaxis().set_visible(False); axc.grid(False)
+                        axc.set_xlabel("NPS %"); axc.set_title(f"NPS vs {y_label} (Latest: {str(latest_m)})", fontsize=12)
+                        st.pyplot(figc, use_container_width=True)
                     else:
-                        st.info("SLA/Service data not available for the latest month; showing table only.")
+                        st.info("Not enough data points to plot NPS vs Complaints for the latest month.")
 
-                with c_right:
-                    view = combined_df.rename(columns={"_month":"Month"}).copy()
-                    for c in ["NPS","SLA%","Pos%","Neg%","NetSent%"]:
-                        if c in view.columns: view[c] = view[c].round(1)
-                    cols = [c for c in ["Portfolio","Month","NPS","SLA%","NetSent%","Pos%","Neg%","Sugg","Complaints","Completes"] if c in view.columns]
-                    st.markdown("#### Combined KPIs (Portfolio × Month)")
-                    st.dataframe(view[cols].sort_values(["Month","Portfolio"]), use_container_width=True)
+            with c_right:
+                view = combined_df.rename(columns={"_month":"Month"}).copy()
+                for c in ["NPS","SLA%","Pos%","Neg%","NetSent%"]:
+                    if c in view.columns: view[c] = view[c].round(1)
+                cols = [c for c in ["Portfolio","Month","NPS","SLA%","NetSent%","Pos%","Neg%","Sugg","Complaints","Completes"] if c in view.columns]
+                st.markdown("#### Combined KPIs (Portfolio × Month)")
+                st.dataframe(view[cols].sort_values(["Month","Portfolio"]), use_container_width=True)
 
-                # guard correlations so we never raise
-                try:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        corr = view[["NPS","SLA%"]].dropna()
-                        st.caption(f"Pearson(NPS, SLA%): **{float(corr.corr().iloc[0,1]):.2f}**" if len(corr)>=2 else "Pearson(NPS, SLA%): not enough data")
-                    with c2:
-                        corr2 = view[["NPS","NetSent%"]].dropna()
-                        st.caption(f"Pearson(NPS, Net Sentiment): **{float(corr2.corr().iloc[0,1]):.2f}**" if len(corr2)>=2 else "Pearson(NPS, Net Sentiment): not enough data")
-                except Exception:
-                    pass
+            # keep existing correlation captions
+            try:
+                c1, c2 = st.columns(2)
+                with c1:
+                    corr = view[["NPS","SLA%"]].dropna() if "SLA%" in view.columns else pd.DataFrame()
+                    st.caption(f"Pearson(NPS, SLA%): **{float(corr.corr().iloc[0,1]):.2f}**" if len(corr)>=2 else "Pearson(NPS, SLA%): not enough data")
+                with c2:
+                    corr2 = view[["NPS","NetSent%"]].dropna() if "NetSent%" in view.columns else pd.DataFrame()
+                    st.caption(f"Pearson(NPS, Net Sentiment): **{float(corr2.corr().iloc[0,1]):.2f}**" if len(corr2)>=2 else "Pearson(NPS, Net Sentiment): not enough data")
+            except Exception:
+                pass
 
-        # host return (never None)
         host_df = combined_df.copy() if not combined_df.empty else detail_df.copy()
         if host_df is None or host_df.empty:
             host_df = pd.DataFrame([{"Message": "No data for selected filters"}])
         return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA correlation"), host_df
 
     except Exception as e:
-        # swallow to avoid the blue import banner and still return a valid dataframe
         import traceback
         st.error(f"NPS module error: {e}")
         st.code(traceback.format_exc())
