@@ -46,6 +46,31 @@ def _lex_sentiment(text: str) -> float:
     return max(-1.0, min(1.0, score / max(len(toks), 4)))
 
 
+# ----------------- palette & styling (NEW) -----------------
+_DARK_BLUE = "#0b3d91"   # titles
+_DARK_GREY = "#333333"   # all chart fonts
+_SOFT_GREY = "#E0E0E0"   # axes
+_BUBBLE_FILL = "#8ECAE6" # soft pastel bubble
+_BUBBLE_EDGE = "#5A7AA1" # soft pastel edge
+
+# sentiments bar colors
+_SENT_NEG = "#9BBBD4"   # soft pastel
+_SENT_NEU = "#F4C27A"
+_SENT_POS = "#7BC47F"
+
+def _style_axes(ax: plt.Axes) -> None:
+    """Soft-grey axes, dark-grey fonts."""
+    ax.tick_params(colors=_DARK_GREY, labelcolor=_DARK_GREY)
+    ax.xaxis.label.set_color(_DARK_GREY)
+    ax.yaxis.label.set_color(_DARK_GREY)
+    for sp in ("top","right"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("bottom","left"):
+        ax.spines[sp].set_color(_SOFT_GREY)
+        ax.spines[sp].set_linewidth(1.25)
+    ax.grid(False)
+
+
 # ----------------- surveys (NPS + suggestions) -----------------
 def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame()
@@ -222,15 +247,19 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     pv = pv[order]
                     fig2, ax2 = plt.subplots()
                     x = np.arange(len(pv.index)); bottom = np.zeros(len(x))
+                    # pastel colors per segment (NEW)
+                    color_map = {"negative": _SENT_NEG, "neutral": _SENT_NEU, "positive": _SENT_POS}
                     for col in pv.columns:
-                        ax2.bar(x, pv[col].values, bottom=bottom, label=col.capitalize())
+                        ax2.bar(x, pv[col].values, bottom=bottom, label=col.capitalize(), color=color_map.get(col, _SENT_NEU))
                         bottom += pv[col].values
-                    ax2.set_xticks(x); ax2.set_xticklabels(pv.index, rotation=90)
+                    ax2.set_xticks(x); 
+                    ax2.set_xticklabels(pv.index, rotation=90, color=_DARK_GREY)
                     for sp in ["top","right","left"]: ax2.spines[sp].set_visible(False)
                     ax2.spines["bottom"].set_color("#D3D3D3")
                     ax2.get_yaxis().set_visible(False); ax2.grid(False)
-                    ax2.set_title("Suggestions Sentiment by Portfolio", fontsize=12)
-                    ax2.legend(loc="best", fontsize=8, frameon=False)
+                    ax2.set_title("Suggestions Sentiment by Portfolio", fontsize=12, color=_DARK_BLUE)  # dark-blue title
+                    leg = ax2.legend(loc="best", fontsize=8, frameon=False)
+                    for t in leg.get_texts(): t.set_color(_DARK_GREY)  # legend text dark grey
                     st.pyplot(fig2, use_container_width=True)
                 with s_right:
                     cat = (sd.groupby("Portfolio")["sent_label"].value_counts()
@@ -289,23 +318,21 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             with c_left:
                 plotted_any = False
 
-                # 1) Draw SLA scatter if available
+                # 1) Draw SLA scatter if available (STYLED)
                 if not latest.empty and "SLA%" in latest.columns and latest["SLA%"].notna().any():
                     fig3, ax3 = plt.subplots()
                     x = latest["NPS"]; y = latest["SLA%"]; s = (latest["Sugg"].fillna(0)+1)*3
-                    ax3.scatter(x, y, s=s)
+                    ax3.scatter(x, y, s=s, c=_BUBBLE_FILL, alpha=0.75, edgecolors=_BUBBLE_EDGE, linewidths=0.6)
                     for _, r in latest.iterrows():
-                        ax3.annotate(r["Portfolio"], (r["NPS"], r["SLA%"]), fontsize=8, xytext=(3,3), textcoords="offset points")
-                    for sp in ["top","right"]: ax3.spines[sp].set_visible(False)
-                    ax3.spines["bottom"].set_color("#D3D3D3")
+                        ax3.annotate(r["Portfolio"], (r["NPS"], r["SLA%"]), fontsize=9, xytext=(3,3), textcoords="offset points", color=_DARK_GREY)
                     ax3.set_xlabel("NPS %"); ax3.set_ylabel("SLA %")
-                    ax3.grid(False)
-                    ax3.set_title(f"NPS vs SLA% (Latest: {str(latest_m)})", fontsize=12)
+                    _style_axes(ax3)  # soft-grey axes + dark-grey fonts
+                    ax3.set_title(f"NPS vs SLA% (Latest: {str(latest_m)})", fontsize=12, color=_DARK_BLUE)
                     st.pyplot(fig3, use_container_width=True)
                     st.caption("Bubble size ∝ number of Suggestions (Sugg).")
                     plotted_any = True
 
-                # 2) Always try to draw NPS vs Complaints(/1000)
+                # 2) Always try to draw NPS vs Complaints(/1000) (STYLED)
                 if not latest.empty and "Complaints" in latest.columns and "NPS" in latest.columns:
                     compl = pd.to_numeric(latest["Complaints"], errors="coerce")
                     y = compl.copy()
@@ -321,15 +348,12 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     if len(dfp) >= 2:
                         figc, axc = plt.subplots()
                         size = (dfp["Sugg"].fillna(0).astype(float) + 1) * 3
-                        axc.scatter(dfp["NPS"], dfp["y"], s=size)
+                        axc.scatter(dfp["NPS"], dfp["y"], s=size, c=_BUBBLE_FILL, alpha=0.75, edgecolors=_BUBBLE_EDGE, linewidths=0.6)
                         for _, r in dfp.iterrows():
-                            axc.annotate(r["Portfolio"], (r["NPS"], r["y"]), fontsize=8, xytext=(3,3), textcoords="offset points")
-                        # style: keep top/right off, keep left axis visible (user asked to show Y axis)
-                        for sp in ["top","right"]: axc.spines[sp].set_visible(False)
-                        axc.spines["bottom"].set_color("#D3D3D3")
+                            axc.annotate(r["Portfolio"], (r["NPS"], r["y"]), fontsize=9, xytext=(3,3), textcoords="offset points", color=_DARK_GREY)
                         axc.set_xlabel("NPS %"); axc.set_ylabel(y_label)
-                        axc.grid(False)
-                        axc.set_title(f"NPS vs {y_label} (Latest: {str(latest_m)})", fontsize=12)
+                        _style_axes(axc)  # left y-axis soft grey; fonts dark grey
+                        axc.set_title(f"NPS vs {y_label} (Latest: {str(latest_m)})", fontsize=12, color=_DARK_BLUE)
                         st.pyplot(figc, use_container_width=True)
                         st.caption("Bubble size ∝ number of Suggestions (Sugg).")
                         plotted_any = True
