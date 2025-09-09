@@ -61,7 +61,7 @@ def _coerce_month(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.to_period("M")
 
-def _load_fpa_cached
+def _load_fpa
 () -> Tuple[pd.DataF
 rame, Dict[str, str]]:
     p = _find_fpa_workbook()
@@ -604,7 +604,7 @@ def _fig_complaints_accuracy(df: pd.DataFrame):
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     # Load
     try:
-        df_raw, col_map = _load_fpa()
+        df_raw, col_map = _load_fpa_cached()
     except FileNotFoundError as e:
         st.error(str(e)); return ("", pd.DataFrame())
     except KeyError as e:
