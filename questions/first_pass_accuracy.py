@@ -504,7 +504,7 @@ def _fig_pareto_full(df: pd.DataFrame):
     return fig
 
 # ======================
-# Comparison helpers (new tab)
+# Comparison helpers (shared)
 # ======================
 def _available_dim(df: pd.DataFrame, logical_name: str, col_map: Dict[str, str]) -> Optional[str]:
     """
@@ -641,81 +641,121 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Tab 2: Comparisons (UPDATED AS REQUESTED) =====================
+    # ===================== Tab 2: Comparisons (UPDATED with 4 independent subsections) =====================
     with tab_comparisons:
-        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .75rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
+        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
-        # ---- Filters at top of Comparisons tab ----
-        # We require portfolio (single-select) and team manager (multi-select within selected portfolio)
         have_portfolio = "portfolio" in df_raw.columns
         have_team = "team" in df_raw.columns
         have_individual = "individual" in df_raw.columns
+        have_location = "location" in df_raw.columns
 
-        if not have_portfolio:
-            st.info("Portfolio column not found; comparisons filtering is limited.")
-            df_cmp_base = df_raw.copy()
-            portfolios = []
-            sel_portfolio = None
-        else:
-            portfolios = sorted(df_raw["portfolio"].dropna().unique().tolist())
-            default_index = 0 if portfolios else 0
-            sel_portfolio = st.selectbox("Portfolio", options=portfolios, index=default_index) if portfolios else None
-            df_cmp_base = df_raw[df_raw["portfolio"] == sel_portfolio].copy() if sel_portfolio else df_raw.copy()
-
-        # Team manager list depends on selected portfolio
+        # ---------- Section 1: MANAGERS (local Portfolio filter) ----------
+        st.markdown("### Managers")
         if have_team:
-            managers_all = sorted(df_cmp_base["team"].dropna().unique().tolist())
-            sel_managers = st.multiselect(
-                "Team manager",
-                options=managers_all,
-                default=managers_all
-            )
-        else:
-            sel_managers = []
+            if have_portfolio:
+                p_opts = sorted(df_raw["portfolio"].dropna().unique().tolist())
+                p_default = 0 if p_opts else 0
+                sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=p_default, key="cmp_mgr_portfolio")
+                df_mgr = df_raw[df_raw["portfolio"] == sel_p_for_mgr].copy()
+            else:
+                st.caption("Portfolio column not found; showing all portfolios for Managers section.")
+                df_mgr = df_raw.copy()
 
-        # Apply manager filter
-        if have_team and sel_managers:
-            df_cmp = df_cmp_base[df_cmp_base["team"].isin(sel_managers)].copy()
-        else:
-            df_cmp = df_cmp_base.copy()
-
-        # ---- TEAM: chart + table side by side (latest month) ----
-        st.markdown("#### Team managers — Latest month")
-        c_tm_chart, c_tm_table = st.columns((1.0, 1.0), gap="large")
-        if have_team:
-            # latest month table for teams from the filtered df
-            _, latest_tab_team = _pass_mom_by_dim(df_cmp, "team")
-            with c_tm_chart:
+            # Latest month by team (manager)
+            _, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
                 if not latest_tab_team.empty:
-                    _mini_bar_latest(latest_tab_team, f"Team manager — {sel_portfolio if sel_portfolio else 'All'} (latest Pass %)")
+                    _mini_bar_latest(latest_tab_team, f"Team managers — {sel_p_for_mgr if have_portfolio else 'All'} (latest Pass %)")
                 else:
-                    st.info("No latest-month data for selected filters.")
-            with c_tm_table:
+                    st.info("No latest-month data for selected portfolio.")
+            with col_table:
                 if not latest_tab_team.empty:
                     st.dataframe(latest_tab_team.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
-                else:
-                    st.empty()
         else:
             st.info("Team manager column not present in data.")
-
         st.divider()
 
-        # ---- INDIVIDUALS: chart + table side by side (latest month) ----
-        st.markdown("#### Individuals — Latest month")
-        c_ind_chart, c_ind_table = st.columns((1.0, 1.0), gap="large")
+        # ---------- Section 2: INDIVIDUALS (local Team manager filter) ----------
+        st.markdown("### Individuals")
         if have_individual:
-            _, latest_tab_ind = _pass_mom_by_dim(df_cmp, "individual")
-            with c_ind_chart:
-                if not latest_tab_ind.empty:
-                    _mini_bar_latest(latest_tab_ind, f"Individuals — {sel_portfolio if sel_portfolio else 'All'} (latest Pass %)")
+            if have_team:
+                mgr_opts = sorted(df_raw["team"].dropna().unique().tolist())
+                sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=mgr_opts, key="cmp_ind_managers")
+                if sel_mgrs_for_ind:
+                    df_ind = df_raw[df_raw["team"].isin(sel_mgrs_for_ind)].copy()
                 else:
-                    st.info("No latest-month data for selected filters.")
-            with c_ind_table:
+                    df_ind = df_raw.head(0).copy()  # empty selection -> empty result
+            else:
+                st.caption("Team manager column not found; Individuals section will not filter by manager.")
+                df_ind = df_raw.copy()
+
+            _, latest_tab_ind = _pass_mom_by_dim(df_ind, "individual")
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
+                if not latest_tab_ind.empty:
+                    _mini_bar_latest(latest_tab_ind, "Individuals — (latest Pass %)")
+                else:
+                    st.info("No latest-month data for selected managers.")
+            with col_table:
                 if not latest_tab_ind.empty:
                     st.dataframe(latest_tab_ind.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
-                else:
-                    st.empty()
         else:
             st.info("Individuals column not present in data.")
+        st.divider()
+
+        # ---------- Section 3: LOCATIONS (local Portfolio filter) ----------
+        st.markdown("### Locations")
+        if have_location:
+            if have_portfolio:
+                p_opts_loc = sorted(df_raw["portfolio"].dropna().unique().tolist())
+                p_default_loc = 0 if p_opts_loc else 0
+                sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=p_default_loc, key="cmp_loc_portfolio")
+                df_loc = df_raw[df_raw["portfolio"] == sel_p_for_loc].copy()
+            else:
+                st.caption("Portfolio column not found; showing all portfolios for Locations section.")
+                df_loc = df_raw.copy()
+
+            _, latest_tab_loc = _pass_mom_by_dim(df_loc, "location")
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
+                if not latest_tab_loc.empty:
+                    _mini_bar_latest(latest_tab_loc, f"Locations — {sel_p_for_loc if have_portfolio else 'All'} (latest Pass %)")
+                else:
+                    st.info("No latest-month data for selected portfolio.")
+            with col_table:
+                if not latest_tab_loc.empty:
+                    st.dataframe(latest_tab_loc.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        else:
+            st.info("Location column not present in data.")
+        st.divider()
+
+        # ---------- Section 4: PORTFOLIO (local Location filter) ----------
+        st.markdown("### Portfolio")
+        if have_portfolio:
+            if have_location:
+                loc_opts = sorted(df_raw["location"].dropna().unique().tolist())
+                sel_loc_for_port = st.multiselect("Location (Portfolio section)", options=loc_opts, default=loc_opts, key="cmp_port_locations")
+                if sel_loc_for_port:
+                    df_port = df_raw[df_raw["location"].isin(sel_loc_for_port)].copy()
+                else:
+                    df_port = df_raw.head(0).copy()
+            else:
+                st.caption("Location column not found; Portfolio section will not filter by location.")
+                df_port = df_raw.copy()
+
+            _, latest_tab_port = _pass_mom_by_dim(df_port, "portfolio")
+            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+            with col_chart:
+                if not latest_tab_port.empty:
+                    _mini_bar_latest(latest_tab_port, "Portfolio — (latest Pass %)")
+                else:
+                    st.info("No latest-month data for selected locations.")
+            with col_table:
+                if not latest_tab_port.empty:
+                    st.dataframe(latest_tab_port.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        else:
+            st.info("Portfolio column not present in data.")
 
     return ("", pd.DataFrame())
