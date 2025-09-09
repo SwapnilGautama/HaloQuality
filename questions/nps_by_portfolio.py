@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from typing import Dict, Any, Tuple, Optional
 import re
-from collections import Counter
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -80,7 +79,6 @@ def _prepare_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     sug_col = _find_col(df, ["suggestions", "suggestion", "comments", "comment", "feedback"])
     if sug_col:
         df["suggestions"] = df[sug_col].astype(str).str.strip()
-        # Strip obviously empty placeholders
         df.loc[df["suggestions"].str.len() == 0, "suggestions"] = np.nan
         df.loc[df["suggestions"].str.lower().isin(["nan", "none", "na", "null"]), "suggestions"] = np.nan
     else:
@@ -140,12 +138,10 @@ _CATEGORY_PATTERNS = [
 
 def _get_vader():
     try:
-        # NLTK VADER (works if corpora installed)
         from nltk.sentiment import SentimentIntensityAnalyzer  # type: ignore
         return SentimentIntensityAnalyzer()
     except Exception:
         try:
-            # Or lightweight vaderSentiment package
             from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore
             return SentimentIntensityAnalyzer()
         except Exception:
@@ -154,7 +150,6 @@ def _get_vader():
 _SIA = _get_vader()
 
 def _fallback_sentiment(text: str) -> float:
-    """Very small lexicon fallback → returns a pseudo compound score in [-1,1]."""
     toks = re.findall(r"\b\w+\b", text.lower())
     if not toks:
         return 0.0
@@ -177,7 +172,6 @@ def _sentiment_label(text: str) -> Tuple[str, float]:
         return "negative", comp
     return "neutral", comp
 
-# compile category regex once
 _CAT_REGEX = [(name, [re.compile(pat, re.IGNORECASE) for pat in pats]) for name, pats in _CATEGORY_PATTERNS]
 
 def _categorize(text: str) -> str:
@@ -191,14 +185,9 @@ def _categorize(text: str) -> str:
 
 
 def _analyze_suggestions(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds 'sentiment', 'sentiment_score', 'category' to rows with suggestions.
-    Returns a frame with those columns for non-null suggestions.
-    """
     sug = df[df["suggestions"].notna()].copy()
     if sug.empty:
         return sug
-
     labs, scores, cats = [], [], []
     for s in sug["suggestions"].astype(str):
         lab, sc = _sentiment_label(s)
@@ -229,7 +218,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     """
     Entry point required by app.py.
     Returns:
-      (title, subtitle), dataframe
+      (title, subtitle), dataframe  # we will return an EMPTY df to avoid duplicate 3rd-row table
     """
     surveys = store.get("surveys", pd.DataFrame())
     if surveys is None or surveys.empty:
@@ -294,7 +283,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             ax.legend(loc="best", fontsize=8, frameon=False)
             st.pyplot(fig, use_container_width=True)
 
-    # ----- Right: Detail Table -----
+    # ----- Right: Detail Table (This is the ONLY table we render) -----
     with right:
         show_cols = ["portfolio", "_month", "NPS%", "promoter", "passive", "detractor", "unknown", "Total"]
         detail = by_month_portfolio[show_cols].rename(columns={"_month": "Month", "NPS%": "NPS"})
@@ -309,7 +298,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     st.markdown("### Suggestions Analysis")
 
     sug = _analyze_suggestions(df)
-    # Apply same filters to suggestions
     if not sug.empty:
         if flt["portfolio"] and flt["portfolio"] != "(All)":
             sug = sug[sug["portfolio"] == flt["portfolio"]]
@@ -325,18 +313,24 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         s_left, s_right = st.columns([1, 1])
 
         with s_left:
-            # Stacked bar: sentiment counts by portfolio
+            # Stacked bar: sentiment counts by portfolio (soft pastel colors, vertical x labels)
             sent_pivot = sug.pivot_table(index="portfolio", columns="sentiment", values="suggestions", aggfunc="count", fill_value=0)
-            sent_pivot = sent_pivot[["negative","neutral","positive"]] if set(["negative","neutral","positive"]).issubset(sent_pivot.columns) else sent_pivot
+            # consistent column order
+            order = [c for c in ["negative", "neutral", "positive"] if c in sent_pivot.columns]
+            sent_pivot = sent_pivot[order]
+            colors = {"negative": "#F6C1C1", "neutral": "#E2ECE9", "positive": "#CDE7BE"}  # soft pastels
+
             fig2, ax2 = plt.subplots()
             x = np.arange(len(sent_pivot.index))
             bottom = np.zeros(len(x))
             for col in sent_pivot.columns:
-                ax2.bar(x, sent_pivot[col].values, bottom=bottom, label=col.capitalize())
+                ax2.bar(x, sent_pivot[col].values, bottom=bottom, label=col.capitalize(), color=colors.get(col))
                 bottom += sent_pivot[col].values
 
+            ax2.set_xticks(x)
+            ax2.set_xticklabels(sent_pivot.index, rotation=90)  # vertical labels
+
             # style (soft grey x-axis, no y-axis/grid, no border)
-            ax2.set_xticks(x, sent_pivot.index, rotation=0)
             for spine in ["top", "right", "left"]:
                 ax2.spines[spine].set_visible(False)
             ax2.spines["bottom"].set_color("#D3D3D3")
@@ -347,7 +341,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             st.pyplot(fig2, use_container_width=True)
 
         with s_right:
-            # Category summary in the filtered range
             total_rows = len(sug)
             cat_summary = (
                 sug.groupby("category")
@@ -360,7 +353,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 cat_summary["%"] = (cat_summary["Count"] / total_rows * 100).round(1)
                 cat_summary["Positive %"] = (cat_summary["Pos"] / cat_summary["Count"] * 100).round(1)
                 cat_summary["Negative %"] = (cat_summary["Neg"] / cat_summary["Count"] * 100).round(1)
-            # Add one short example per category
             examples = (
                 sug.groupby("category")["suggestions"]
                    .apply(lambda s: (s.dropna().iloc[0] if len(s.dropna()) else ""))
@@ -369,5 +361,5 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             st.markdown("#### Categories (filtered range)")
             st.dataframe(cat_summary[["Count","%","Positive %","Negative %","Example"]], use_container_width=True)
 
-    # Return the NPS detail DF to the host app (unchanged contract)
-    return ("NPS by Portfolio", "Reads surveys/ (Sheet 1), computes NPS, and analyzes Suggestions sentiment & categories."), detail
+    # IMPORTANT: return empty df to avoid the host app rendering a duplicate 3rd-row table
+    return ("NPS by Portfolio", "Reads surveys/ (Sheet 1), computes NPS, and analyzes Suggestions sentiment & categories."), pd.DataFrame()
