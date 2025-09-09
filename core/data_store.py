@@ -28,7 +28,8 @@ def _read_any(f: Path) -> pd.DataFrame:
         return pd.read_parquet(f)
     if suffix == ".csv":
         return pd.read_csv(f)
-    return pd.read_excel(f)
+    # default Excel: Sheet 1 (index 0) as requested
+    return pd.read_excel(f, sheet_name=0)
 
 
 def _load_folder(sub: str) -> pd.DataFrame:
@@ -95,8 +96,7 @@ def _rename_cases(df: pd.DataFrame) -> pd.DataFrame:
     if "portfolio" in df.columns:
         df["portfolio"] = df["portfolio"].astype(str).str.strip().str.title()
 
-    # date (pick exactly one; do NOT rename duplicates into 'date' first)
-    # priority: create date > report date > created date > start date > anything containing 'date'
+    # date
     date_candidates = [
         "create date",
         "report date",
@@ -109,12 +109,10 @@ def _rename_cases(df: pd.DataFrame) -> pd.DataFrame:
     ]
     chosen = _choose_first_existing(df.columns, date_candidates)
     if not chosen:
-        # last resort: any column that contains 'date'
         others = [c for c in df.columns if "date" in c and c not in {"_month", "month"}]
         chosen = others[0] if others else None
 
     if chosen:
-        # create a single canonical 'date' column from the chosen source
         df["date"] = pd.to_datetime(df[chosen], errors="coerce", dayfirst=True)
         df["_month"] = df["date"].dt.to_period("M")
     else:
@@ -130,7 +128,7 @@ def _rename_complaints(df: pd.DataFrame, assume_year_for_complaints: int) -> pd.
 
     # portfolio
     if "portfolio" not in df.columns:
-        if "portfolio" in df.columns:  # no-op but keeps pattern consistent
+        if "portfolio" in df.columns:
             df = df.rename(columns={"portfolio": "portfolio"})
     if "portfolio" in df.columns:
         df["portfolio"] = df["portfolio"].astype(str).str.strip().str.title()
@@ -141,25 +139,17 @@ def _rename_complaints(df: pd.DataFrame, assume_year_for_complaints: int) -> pd.
             df = df.rename(columns={c: "process"})
             break
 
-    # try to use explicit complaints date column first
-    comp_date_col = None
-    explicit_date_candidates = [
-        "date complaint received - dd/mm/yy",
-        "date complaint received",
-        "complaint date",
-    ]
-    comp_date_col = _choose_first_existing(df.columns, explicit_date_candidates)
+    # date (explicit first; else Month text + assumed year)
+    comp_date_col = _choose_first_existing(
+        df.columns,
+        ["date complaint received - dd/mm/yy", "date complaint received", "complaint date"],
+    )
 
     if comp_date_col:
         df["date"] = pd.to_datetime(df[comp_date_col], errors="coerce", dayfirst=True)
         df["_month"] = df["date"].dt.to_period("M")
     else:
-        # fall back to Month text (e.g., 'June'); assume provided year
-        month_text_col = None
-        for c in ["month"]:
-            if c in df.columns:
-                month_text_col = c
-                break
+        month_text_col = _choose_first_existing(df.columns, ["month"])
         if month_text_col:
             m = (
                 df[month_text_col]
@@ -185,21 +175,53 @@ def _rename_complaints(df: pd.DataFrame, assume_year_for_complaints: int) -> pd.
     return df
 
 
+def _rename_surveys(df: pd.DataFrame) -> pd.DataFrame:
+    """Light normalization so the question can work consistently."""
+    if df.empty:
+        return df
+    df = _norm_cols(df)
+
+    # portfolio
+    if "portfolio" in df.columns:
+        df["portfolio"] = df["portfolio"].astype(str).str.strip().str.title()
+
+    # Month_received -> _month (leave full parsing to the question for robustness)
+    # we still try a best-effort here for quick checks
+    month_col = None
+    for c in ["month_received", "month received", "received_month", "month"]:
+        if c in df.columns:
+            month_col = c
+            break
+    if month_col:
+        temp = pd.to_datetime(df[month_col], errors="coerce", dayfirst=True, infer_datetime_format=True)
+        df["_month"] = temp.dt.to_period("M")
+        df["date"] = temp
+    else:
+        df["_month"] = pd.NaT
+        df["date"] = pd.NaT
+
+    return df
+
+
 # ---------- public loader ----------
 @st.cache_data(show_spinner="Reading Excel / parquet sources", ttl=3600)
 def load_store(assume_year_for_complaints: int = 2025) -> Dict[str, Any]:
     cases = _load_folder("cases")
     complaints = _load_folder("complaints")
     fpa = _load_folder("fpa")
+    surveys = _load_folder("surveys")  # << NEW
 
     cases = _rename_cases(cases)
     complaints = _rename_complaints(complaints, assume_year_for_complaints)
+    surveys = _rename_surveys(surveys)  # << NEW
 
     return {
         "cases": cases,
         "complaints": complaints,
         "fpa": fpa,
+        "surveys": surveys,          # << NEW
         "cases_rows": len(cases),
         "complaints_rows": len(complaints),
         "fpa_rows": len(fpa),
+        "surveys_rows": len(surveys) # << NEW
     }
