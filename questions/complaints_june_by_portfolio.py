@@ -1,3 +1,11 @@
+# --- memoized wrappers to speed up repeated text classification ---
+@lru_cache(maxsize=20000)
+def _rca1_keyword_cached(text: str) -> str:
+    return _rca1_keyword_cached(text)
+
+@lru_cache(maxsize=20000)
+def _rca2_keyword_cached(text: str) -> str:
+    return _rca2_keyword_cached(text)
 # questions/complaints_june_by_portfolio.py
 from __future__ import annotations
 
@@ -28,6 +36,7 @@ try:
     from pptx.util import Inches, Pt
     from pptx.enum.text import PP_ALIGN
     from pptx.dml.color import RGBColor
+from functools import lru_cache
     _PPT_READY = True
 except Exception:
     _PPT_READY = False
@@ -166,7 +175,7 @@ def _classify(text: str, patterns: Dict[str, List[str]], default: str) -> str:
                 return label
     return default
 
-def _rca1_keyword(text: str) -> str:
+def _rca1_keyword_cached(text: str) -> str:
     patterns = {
         "Delay": [
             r"\bdelay(ed|s|ing)?\b", r"\btimes? ?scale\b", r"\bsla\b", r"\bbacklog\b",
@@ -195,7 +204,7 @@ def _rca1_keyword(text: str) -> str:
     }
     return _classify(text, patterns, default="Other")
 
-def _rca2_keyword(text: str) -> str:
+def _rca2_keyword_cached(text: str) -> str:
     patterns = {
         "Manual calculation": [r"\bmanual calculat", r"\bre-?calculat", r"\brecalculation\b"],
         "Data entry error": [
@@ -286,7 +295,7 @@ DELAY_APTIA = {"Manual calculation", "Case not created", "2nd review / QA", "Pen
 
 def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
     if not _OPENAI_READY:
-        return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
+        return [(_rca1_keyword_cached(t), _rca2_keyword_cached(t)) for t in texts]
     try:
         prompt = (
             "You are classifying complaint root causes. "
@@ -319,10 +328,10 @@ def _ai_label_batch(texts: List[str]) -> List[Tuple[str, str]]:
         except Exception:
             out = []
         if len(out) != len(texts):
-            return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
+            return [(_rca1_keyword_cached(t), _rca2_keyword_cached(t)) for t in texts]
         return out
     except Exception:
-        return [(_rca1_keyword(t), _rca2_keyword(t)) for t in texts]
+        return [(_rca1_keyword_cached(t), _rca2_keyword_cached(t)) for t in texts]
 
 def _detect_cases_fields(cases: pd.DataFrame):
     id_col = _find_first_col(cases, ["Case ID", "CaseId", "ID"])
@@ -354,6 +363,9 @@ def _detect_complaints_fields(comp: pd.DataFrame):
 # -------------------------------
 # Core computations (overall)
 # -------------------------------
+
+@st.cache_data(show_spinner=False)
+
 
 def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     id_c, port_c, date_c = _detect_cases_fields(cases)
@@ -391,6 +403,9 @@ def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.Dat
     out["per_1000"] = out["per_1000"].round(1)
     return out
 
+@st.cache_data(show_spinner=False)
+
+
 def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     _, _, date_c = _detect_cases_fields(cases)
     _, _, date_k, _ = _detect_complaints_fields(comp)
@@ -417,6 +432,9 @@ def _repair_rca1_from_rca2(rca1: List[str], rca2: List[str]) -> List[str]:
             out.append(a)
     return out
 
+@st.cache_data(show_spinner=False)
+
+
 def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
     _, _, date_k, desc_col = _detect_complaints_fields(comp)
     if date_k is None or desc_col is None:
@@ -436,8 +454,8 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
             r1_labels.extend([p[0] for p in pairs])
             r2_labels.extend([p[1] for p in pairs])
     else:
-        r1_labels = [_rca1_keyword(t) for t in texts]
-        r2_labels = [_rca2_keyword(t) for t in texts]
+        r1_labels = [_rca1_keyword_cached(t) for t in texts]
+        r2_labels = [_rca2_keyword_cached(t) for t in texts]
 
     r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
 
@@ -456,6 +474,8 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
     return r2, r1
 
 # NEW: RCA2 table by portfolio (for June) with optional filters
+@st.cache_data(show_spinner=False)
+
 def _rca2_table_by_portfolio_for_june(
     comp: pd.DataFrame,
     use_ai: bool,
@@ -490,8 +510,8 @@ def _rca2_table_by_portfolio_for_june(
         r1_labels = [p[0] for p in pairs]
         r2_labels = [p[1] for p in pairs]
     else:
-        r1_labels = [_rca1_keyword(t) for t in texts]
-        r2_labels = [_rca2_keyword(t) for t in texts]
+        r1_labels = [_rca1_keyword_cached(t) for t in texts]
+        r2_labels = [_rca2_keyword_cached(t) for t in texts]
     r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
 
     # RCA1 filter
@@ -582,12 +602,17 @@ def _pareto_fig(df: pd.DataFrame):
     return fig
 
 def _plot_rca1_pareto(df: pd.DataFrame):
-    st.pyplot(_pareto_fig(df))
+    _auto_fig_ac1ff2 = _pareto_fig(df)
+st.pyplot(_auto_fig_ac1ff2)
+plt.close(_auto_fig_ac1ff2)
 
 
 # -------------------------------
 # Portfolio-tab computations & plots
 # -------------------------------
+
+@st.cache_data(show_spinner=False)
+
 
 def _portfolio_list(cases: pd.DataFrame, comp: pd.DataFrame) -> List[str]:
     _, port_c, _ = _detect_cases_fields(cases)
@@ -598,6 +623,9 @@ def _portfolio_list(cases: pd.DataFrame, comp: pd.DataFrame) -> List[str]:
     if port_k and port_k in comp.columns:
         ports |= set(comp[port_k].dropna().astype(str).unique().tolist())
     return sorted([p for p in ports if p and p.lower() != "nan"])
+
+@st.cache_data(show_spinner=False)
+
 
 def _portfolio_mom_series(cases: pd.DataFrame, comp: pd.DataFrame, portfolio: str) -> pd.DataFrame:
     _, port_c, date_c = _detect_cases_fields(cases)
@@ -646,10 +674,13 @@ def _rca_labels_for_subset(df: pd.DataFrame, use_ai: bool) -> Tuple[List[str], L
             r1_labels.extend([p[0] for p in pairs])
             r2_labels.extend([p[1] for p in pairs])
     else:
-        r1_labels = [_rca1_keyword(t) for t in texts]
-        r2_labels = [_rca2_keyword(t) for t in texts]
+        r1_labels = [_rca1_keyword_cached(t) for t in texts]
+        r2_labels = [_rca2_keyword_cached(t) for t in texts]
     r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
     return r1_labels, r2_labels
+
+@st.cache_data(show_spinner=False)
+
 
 def _reason_trend_df(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.DataFrame:
     _, port_k, date_k, desc_col = _detect_complaints_fields(comp)
