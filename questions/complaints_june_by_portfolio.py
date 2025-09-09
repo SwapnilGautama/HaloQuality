@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # questions/complaints_june_by_portfolio.py
 from __future__ import annotations
 
@@ -456,6 +455,61 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
 
     return r2, r1
 
+# NEW: RCA2 table by portfolio (for June) with optional filters
+def _rca2_table_by_portfolio_for_june(
+    comp: pd.DataFrame,
+    use_ai: bool,
+    portfolios: List[str] | None = None,
+    rca1_keep: List[str] | None = None,
+) -> pd.DataFrame:
+    id_k, port_k, date_k, desc_col = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_k, date_k, desc_col]):
+        return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+
+    df = comp.copy()
+    df["_month"] = _build_month_column(df, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+
+    # June only
+    df = df.loc[df["_month"] == "2025-06", [port_k, desc_col]].dropna(subset=[desc_col])
+    if df.empty:
+        return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+
+    # Portfolio filter
+    if portfolios and len(portfolios) > 0:
+        df = df.loc[df[port_k].astype(str).isin([str(p) for p in portfolios])]
+        if df.empty:
+            return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+
+    # Label RCA1/RCA2
+    texts = df[desc_col].astype(str).tolist()
+    if use_ai and _OPENAI_READY and len(texts) > 0:
+        pairs = []
+        batch = 80
+        for i in range(0, len(texts), batch):
+            pairs.extend(_ai_label_batch(texts[i:i+batch]))
+        r1_labels = [p[0] for p in pairs]
+        r2_labels = [p[1] for p in pairs]
+    else:
+        r1_labels = [_rca1_keyword(t) for t in texts]
+        r2_labels = [_rca2_keyword(t) for t in texts]
+    r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
+
+    # RCA1 filter
+    if rca1_keep and len(rca1_keep) > 0:
+        mask = [r in set(rca1_keep) for r in r1_labels]
+        if not any(mask):
+            return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+        df = df.loc[mask].copy()
+        r2_labels = [r2 for r2, keep in zip(r2_labels, mask) if keep]
+
+    df["RCA2"] = r2_labels
+    df["Portfolio"] = df[port_k].astype(str).fillna("")
+
+    # Grouped table
+    tab = df.groupby(["Portfolio", "RCA2"], dropna=False, as_index=False).size().rename(columns={"size": "count"})
+    tab = tab.sort_values(["count", "Portfolio", "RCA2"], ascending=[False, True, True], kind="stable").reset_index(drop=True)
+    return tab
+
 
 # -------------------------------
 # Plotting (overall)
@@ -799,7 +853,7 @@ def _build_ppt(table_df: pd.DataFrame, mom_df: pd.DataFrame, rca1_df: pd.DataFra
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     """
     Tabs:
-      - Overall (original dashboard, unchanged)
+      - Overall (original dashboard, unchanged except 2nd row filters & table)
       - One tab per Portfolio with the layout from the screenshot
     """
     # Hide sidebar / toolbar / parsed filters AND any alert (blue) boxes
@@ -848,26 +902,72 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if not mom.empty:
                 _plot_mom_line(mom)
 
-        rca2, rca1 = _rca_tables_for_june(comp, use_ai=use_ai)
+        # =========== ROW 2 (UPDATED): local filters + filtered RCA1 Pareto + RCA2 table by portfolio ===========
+        # Local filter controls (affect Pareto + table only)
+        # Build options
+        _, port_k, _, _ = _detect_complaints_fields(comp)
+        rca1_options = _RCA1_ALLOWED
+        ports_options = portfolios if portfolios else []
+
+        f1, f2 = st.columns((1.0, 1.0))
+        with f1:
+            sel_ports = st.multiselect(
+                "Portfolio (local filter for RCA visuals)",
+                options=ports_options,
+                default=ports_options,
+                key="compl_rca_row2_ports",
+            )
+        with f2:
+            sel_rca1 = st.multiselect(
+                "Complaint Reason — RCA1 (local filter)",
+                options=rca1_options,
+                default=rca1_options,
+                key="compl_rca_row2_rca1",
+            )
+
+        # Create a filtered view of complaints for June used by both visuals
+        comp_local = comp.copy()
+        if port_k and sel_ports:
+            comp_local = comp_local[comp_local[port_k].astype(str).isin([str(p) for p in sel_ports])]
+
+        # Pareto (RCA1) on filtered data (still June)
+        rca2_filtered, rca1_filtered = _rca_tables_for_june(comp_local, use_ai=use_ai)
+        if not rca1_filtered.empty and sel_rca1:
+            rca1_filtered = rca1_filtered[rca1_filtered["RCA1"].isin(sel_rca1)]
+
         c3, c4 = st.columns((1.05, 1.0), gap="large")
         with c3:
-            if not rca1.empty:
-                _plot_rca1_pareto(rca1)
+            if not rca1_filtered.empty:
+                _plot_rca1_pareto(rca1_filtered)
+            else:
+                _header("RCA1 — June 2025 (Pareto)")
+                st.info("No data for the selected filters.")
+
         with c4:
-            _header("RCA2 — Top 80% (June 2025)")
-            if rca2.empty:
-                st.info("No June-2025 complaints with usable RCA text.")
+            _header("RCA2 — June 2025 (by Portfolio)")
+            rca2_by_port = _rca2_table_by_portfolio_for_june(
+                comp=comp,
+                use_ai=use_ai,
+                portfolios=sel_ports if sel_ports else ports_options,
+                rca1_keep=sel_rca1 if sel_rca1 else rca1_options,
+            )
+            if rca2_by_port.empty:
+                st.info("No June-2025 complaints for the selected filters.")
             else:
                 st.dataframe(
                     _style_table(
-                        rca2.rename(columns={"RCA2": "RCA2"}),
-                        formats={"count": "{:,.0f}", "percent": "{:.1f}", "cum_percent": "{:.1f}"},
+                        rca2_by_port[["Portfolio", "RCA2", "count"]],
+                        formats={"count": "{:,.0f}"},
                     ),
                     use_container_width=True,
                 )
+        # ================= END ROW 2 (rest of file unchanged) =================
 
-        if _PPT_READY and not table.empty and not mom.empty and not rca1.empty and not rca2.empty:
-            ppt_bytes = _build_ppt(table, mom, rca1, rca2)
+        # PPT button remains aware of original (unfiltered) second row artifacts
+        rca2_all, rca1_all = _rca_tables_for_june(comp, use_ai=use_ai)
+
+        if _PPT_READY and not table.empty and not mom.empty and not rca1_all.empty and not rca2_all.empty:
+            ppt_bytes = _build_ppt(table, mom, rca1_all, rca2_all)
             st.download_button(
                 "Download PPT",
                 data=ppt_bytes,
