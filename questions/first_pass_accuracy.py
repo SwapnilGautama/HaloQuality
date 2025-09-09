@@ -14,7 +14,7 @@ import streamlit as st
 # ---------------------------
 _DARK_BLUE = "#0b3d91"
 _DARK_GREY = "#333333"
-_SOFT_GREY = "#E0E0E0"   # softer axis baseline
+_SOFT_GREY = "#E0E0E0"
 
 _PASTEL_LINE = "#8ECAE6"
 _PASTEL_LINE_2 = "#A1D99B"
@@ -98,7 +98,7 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     return df, col_map
 
 # ======================
-# Normalization helpers (for robust filtering)
+# Normalization helpers (robust filtering)
 # ======================
 def _norm_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.normalize("NFKC").str.strip().str.casefold()
@@ -197,7 +197,7 @@ def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     return mat.sort_index()
 
 # ======================
-# Insights (unchanged)
+# Insights (minimal heuristic)
 # ======================
 def _portfolio_pass_table(df: pd.DataFrame) -> pd.DataFrame:
     grp = (df.groupby(["portfolio", "_m"])
@@ -215,39 +215,12 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
     last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
     prev_val = overall_series.iloc[-2] if len(overall_series) >= 2 else np.nan
     delta = (last_val - prev_val) if not (np.isnan(last_val) or np.isnan(prev_val)) else np.nan
-
-    periods = sorted(df_raw["_m"].dropna().unique().tolist())
-    latest = periods[-1] if periods else None
-    prev = _get_prev_period(periods, latest) if latest else None
-
-    ptab = _portfolio_pass_table(df_raw)
-
-    def _extract_pass(grp, at_period):
-        if at_period is None:
-            return pd.Series(dtype=float)
-        sub = grp[grp["_m"] == at_period][["portfolio", "pass_%"]].set_index("portfolio")["pass_%"]
-        return sub
-
-    curr = _extract_pass(ptab, latest)
-    prevp = _extract_pass(ptab, prev)
-    change = (curr - prevp).dropna().sort_values(ascending=False) if not curr.empty and not prevp.empty else pd.Series(dtype=float)
-    top_up = change.head(2)
-    top_down = change.tail(2).sort_values()
-
     bullets: List[str] = []
     if not np.isnan(last_val):
         if not np.isnan(delta):
             bullets.append(f"**Month-on-Month Pass Rate**: {mom['month'].iloc[-1]} **{last_val:.0f}%** ({'+' if delta>=0 else ''}{delta:.0f} pp MoM).")
         else:
             bullets.append(f"**Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
-    if not change.empty:
-        lines = []
-        for idx, val in top_up.items():
-            lines.append(f"  - *{idx}*: {('+' if val>=0 else '')}{val:.0f} pp MoM")
-        for idx, val in top_down.items():
-            lines.append(f"  - *{idx}*: {val:.0f} pp MoM")
-        if lines:
-            bullets.append("**Standout Portfolios**:\n" + "\n".join(lines))
     return bullets[:4]
 
 def _fig_mom(df: pd.DataFrame, title: str):
@@ -293,22 +266,37 @@ def _fig_pareto_full(df: pd.DataFrame):
     ax1.grid(False); ax2.set_ylim(0, 100)
     return fig
 
+# ======================
+# Comparison helpers (shared)
+# ======================
 def _pass_mom_by_dim(df: pd.DataFrame, dim_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      piv  -> full pivot (dim × months) pass_% (kept as before)
+      latest_tab -> **latest month only**, filtered to exclude zero-volume groups  (# ZERO-FILTER)
+    """
     if df["_m"].dropna().empty:
         return pd.DataFrame(), pd.DataFrame()
     start = JAN_2025
     end = df["_m"].max()
     months = pd.period_range(start, end, freq="M")
     lab = [m.to_timestamp().strftime("%b-%y") for m in months]
+
     g = (df.groupby([dim_col, "_m"])
            .agg(total=("is_pass", "size"), passed=("is_pass", "sum"))
            .reset_index())
     g["pass_%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan)).fillna(0).round(0)
+
     piv = g.pivot(index=dim_col, columns="_m", values="pass_%").reindex(columns=months)
     piv.columns = lab
     piv = piv.fillna(0).sort_index()
+
     latest = end
-    latest_tab = g[g["_m"] == latest][[dim_col, "pass_%"]].set_index(dim_col).sort_values("pass_%", ascending=False)
+    lt = g[g["_m"] == latest][[dim_col, "pass_%", "total"]]
+    # ZERO-FILTER: drop groups with zero total (no records) and any computed 0 pass_% from that condition
+    lt = lt[lt["total"] > 0].copy()
+    lt = lt[lt["pass_%"] > 0].copy()
+    latest_tab = lt.set_index(dim_col)[["pass_%"]].sort_values("pass_%", ascending=False)
     return piv, latest_tab
 
 def _mini_bar_latest(latest_tab: pd.DataFrame, title: str):
@@ -453,7 +441,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Comparisons (filters fixed) =====================
+    # ===================== Comparisons (ZERO rows filtered) =====================
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
@@ -500,14 +488,12 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if have_portfolio:
                 p_opts = sorted(df_raw["portfolio"].dropna().astype(str).unique().tolist())
                 sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=0 if p_opts else 0, key="cmp_mgr_portfolio")
-                # robust filtering by portfolio
-                mask_mgr_port = _mask_eq(df_raw["portfolio"], sel_p_for_mgr)
-                df_mgr = df_raw[mask_mgr_port].copy()
+                df_mgr = df_raw[_mask_eq(df_raw["portfolio"], sel_p_for_mgr)].copy()
             else:
                 st.caption("Portfolio column not found; showing all portfolios for Managers section.")
                 df_mgr = df_raw.copy()
 
-            _, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
+            piv_team, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
             overall_mgr = _overall_latest_pass_pct(df_mgr)
             if overall_mgr is not None and not latest_tab_team.empty:
                 latest_tab_team = latest_tab_team.copy(); latest_tab_team.loc["Overall"] = overall_mgr
@@ -532,9 +518,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                 mgr_opts = sorted(df_raw["team"].dropna().astype(str).unique().tolist())
                 default_mgrs = ["Divya Dayanidhi"] if "Divya Dayanidhi" in mgr_opts else mgr_opts
                 sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=default_mgrs, key="cmp_ind_managers")
-                # robust multiselect filter for team
-                mask_mgrs = _mask_in(df_raw["team"], sel_mgrs_for_ind) if sel_mgrs_for_ind else pd.Series(False, index=df_raw.index)
-                df_ind = df_raw[mask_mgrs].copy() if sel_mgrs_for_ind else df_raw.head(0).copy()
+                df_ind = df_raw[_mask_in(df_raw["team"], sel_mgrs_for_ind)].copy() if sel_mgrs_for_ind else df_raw.head(0).copy()
             else:
                 st.caption("Team manager column not found; Individuals section will not filter by manager.")
                 df_ind = df_raw.copy()
@@ -563,8 +547,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if have_portfolio:
                 p_opts_loc = sorted(df_raw["portfolio"].dropna().astype(str).unique().tolist())
                 sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=0 if p_opts_loc else 0, key="cmp_loc_portfolio")
-                mask_loc_port = _mask_eq(df_raw["portfolio"], sel_p_for_loc)
-                df_loc = df_raw[mask_loc_port].copy()
+                df_loc = df_raw[_mask_eq(df_raw["portfolio"], sel_p_for_loc)].copy()
             else:
                 st.caption("Portfolio column not found; showing all portfolios for Locations section.")
                 df_loc = df_raw.copy()
@@ -593,8 +576,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if have_location:
                 loc_opts = sorted(df_raw["location"].dropna().astype(str).unique().tolist())
                 sel_loc_for_port = st.multiselect("Location (Portfolio section)", options=loc_opts, default=loc_opts, key="cmp_port_locations")
-                mask_port_locs = _mask_in(df_raw["location"], sel_loc_for_port) if sel_loc_for_port else pd.Series(False, index=df_raw.index)
-                df_port = df_raw[mask_port_locs].copy() if sel_loc_for_port else df_raw.head(0).copy()
+                df_port = df_raw[_mask_in(df_raw["location"], sel_loc_for_port)].copy() if sel_loc_for_port else df_raw.head(0).copy()
             else:
                 st.caption("Location column not found; Portfolio section will not filter by location.")
                 df_port = df_raw.copy()
