@@ -248,7 +248,7 @@ def _get_prev_period(periods: List[pd.Period], latest: pd.Period) -> Optional[pd
     return prevs[-1] if prevs else None
 
 def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> List[str]:
-    # (unchanged – omitting for brevity; preserved exactly)
+    # (unchanged – existing logic preserved)
     overall_series = mom["pass_pct"].astype(float)
     last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
     prev_val = overall_series.iloc[-2] if len(overall_series) >= 2 else np.nan
@@ -593,7 +593,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Comparisons (UPDATED: labels, defaults, overall %, avg line) =====================
+    # ===================== Comparisons (UPDATED: spinners + labels + defaults + overall % + avg line) =====================
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
@@ -645,33 +645,34 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         # ---------- Section 1: MANAGERS (local Portfolio filter) ----------
         st.markdown("### Managers")
         if have_team:
-            if have_portfolio:
-                p_opts = sorted(df_raw["portfolio"].dropna().unique().tolist())
-                p_default = 0 if p_opts else 0
-                sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=p_default, key="cmp_mgr_portfolio")
-                df_mgr = df_raw[df_raw["portfolio"] == sel_p_for_mgr].copy()
-            else:
-                st.caption("Portfolio column not found; showing all portfolios for Managers section.")
-                df_mgr = df_raw.copy()
-
-            # Tables and chart
-            _, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
-
-            # Append Overall row
-            overall_mgr = _overall_latest_pass_pct(df_mgr)
-            if overall_mgr is not None and not latest_tab_team.empty:
-                latest_tab_team = latest_tab_team.copy()
-                latest_tab_team.loc["Overall"] = overall_mgr
-
-            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-            with col_chart:
-                if not latest_tab_team.empty:
-                    _bar_with_avg(latest_tab_team, f"Team managers — {sel_p_for_mgr if have_portfolio else 'All'} (latest Pass %)", overall_mgr)
+            with st.spinner("Updating managers…"):
+                if have_portfolio:
+                    p_opts = sorted(df_raw["portfolio"].dropna().unique().tolist())
+                    p_default = 0 if p_opts else 0
+                    sel_p_for_mgr = st.selectbox("Portfolio (Managers section)", options=p_opts, index=p_default, key="cmp_mgr_portfolio")
+                    df_mgr = df_raw[df_raw["portfolio"] == sel_p_for_mgr].copy()
                 else:
-                    st.info("No latest-month data for selected portfolio.")
-            with col_table:
-                if not latest_tab_team.empty:
-                    st.dataframe(latest_tab_team.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                    st.caption("Portfolio column not found; showing all portfolios for Managers section.")
+                    df_mgr = df_raw.copy()
+
+                # Tables and chart
+                _, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
+
+                # Append Overall row
+                overall_mgr = _overall_latest_pass_pct(df_mgr)
+                if overall_mgr is not None and not latest_tab_team.empty:
+                    latest_tab_team = latest_tab_team.copy()
+                    latest_tab_team.loc["Overall"] = overall_mgr
+
+                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+                with col_chart:
+                    if not latest_tab_team.empty:
+                        _bar_with_avg(latest_tab_team, f"Team managers — {sel_p_for_mgr if have_portfolio else 'All'} (latest Pass %)", overall_mgr)
+                    else:
+                        st.info("No latest-month data for selected portfolio.")
+                with col_table:
+                    if not latest_tab_team.empty:
+                        st.dataframe(latest_tab_team.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Team manager column not present in data.")
         st.divider()
@@ -679,36 +680,37 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         # ---------- Section 2: INDIVIDUALS (local Team manager filter; default Divya Dayanidhi) ----------
         st.markdown("### Individuals")
         if have_individual:
-            if have_team:
-                mgr_opts = sorted(df_raw["team"].dropna().unique().tolist())
-                # Default = "Divya Dayanidhi" if present; else all managers
-                default_mgrs = ["Divya Dayanidhi"] if "Divya Dayanidhi" in mgr_opts else mgr_opts
-                sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=default_mgrs, key="cmp_ind_managers")
-                if sel_mgrs_for_ind:
-                    df_ind = df_raw[df_raw["team"].isin(sel_mgrs_for_ind)].copy()
+            with st.spinner("Updating individuals…"):
+                if have_team:
+                    mgr_opts = sorted(df_raw["team"].dropna().unique().tolist())
+                    # Default = "Divya Dayanidhi" if present; else all managers
+                    default_mgrs = ["Divya Dayanidhi"] if "Divya Dayanidhi" in mgr_opts else mgr_opts
+                    sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=default_mgrs, key="cmp_ind_managers")
+                    if sel_mgrs_for_ind:
+                        df_ind = df_raw[df_raw["team"].isin(sel_mgrs_for_ind)].copy()
+                    else:
+                        df_ind = df_raw.head(0).copy()  # empty selection -> empty result
                 else:
-                    df_ind = df_raw.head(0).copy()  # empty selection -> empty result
-            else:
-                st.caption("Team manager column not found; Individuals section will not filter by manager.")
-                df_ind = df_raw.copy()
+                    st.caption("Team manager column not found; Individuals section will not filter by manager.")
+                    df_ind = df_raw.copy()
 
-            _, latest_tab_ind = _pass_mom_by_dim(df_ind, "individual")
+                _, latest_tab_ind = _pass_mom_by_dim(df_ind, "individual")
 
-            # Append Overall row
-            overall_ind = _overall_latest_pass_pct(df_ind)
-            if overall_ind is not None and not latest_tab_ind.empty:
-                latest_tab_ind = latest_tab_ind.copy()
-                latest_tab_ind.loc["Overall"] = overall_ind
+                # Append Overall row
+                overall_ind = _overall_latest_pass_pct(df_ind)
+                if overall_ind is not None and not latest_tab_ind.empty:
+                    latest_tab_ind = latest_tab_ind.copy()
+                    latest_tab_ind.loc["Overall"] = overall_ind
 
-            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-            with col_chart:
-                if not latest_tab_ind.empty:
-                    _bar_with_avg(latest_tab_ind, "Individuals — (latest Pass %)", overall_ind)
-                else:
-                    st.info("No latest-month data for selected managers.")
-            with col_table:
-                if not latest_tab_ind.empty:
-                    st.dataframe(latest_tab_ind.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+                with col_chart:
+                    if not latest_tab_ind.empty:
+                        _bar_with_avg(latest_tab_ind, "Individuals — (latest Pass %)", overall_ind)
+                    else:
+                        st.info("No latest-month data for selected managers.")
+                with col_table:
+                    if not latest_tab_ind.empty:
+                        st.dataframe(latest_tab_ind.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Individuals column not present in data.")
         st.divider()
@@ -716,32 +718,33 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         # ---------- Section 3: LOCATIONS (local Portfolio filter) ----------
         st.markdown("### Locations")
         if have_location:
-            if have_portfolio:
-                p_opts_loc = sorted(df_raw["portfolio"].dropna().unique().tolist())
-                p_default_loc = 0 if p_opts_loc else 0
-                sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=p_default_loc, key="cmp_loc_portfolio")
-                df_loc = df_raw[df_raw["portfolio"] == sel_p_for_loc].copy()
-            else:
-                st.caption("Portfolio column not found; showing all portfolios for Locations section.")
-                df_loc = df_raw.copy()
-
-            _, latest_tab_loc = _pass_mom_by_dim(df_loc, "location")
-
-            # Append Overall row
-            overall_loc = _overall_latest_pass_pct(df_loc)
-            if overall_loc is not None and not latest_tab_loc.empty:
-                latest_tab_loc = latest_tab_loc.copy()
-                latest_tab_loc.loc["Overall"] = overall_loc
-
-            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-            with col_chart:
-                if not latest_tab_loc.empty:
-                    _bar_with_avg(latest_tab_loc, f"Locations — {sel_p_for_loc if have_portfolio else 'All'} (latest Pass %)", overall_loc)
+            with st.spinner("Updating locations…"):
+                if have_portfolio:
+                    p_opts_loc = sorted(df_raw["portfolio"].dropna().unique().tolist())
+                    p_default_loc = 0 if p_opts_loc else 0
+                    sel_p_for_loc = st.selectbox("Portfolio (Locations section)", options=p_opts_loc, index=p_default_loc, key="cmp_loc_portfolio")
+                    df_loc = df_raw[df_raw["portfolio"] == sel_p_for_loc].copy()
                 else:
-                    st.info("No latest-month data for selected portfolio.")
-            with col_table:
-                if not latest_tab_loc.empty:
-                    st.dataframe(latest_tab_loc.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                    st.caption("Portfolio column not found; showing all portfolios for Locations section.")
+                    df_loc = df_raw.copy()
+
+                _, latest_tab_loc = _pass_mom_by_dim(df_loc, "location")
+
+                # Append Overall row
+                overall_loc = _overall_latest_pass_pct(df_loc)
+                if overall_loc is not None and not latest_tab_loc.empty:
+                    latest_tab_loc = latest_tab_loc.copy()
+                    latest_tab_loc.loc["Overall"] = overall_loc
+
+                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+                with col_chart:
+                    if not latest_tab_loc.empty:
+                        _bar_with_avg(latest_tab_loc, f"Locations — {sel_p_for_loc if have_portfolio else 'All'} (latest Pass %)", overall_loc)
+                    else:
+                        st.info("No latest-month data for selected portfolio.")
+                with col_table:
+                    if not latest_tab_loc.empty:
+                        st.dataframe(latest_tab_loc.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Location column not present in data.")
         st.divider()
@@ -749,34 +752,35 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         # ---------- Section 4: PORTFOLIO (local Location filter) ----------
         st.markdown("### Portfolio")
         if have_portfolio:
-            if have_location:
-                loc_opts = sorted(df_raw["location"].dropna().unique().tolist())
-                sel_loc_for_port = st.multiselect("Location (Portfolio section)", options=loc_opts, default=loc_opts, key="cmp_port_locations")
-                if sel_loc_for_port:
-                    df_port = df_raw[df_raw["location"].isin(sel_loc_for_port)].copy()
+            with st.spinner("Updating portfolios…"):
+                if have_location:
+                    loc_opts = sorted(df_raw["location"].dropna().unique().tolist())
+                    sel_loc_for_port = st.multiselect("Location (Portfolio section)", options=loc_opts, default=loc_opts, key="cmp_port_locations")
+                    if sel_loc_for_port:
+                        df_port = df_raw[df_raw["location"].isin(sel_loc_for_port)].copy()
+                    else:
+                        df_port = df_raw.head(0).copy()
                 else:
-                    df_port = df_raw.head(0).copy()
-            else:
-                st.caption("Location column not found; Portfolio section will not filter by location.")
-                df_port = df_raw.copy()
+                    st.caption("Location column not found; Portfolio section will not filter by location.")
+                    df_port = df_raw.copy()
 
-            _, latest_tab_port = _pass_mom_by_dim(df_port, "portfolio")
+                _, latest_tab_port = _pass_mom_by_dim(df_port, "portfolio")
 
-            # Append Overall row
-            overall_port = _overall_latest_pass_pct(df_port)
-            if overall_port is not None and not latest_tab_port.empty:
-                latest_tab_port = latest_tab_port.copy()
-                latest_tab_port.loc["Overall"] = overall_port
+                # Append Overall row
+                overall_port = _overall_latest_pass_pct(df_port)
+                if overall_port is not None and not latest_tab_port.empty:
+                    latest_tab_port = latest_tab_port.copy()
+                    latest_tab_port.loc["Overall"] = overall_port
 
-            col_chart, col_table = st.columns((1.0, 1.0), gap="large")
-            with col_chart:
-                if not latest_tab_port.empty:
-                    _bar_with_avg(latest_tab_port, "Portfolio — (latest Pass %)", overall_port)
-                else:
-                    st.info("No latest-month data for selected locations.")
-            with col_table:
-                if not latest_tab_port.empty:
-                    st.dataframe(latest_tab_port.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                col_chart, col_table = st.columns((1.0, 1.0), gap="large")
+                with col_chart:
+                    if not latest_tab_port.empty:
+                        _bar_with_avg(latest_tab_port, "Portfolio — (latest Pass %)", overall_port)
+                    else:
+                        st.info("No latest-month data for selected locations.")
+                with col_table:
+                    if not latest_tab_port.empty:
+                        st.dataframe(latest_tab_port.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         else:
             st.info("Portfolio column not present in data.")
 
