@@ -9,7 +9,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 
-# ========== small helpers ==========
+# ===================== small helpers =====================
 def _find_col(df: pd.DataFrame, candidates) -> Optional[str]:
     cols = {str(c).strip().lower(): c for c in df.columns}
     for c in candidates:
@@ -21,7 +21,8 @@ def _soft_pastels(n: int) -> list:
     base = ["#A3C4F3", "#CDE7BE", "#F6C1C1", "#FFD6A5", "#BDB2FF", "#FFAFCC", "#BEE1E6", "#E2ECE9"]
     return [base[i % len(base)] for i in range(n)]
 
-# ========== surveys (NPS) ==========
+
+# ===================== surveys (NPS) =====================
 def _prepare_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty:
         return pd.DataFrame()
@@ -79,6 +80,7 @@ def _prepare_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def _aggregate_nps(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -98,7 +100,8 @@ def _aggregate_nps(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     latest_pivot = latest.pivot_table(index="portfolio", values="NPS%", aggfunc="mean").sort_values("NPS%", ascending=False)
     return by_month_portfolio, latest_pivot
 
-# ========== suggestions sentiment ==========
+
+# ===================== suggestions sentiment =====================
 _POS_WORDS = {
     "good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
     "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"
@@ -117,6 +120,7 @@ _CATEGORY_PATTERNS = [
     ("Staff & Behavior", [r"agent", r"executive", r"representative", r"staff", r"polite", r"rude", r"attitude", r"helpful"]),
     ("Clarity & Information", [r"clear", r"explain", r"information", r"transparen", r"confus", r"guid", r" educate "]),
 ]
+
 def _get_vader():
     try:
         from nltk.sentiment import SentimentIntensityAnalyzer  # type: ignore
@@ -127,6 +131,7 @@ def _get_vader():
             return SentimentIntensityAnalyzer()
         except Exception:
             return None
+
 _SIA = _get_vader()
 _CAT_REGEX = [(name, [re.compile(pat, re.IGNORECASE) for pat in pats]) for name, pats in _CATEGORY_PATTERNS]
 
@@ -169,7 +174,8 @@ def _analyze_suggestions(df: pd.DataFrame) -> pd.DataFrame:
     sug["category"] = cats
     return sug
 
-# ========== FPA (Accuracy) ==========
+
+# ===================== FPA (Accuracy) =====================
 def _prepare_fpa(df_raw: pd.DataFrame) -> pd.DataFrame:
     """Robust parser for FPA/Accuracy with many schema variants."""
     if df_raw is None or df_raw.empty: return pd.DataFrame()
@@ -187,7 +193,6 @@ def _prepare_fpa(df_raw: pd.DataFrame) -> pd.DataFrame:
         dt = pd.to_datetime(df[dcol], errors="coerce", dayfirst=True, infer_datetime_format=True)
     elif mcol:
         dt = pd.to_datetime(df[mcol], errors="coerce", dayfirst=True, infer_datetime_format=True)
-        # if 'Jan', assume 2025 as fallback
         need = dt.isna()
         if need.any():
             mm = df.loc[need, mcol].astype(str).str[:3].str.title()
@@ -203,15 +208,13 @@ def _prepare_fpa(df_raw: pd.DataFrame) -> pd.DataFrame:
     acc_col = _find_col(df, ["accuracy", "accuracy %", "first pass accuracy", "first-pass accuracy", "fpa", "fpa %"])
     if acc_col:
         acc = pd.to_numeric(df[acc_col], errors="coerce")
-        # if on 0–1 scale, lift to %
         mx = pd.Series(acc).dropna().max() if acc is not None else None
-        if mx is not None and mx <= 1.4:  # ~1.0
+        if mx is not None and mx <= 1.4:  # 0–1 scale → %
             acc = acc * 100.0
         df["_acc_pct"] = acc
         weight = _find_col(df, ["checks", "total", "count", "volume", "cases", "records", "num_records"])
         df["_weight"] = pd.to_numeric(df[weight], errors="coerce") if weight else 1.0
     else:
-        # try numerator / denominator
         num = _find_col(df, ["accurate", "passed", "first pass", "correct", "pass_count"])
         den = _find_col(df, ["checked", "total", "count", "volume", "cases", "records", "num_records"])
         if den:
@@ -223,7 +226,6 @@ def _prepare_fpa(df_raw: pd.DataFrame) -> pd.DataFrame:
             df["_acc_pct"] = np.nan
             df["_weight"] = 1.0
 
-    # keep only relevant columns
     return df[["portfolio", "_month", "_acc_pct", "_weight"]]
 
 def _aggregate_accuracy(df: pd.DataFrame) -> pd.DataFrame:
@@ -231,13 +233,16 @@ def _aggregate_accuracy(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["_month"].notna()].copy()
     grp = df.groupby(["portfolio", "_month"]).apply(
         lambda g: pd.Series({
-            "Accuracy%": np.average(g["_acc_pct"].dropna(), weights=g["_weight"].reindex(g["_acc_pct"].index).fillna(1.0)) if g["_acc_pct"].notna().any() else np.nan,
+            "Accuracy%": np.average(g["_acc_pct"].dropna(),
+                                   weights=g["_weight"].reindex(g["_acc_pct"].index).fillna(1.0))
+                       if g["_acc_pct"].notna().any() else np.nan,
             "Checks": np.nansum(g["_weight"])
         })
     ).reset_index()
     return grp
 
-# ========== filters ==========
+
+# ===================== filters =====================
 def _sidebar_filters(df: pd.DataFrame) -> Dict[str, Any]:
     with st.sidebar:
         st.header("Filters")
@@ -252,19 +257,20 @@ def _sidebar_filters(df: pd.DataFrame) -> Dict[str, Any]:
             start = end = None
     return {"portfolio": port, "start": start, "end": end}
 
-# ========== UI entry ==========
+
+# ===================== UI entry =====================
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
     """
     Entry point required by app.py.
-    Returns: (title, subtitle), EMPTY dataframe (avoid host duplicate table)
+    Returns: (title, subtitle), dataframe  (always non-empty to avoid host error UI)
     """
     surveys = store.get("surveys", pd.DataFrame())
     if surveys is None or surveys.empty:
-        return ("NPS by Portfolio", "No surveys data found. Put files under data/surveys/"), pd.DataFrame()
+        return ("NPS by Portfolio", "No surveys data found. Put files under data/surveys/"), pd.DataFrame([{"Message":"No surveys data found."}])
 
     df = _prepare_surveys(surveys)
     if df.empty or df["_month"].isna().all():
-        return ("NPS by Portfolio", "Could not parse Month_received; please check column name/values."), pd.DataFrame()
+        return ("NPS by Portfolio", "Could not parse Month_received; please check column name/values."), pd.DataFrame([{"Message":"Month parsing failed"}])
 
     # filters
     flt = _sidebar_filters(df)
@@ -290,7 +296,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     st.markdown(f"### Overall NPS (selected range): **{overall_nps:.1f}**")
 
     # ===== TABS =====
-    tab1, tab2, tab3 = st.tabs(["Overview", "Suggestions", "Combined (NPS × Sentiment × Accuracy)"])
+    tab1, tab2, tab3 = st.tabs(["Overview", "Sentiments", "NPS Correlation"])
 
     # ----- Tab 1: Overview (trend + detail table side-by-side) -----
     with tab1:
@@ -303,7 +309,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     ax.plot(
                         g["_month"].astype(str), g["NPS%"],
                         marker="o", linewidth=2.0, markersize=4.5,
-                        label=p, color=_soft_pastels(1)[0] if len(by_month_portfolio["portfolio"].unique())==1 else _soft_pastels(8)[i%8]
+                        label=p, color=_soft_pastels(8)[i % 8]
                     )
                 for spine in ["top", "right", "left"]:
                     ax.spines[spine].set_visible(False)
@@ -319,12 +325,11 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             cols = ["portfolio", "_month", "NPS%", "promoter", "passive", "detractor", "unknown", "Total"]
             detail = by_month_portfolio[cols].rename(columns={"_month":"Month","NPS%":"NPS"})
             if not detail.empty:
-                detail = detail.copy()
-                detail["NPS"] = detail["NPS"].round(1)
+                detail = detail.copy(); detail["NPS"] = detail["NPS"].round(1)
             st.markdown("#### Detail (by Portfolio × Month)")
             st.dataframe(detail, use_container_width=True)
 
-    # ----- Tab 2: Suggestions (sentiment chart + category table) -----
+    # ----- Tab 2: Sentiments (sentiment chart + category table) -----
     with tab2:
         sug = _analyze_suggestions(df)
         if not sug.empty:
@@ -340,7 +345,8 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         else:
             s_left, s_right = st.columns([1, 1])
             with s_left:
-                sent_pivot = sug.pivot_table(index="portfolio", columns="sentiment", values="suggestions", aggfunc="count", fill_value=0)
+                sent_pivot = sug.pivot_table(index="portfolio", columns="sentiment",
+                                             values="suggestions", aggfunc="count", fill_value=0)
                 order = [c for c in ["negative","neutral","positive"] if c in sent_pivot.columns]
                 sent_pivot = sent_pivot[order]
                 colors = {"negative": "#F6C1C1", "neutral": "#E2ECE9", "positive": "#CDE7BE"}
@@ -349,11 +355,11 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 x = np.arange(len(sent_pivot.index))
                 bottom = np.zeros(len(x))
                 for col in sent_pivot.columns:
-                    ax2.bar(x, sent_pivot[col].values, bottom=bottom, label=col.capitalize(), color=colors.get(col))
+                    ax2.bar(x, sent_pivot[col].values, bottom=bottom,
+                            label=col.capitalize(), color=colors.get(col))
                     bottom += sent_pivot[col].values
 
-                ax2.set_xticks(x)
-                ax2.set_xticklabels(sent_pivot.index, rotation=90)
+                ax2.set_xticks(x); ax2.set_xticklabels(sent_pivot.index, rotation=90)
                 for spine in ["top", "right", "left"]:
                     ax2.spines[spine].set_visible(False)
                 ax2.spines["bottom"].set_color("#D3D3D3")
@@ -379,11 +385,12 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 examples = sug.groupby("category")["suggestions"].apply(lambda s: (s.dropna().iloc[0] if len(s.dropna()) else ""))
                 cat_summary = cat_summary.join(examples.rename("Example")).drop(columns=["Pos","Neg"])
                 st.markdown("#### Categories (filtered range)")
-                st.dataframe(cat_summary[["Count","%","Positive %","Negative %","Example"]], use_container_width=True)
+                st.dataframe(cat_summary[["Count","%","Positive %","Negative %","Example"]],
+                             use_container_width=True)
 
-    # ----- Tab 3: Combined (NPS × Sentiment × Accuracy) -----
+    # ----- Tab 3: NPS Correlation (NPS × Sentiment × Accuracy) -----
     with tab3:
-        # Build sentiment KPIs per Portfolio × Month
+        # Sentiment KPIs per Portfolio × Month
         sug_all = _analyze_suggestions(df)
         if not sug_all.empty:
             sent = (
@@ -401,17 +408,17 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         else:
             sent = pd.DataFrame(columns=["portfolio","_month","Sugg","Pos%","Neg%","NetSent%"])
 
-        # FPA accuracy
+        # FPA accuracy (optional)
         fpa_raw = store.get("fpa", pd.DataFrame())
-        fpa_norm = _prepare_fpa(fpa_raw)
-        acc = _aggregate_accuracy(fpa_norm)
+        acc = _aggregate_accuracy(_prepare_fpa(fpa_raw))
 
         # Join NPS + Sentiment + Accuracy
         combo = by_month_portfolio[["portfolio","_month","NPS%","Total"]].merge(
             sent[["portfolio","_month","Sugg","Pos%","Neg%","NetSent%"]],
             on=["portfolio","_month"], how="left"
         ).merge(
-            acc[["portfolio","_month","Accuracy%","Checks"]],
+            acc[["portfolio","_month","Accuracy%","Checks"]] if not acc.empty else
+            pd.DataFrame(columns=["portfolio","_month","Accuracy%","Checks"]),
             on=["portfolio","_month"], how="left"
         )
 
@@ -424,46 +431,39 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             combo = combo[combo["_month"] <= flt["end"]]
 
         if combo.empty:
-            st.info("No overlapped data across NPS, Suggestions, and Accuracy for the selected range.")
+            st.info("No overlapped data across NPS, Sentiment, and Accuracy for the selected range.")
         else:
-            # Use latest month in range for cleaner scatter; toggle easily if you want "all months"
             latest_m = combo["_month"].max()
             latest_slice = combo[combo["_month"] == latest_m].copy()
 
             c_left, c_right = st.columns([1,1])
 
             with c_left:
-                # Scatter: NPS vs Accuracy (bubble size = suggestions volume; color by NetSent)
-                fig3, ax3 = plt.subplots()
-                x = latest_slice["NPS%"]
-                y = latest_slice["Accuracy%"]
-                s = latest_slice["Sugg"].fillna(0).astype(float)
-                s_scaled = (np.sqrt(s) + 3) * 15.0  # gentle scaling so small vols still visible
-                # map NetSent to pastel colors: negative->reddish, neutral->grey, positive->greenish
-                colors = []
-                for v in latest_slice["NetSent%"].fillna(0):
-                    if v <= -5: colors.append("#F6C1C1")
-                    elif v >= 5: colors.append("#CDE7BE")
-                    else: colors.append("#E2ECE9")
-                ax3.scatter(x, y, s=s_scaled, c=colors, edgecolors="none")
-
-                # label some points lightly (optional: top 8 by volume)
-                top = latest_slice.assign(vol=s).sort_values("vol", ascending=False).head(min(8, len(latest_slice)))
-                for _, r in top.iterrows():
-                    ax3.text(r["NPS%"], r["Accuracy%"], str(r["portfolio"])[:14], fontsize=8, ha="center", va="bottom")
-
-                # Style
-                for spine in ["top","right","left"]:
-                    ax3.spines[spine].set_visible(False)
-                ax3.spines["bottom"].set_color("#D3D3D3")
-                ax3.get_yaxis().set_visible(False)
-                ax3.grid(False)
-                ax3.set_xlabel("NPS %")
-                ax3.set_title(f"NPS vs Accuracy (Latest: {str(latest_m)})", fontsize=12, pad=6)
-                st.pyplot(fig3, use_container_width=True)
+                if "Accuracy%" in latest_slice.columns and latest_slice["Accuracy%"].notna().any():
+                    fig3, ax3 = plt.subplots()
+                    x = latest_slice["NPS%"]
+                    y = latest_slice["Accuracy%"]
+                    s = latest_slice["Sugg"].fillna(0).astype(float)
+                    s_scaled = (np.sqrt(s) + 3) * 15.0
+                    colors = []
+                    for v in latest_slice["NetSent%"].fillna(0):
+                        if v <= -5: colors.append("#F6C1C1")
+                        elif v >= 5: colors.append("#CDE7BE")
+                        else: colors.append("#E2ECE9")
+                    ax3.scatter(x, y, s=s_scaled, c=colors, edgecolors="none")
+                    # style
+                    for spine in ["top","right","left"]:
+                        ax3.spines[spine].set_visible(False)
+                    ax3.spines["bottom"].set_color("#D3D3D3")
+                    ax3.get_yaxis().set_visible(False)
+                    ax3.grid(False)
+                    ax3.set_xlabel("NPS %")
+                    ax3.set_title(f"NPS vs Accuracy (Latest: {str(latest_m)})", fontsize=12, pad=6)
+                    st.pyplot(fig3, use_container_width=True)
+                else:
+                    st.info("Accuracy data not available for the latest month; showing table only.")
 
             with c_right:
-                # Combined table
                 view = combo.copy()
                 view = view.rename(columns={"_month":"Month","NPS%":"NPS","Accuracy%":"Accuracy"})
                 for c in ["NPS","Accuracy","Pos%","Neg%","NetSent%"]:
@@ -474,18 +474,35 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 st.markdown("#### Combined KPIs (Portfolio × Month)")
                 st.dataframe(view[cols].sort_values(["Month","portfolio"]), use_container_width=True)
 
-            # tiny correlation panel (across selected slice)
+            # quick correlations across the selection
             c1, c2 = st.columns(2)
             with c1:
                 corr = view[["NPS","Accuracy"]].dropna()
                 if len(corr) >= 2:
                     pear = float(corr.corr(method="pearson").iloc[0,1])
                     st.caption(f"Pearson(NPS, Accuracy) across selection: **{pear:.2f}**")
+                else:
+                    st.caption("Pearson(NPS, Accuracy): not enough data")
             with c2:
                 corr2 = view[["NPS","NetSent%"]].dropna()
                 if len(corr2) >= 2:
                     pear2 = float(corr2.corr(method="pearson").iloc[0,1])
                     st.caption(f"Pearson(NPS, Net Sentiment) across selection: **{pear2:.2f}**")
+                else:
+                    st.caption("Pearson(NPS, Net Sentiment): not enough data")
 
-    # return EMPTY df to avoid host duplicate output row
-    return ("NPS by Portfolio", "Reads surveys (Sheet 1), computes NPS, runs Suggestions analysis, and combines with Accuracy."), pd.DataFrame()
+    # ===== Return a real DataFrame so the host never shows the import error =====
+    # Prefer the Combined KPIs table; if empty, return the NPS detail table.
+    host_df = locals().get("view", pd.DataFrame())
+    if host_df is None or host_df.empty:
+        # fallback to detail
+        cols = ["portfolio", "_month", "NPS%", "promoter", "passive", "detractor", "unknown", "Total"]
+        if not by_month_portfolio.empty:
+            host_df = by_month_portfolio[cols].rename(columns={"_month":"Month","NPS%":"NPS"})
+            host_df["NPS"] = host_df["NPS"].round(1)
+        else:
+            host_df = pd.DataFrame([{"Message":"No data for selected filters"}])
+
+    return ("NPS by Portfolio",
+            "Reads surveys (Sheet 1), computes NPS, shows Sentiments, and correlates with Accuracy."),
+            host_df
