@@ -282,7 +282,7 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
 
     if not fails_all.empty and latest is not None:
         latest_fails = fails_all[fails_all["_m"] == latest]
-        prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns(fails_all.columns))
+        prev_fails = fails_all[fails_all["_m"] == prev] if prev is not None else pd.DataFrame(columns=fails_all.columns)
 
         # concentration by portfolio (share in latest)
         by_port = latest_fails.groupby("portfolio").size().sort_values(ascending=False)
@@ -315,8 +315,10 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
                 parts = ", ".join([f"{k} ({int(v)})" for k, v in tops.items()])
                 contrib_points.append(f"Top portfolios for **{r}**: {parts}.")
 
-    # ---- Build bullets ----
+    # ---- Build bullets in structured + indented format ----
     bullets: List[str] = []
+
+    # Pass rate headline
     if not np.isnan(last_val):
         if not np.isnan(delta):
             bullets.append(
@@ -326,27 +328,37 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
         else:
             bullets.append(f"**Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
 
+    # Standout portfolios (indented)
     if not change.empty:
         lines = []
+        # Up movers
         for idx, val in top_up.items():
             lines.append(f"  - *{idx}*: {('+' if val>=0 else '')}{val:.0f} pp MoM")
+        # Down movers
         for idx, val in top_down.items():
             lines.append(f"  - *{idx}*: {val:.0f} pp MoM")
         if lines:
             bullets.append("**Standout Portfolios**:\n" + "\n".join(lines))
 
+    # Fail reasons (top 2) (indented)
     if reasons_points:
         bullets.append("**Fail Reasons (Top 2)**:\n" + "\n".join([f"  - {p}" for p in reasons_points]))
 
+    # Standout observations (indented)
     if obs_points or contrib_points:
         combined = obs_points + contrib_points
         bullets.append("**Standout Observations**:\n" + "\n".join([f"  - {p}" for p in combined]))
 
+    # Keep 3–4 bullets max
     if len(bullets) > 4:
         bullets = bullets[:4]
     return bullets
 
 def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> Optional[List[str]]:
+    """
+    Try to use OpenAI (if available). If anything fails, return None to fall back safely.
+    Requires OPENAI_API_KEY in env or st.secrets["OPENAI_API_KEY"] and `openai` >= 1.0 installed.
+    """
     try:
         df_tmp = df_raw.copy()
         df_tmp["_m"] = _coerce_month(df_tmp["date"])
@@ -368,7 +380,11 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
             fr_df = pd.DataFrame({"latest": fr_now}).join(pd.DataFrame({"prev": fr_prev}), how="outer").fillna(0).astype(int)
             fr_str = fr_df.to_csv()
 
-        from openai import OpenAI  # may not be available; handled by except
+        try:
+            from openai import OpenAI
+        except Exception:
+            return None
+
         api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
         if not api_key:
             return None
@@ -411,6 +427,7 @@ def _openai_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.Data
         return None
 
 def _render_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.DataFrame) -> None:
+    # Try OpenAI → fallback heuristic
     bullets = _openai_insights(mom, df_raw, fails_all)
     if not bullets:
         bullets = _heuristic_insights(mom, df_raw, fails_all)
@@ -624,35 +641,81 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             else:
                 st.info("No 2025 fail reason data available to populate the matrix.")
 
-    # ===================== Tab 2: Comparisons (existing layout preserved) =====================
+    # ===================== Tab 2: Comparisons (UPDATED AS REQUESTED) =====================
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .75rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
-        st.caption("Explore pass percentages across different slices such as Portfolio, Team, Work Type, Individuals and Locations (where available in your data).")
 
-        dims = [
-            ("portfolio", "Portfolio"),
-            ("team", "Team"),
-            ("work_type", "Work Type"),
-            ("individual", "Individual"),
-            ("location", "Location"),
-        ]
-        for logical, label in dims:
-            dim_col = _available_dim(df_raw, logical, col_map)
-            if dim_col is None:
-                continue
+        # ---- Filters at top of Comparisons tab ----
+        # We require portfolio (single-select) and team manager (multi-select within selected portfolio)
+        have_portfolio = "portfolio" in df_raw.columns
+        have_team = "team" in df_raw.columns
+        have_individual = "individual" in df_raw.columns
 
-            st.markdown(f"##### {label}")
+        if not have_portfolio:
+            st.info("Portfolio column not found; comparisons filtering is limited.")
+            df_cmp_base = df_raw.copy()
+            portfolios = []
+            sel_portfolio = None
+        else:
+            portfolios = sorted(df_raw["portfolio"].dropna().unique().tolist())
+            default_index = 0 if portfolios else 0
+            sel_portfolio = st.selectbox("Portfolio", options=portfolios, index=default_index) if portfolios else None
+            df_cmp_base = df_raw[df_raw["portfolio"] == sel_portfolio].copy() if sel_portfolio else df_raw.copy()
 
-            mom_tab, latest_tab = _pass_mom_by_dim(df_raw, dim_col)
+        # Team manager list depends on selected portfolio
+        if have_team:
+            managers_all = sorted(df_cmp_base["team"].dropna().unique().tolist())
+            sel_managers = st.multiselect(
+                "Team manager",
+                options=managers_all,
+                default=managers_all
+            )
+        else:
+            sel_managers = []
 
-            # Latest month mini bar
-            if not latest_tab.empty:
-                _mini_bar_latest(latest_tab, f"{label} — Latest month Pass %")
+        # Apply manager filter
+        if have_team and sel_managers:
+            df_cmp = df_cmp_base[df_cmp_base["team"].isin(sel_managers)].copy()
+        else:
+            df_cmp = df_cmp_base.copy()
 
-            # MoM table
-            if not mom_tab.empty:
-                st.dataframe(mom_tab, use_container_width=True)
-            else:
-                st.info(f"No data to compute {label} pass percentages.")
+        # ---- TEAM: chart + table side by side (latest month) ----
+        st.markdown("#### Team managers — Latest month")
+        c_tm_chart, c_tm_table = st.columns((1.0, 1.0), gap="large")
+        if have_team:
+            # latest month table for teams from the filtered df
+            _, latest_tab_team = _pass_mom_by_dim(df_cmp, "team")
+            with c_tm_chart:
+                if not latest_tab_team.empty:
+                    _mini_bar_latest(latest_tab_team, f"Team manager — {sel_portfolio if sel_portfolio else 'All'} (latest Pass %)")
+                else:
+                    st.info("No latest-month data for selected filters.")
+            with c_tm_table:
+                if not latest_tab_team.empty:
+                    st.dataframe(latest_tab_team.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                else:
+                    st.empty()
+        else:
+            st.info("Team manager column not present in data.")
+
+        st.divider()
+
+        # ---- INDIVIDUALS: chart + table side by side (latest month) ----
+        st.markdown("#### Individuals — Latest month")
+        c_ind_chart, c_ind_table = st.columns((1.0, 1.0), gap="large")
+        if have_individual:
+            _, latest_tab_ind = _pass_mom_by_dim(df_cmp, "individual")
+            with c_ind_chart:
+                if not latest_tab_ind.empty:
+                    _mini_bar_latest(latest_tab_ind, f"Individuals — {sel_portfolio if sel_portfolio else 'All'} (latest Pass %)")
+                else:
+                    st.info("No latest-month data for selected filters.")
+            with c_ind_table:
+                if not latest_tab_ind.empty:
+                    st.dataframe(latest_tab_ind.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+                else:
+                    st.empty()
+        else:
+            st.info("Individuals column not present in data.")
 
     return ("", pd.DataFrame())
