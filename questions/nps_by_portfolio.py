@@ -9,7 +9,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 
-# =============== utils ===============
+# ----------------- helpers -----------------
 def _find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
     if df is None or df.empty:
         return None
@@ -30,6 +30,7 @@ def _norm_portfolio(x: str) -> str:
     t = t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
     return t
 
+# simple offline lexical sentiment
 _POS = {"good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
         "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"}
 _NEG = {"bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
@@ -44,10 +45,12 @@ def _lex_sentiment(text: str) -> float:
     score = sum(1 for t in toks if t in _POS) - sum(1 for t in toks if t in _NEG)
     return max(-1.0, min(1.0, score / max(len(toks), 4)))
 
-# =============== surveys (NPS) prep ===============
+
+# ----------------- surveys (NPS + suggestions) -----------------
 def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame()
     df = df_raw.copy()
+
     pcol = _find_col(df, ["portfolio"])
     df["Portfolio"] = df[pcol].map(_norm_portfolio) if pcol else "Unknown"
 
@@ -64,7 +67,8 @@ def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     scol = _find_col(df, ["nps","nps score","nps_score","nps (0-10)","score","rating"])
     score = pd.to_numeric(df[scol], errors="coerce") if scol else pd.Series([np.nan]*len(df))
-    df["nps_bucket"] = np.where(score >= 9, "promoter", np.where(score >= 7, "passive", np.where(score >= 0, "detractor", "unknown")))
+    bucket = np.where(score >= 9, "promoter", np.where(score >= 7, "passive", np.where(score >= 0, "detractor","unknown")))
+    df["nps_bucket"] = bucket
 
     sugcol = _find_col(df, ["suggestions","suggestion","comments","comment","feedback"])
     if sugcol:
@@ -92,7 +96,8 @@ def _sentiments(df: pd.DataFrame) -> pd.DataFrame:
     sug["sent_score"] = score; sug["sent_label"] = lab
     return sug
 
-# =============== ops/service (SLA) ===============
+
+# ----------------- ops/service (SLA) -----------------
 def _prep_ops(df_ops: pd.DataFrame) -> pd.DataFrame:
     if df_ops is None or df_ops.empty: return pd.DataFrame()
     d = df_ops.copy()
@@ -116,7 +121,8 @@ def _ops_kpis(d_ops: pd.DataFrame) -> pd.DataFrame:
     g["SLA%"] = (g["Within"] / g["Total"]) * 100.0
     return g
 
-# =============== complaints (optional) ===============
+
+# ----------------- complaints (optional) -----------------
 def _prep_complaints(df_comp: pd.DataFrame) -> pd.DataFrame:
     if df_comp is None or df_comp.empty: return pd.DataFrame()
     c = df_comp.copy()
@@ -132,9 +138,12 @@ def _prep_complaints(df_comp: pd.DataFrame) -> pd.DataFrame:
     c["_month"] = pd.to_datetime(months, errors="coerce").dt.to_period("M")
     return c
 
-# =============== UI entry ===============
+
+# ----------------- UI entry -----------------
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
+    """Always returns ((title, subtitle), dataframe) and never raises to the host."""
     try:
+        # Load
         surveys = store.get("surveys", pd.DataFrame())
         ops_raw = store.get("ops", store.get("fpa", pd.DataFrame()))
         complaints_raw = store.get("complaints", pd.DataFrame())
@@ -144,6 +153,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             msg = pd.DataFrame([{"Message": "No usable surveys (check Month_received, NPS, Suggestions)."}])
             return ("NPS by Portfolio", "Surveys (Sheet 1)"), msg
 
+        # Sidebar filters
         with st.sidebar:
             st.header("Filters")
             ports = ["(All)"] + sorted(s["Portfolio"].dropna().unique().tolist())
@@ -152,11 +162,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             start = st.selectbox("From month", months, index=0) if months else None
             end = st.selectbox("To month", months, index=len(months)-1) if months else None
 
+        # NPS aggregates
         nps = _aggregate_nps(s)
         if sel_port != "(All)": nps = nps[nps["Portfolio"] == sel_port]
         if start is not None:  nps = nps[nps["_month"] >= start]
         if end   is not None:  nps = nps[nps["_month"] <= end]
 
+        # overall NPS (weighted)
         if not nps.empty:
             weights = nps[["promoter","passive","detractor","unknown"]].sum(axis=1)
             overall_nps = float((nps["NPS%"] * weights).sum() / weights.sum()) if weights.sum() else np.nan
@@ -164,6 +176,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             overall_nps = np.nan
         st.markdown(f"### Overall NPS (selected range): **{overall_nps:.1f}**")
 
+        # Tabs
         tab1, tab2, tab3 = st.tabs(["Overview", "Sentiments", "NPS Correlation"])
 
         # ---- Tab 1: overview ----
@@ -260,31 +273,50 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if start is not None:  combined_df = combined_df[combined_df["_month"] >= start]
             if end   is not None:  combined_df = combined_df[combined_df["_month"] <= end]
 
+            # add Complaints/1000 for the table
+            if "Complaints" in combined_df.columns:
+                if "Completes" in combined_df.columns:
+                    combined_df["Complaints_per_1000"] = (pd.to_numeric(combined_df["Complaints"], errors="coerce") /
+                                                           pd.to_numeric(combined_df["Completes"], errors="coerce")) * 1000
+                else:
+                    combined_df["Complaints_per_1000"] = np.nan
+
             latest_m = combined_df["_month"].max() if not combined_df.empty else None
             latest = combined_df[combined_df["_month"] == latest_m].copy() if latest_m is not None else pd.DataFrame()
 
+            # LHS: chart area
             c_left, c_right = st.columns([1,1])
             with c_left:
-                # keep old SLA info if missing
-                if (latest.empty) or ("SLA%" not in latest.columns) or (latest["SLA%"].notna().sum() == 0):
-                    st.info("SLA/Service data not available for the latest month; showing table only.")
+                plotted_any = False
 
-                # NEW: NPS vs Complaints (or Complaints/1000) chart
-                if not latest.empty and "NPS" in latest.columns and "Complaints" in latest.columns:
-                    # numeric complaints
+                # 1) Draw SLA scatter if available
+                if not latest.empty and "SLA%" in latest.columns and latest["SLA%"].notna().any():
+                    fig3, ax3 = plt.subplots()
+                    x = latest["NPS"]; y = latest["SLA%"]; s = (latest["Sugg"].fillna(0)+1)*3
+                    ax3.scatter(x, y, s=s)
+                    for _, r in latest.iterrows():
+                        ax3.annotate(r["Portfolio"], (r["NPS"], r["SLA%"]), fontsize=8, xytext=(3,3), textcoords="offset points")
+                    for sp in ["top","right"]: ax3.spines[sp].set_visible(False)
+                    ax3.spines["bottom"].set_color("#D3D3D3")
+                    ax3.set_xlabel("NPS %"); ax3.set_ylabel("SLA %")
+                    ax3.grid(False)
+                    ax3.set_title(f"NPS vs SLA% (Latest: {str(latest_m)})", fontsize=12)
+                    st.pyplot(fig3, use_container_width=True)
+                    st.caption("Bubble size ∝ number of Suggestions (Sugg).")
+                    plotted_any = True
+
+                # 2) Always try to draw NPS vs Complaints(/1000)
+                if not latest.empty and "Complaints" in latest.columns and "NPS" in latest.columns:
                     compl = pd.to_numeric(latest["Complaints"], errors="coerce")
                     y = compl.copy()
                     y_label = "Complaints (count)"
                     if "Completes" in latest.columns:
                         completes = pd.to_numeric(latest["Completes"], errors="coerce")
                         rate = compl / completes * 1000
-                        # use rate where completes>0, else fallback to counts
                         y = np.where((completes > 0) & np.isfinite(rate), rate, compl)
-                        y = pd.Series(y, index=latest.index)
-                        y_label = "Complaints per 1000 (fallback to count if completes=0)"
-
+                        y_label = "Complaints per 1000 (fallback to count if completes = 0)"
                     dfp = latest.copy()
-                    dfp["y"] = y
+                    dfp["y"] = pd.to_numeric(y, errors="coerce")
                     dfp = dfp[dfp["NPS"].notna() & dfp["y"].notna()]
                     if len(dfp) >= 2:
                         figc, axc = plt.subplots()
@@ -292,23 +324,30 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                         axc.scatter(dfp["NPS"], dfp["y"], s=size)
                         for _, r in dfp.iterrows():
                             axc.annotate(r["Portfolio"], (r["NPS"], r["y"]), fontsize=8, xytext=(3,3), textcoords="offset points")
-                        for sp in ["top","right","left"]: axc.spines[sp].set_visible(False)
+                        # style: keep top/right off, keep left axis visible (user asked to show Y axis)
+                        for sp in ["top","right"]: axc.spines[sp].set_visible(False)
                         axc.spines["bottom"].set_color("#D3D3D3")
-                        axc.get_yaxis().set_visible(False); axc.grid(False)
-                        axc.set_xlabel("NPS %"); axc.set_title(f"NPS vs {y_label} (Latest: {str(latest_m)})", fontsize=12)
+                        axc.set_xlabel("NPS %"); axc.set_ylabel(y_label)
+                        axc.grid(False)
+                        axc.set_title(f"NPS vs {y_label} (Latest: {str(latest_m)})", fontsize=12)
                         st.pyplot(figc, use_container_width=True)
-                    else:
-                        st.info("Not enough data points to plot NPS vs Complaints for the latest month.")
+                        st.caption("Bubble size ∝ number of Suggestions (Sugg).")
+                        plotted_any = True
 
+                # If nothing plotted, show the banner; otherwise suppress it.
+                if not plotted_any:
+                    st.info("SLA/Service data not available for the latest month; showing table only.")
+
+            # RHS: table with Complaints/1000 included
             with c_right:
-                view = combined_df.rename(columns={"_month":"Month"}).copy()
-                for c in ["NPS","SLA%","Pos%","Neg%","NetSent%"]:
+                view = combined_df.rename(columns={"_month":"Month","NPS%":"NPS"}).copy()
+                for c in ["NPS","SLA%","Pos%","Neg%","NetSent%","Complaints_per_1000"]:
                     if c in view.columns: view[c] = view[c].round(1)
-                cols = [c for c in ["Portfolio","Month","NPS","SLA%","NetSent%","Pos%","Neg%","Sugg","Complaints","Completes"] if c in view.columns]
+                cols = [c for c in ["Portfolio","Month","NPS","NetSent%","Pos%","Neg%","Sugg","Complaints","Completes","Complaints_per_1000","SLA%"] if c in view.columns]
                 st.markdown("#### Combined KPIs (Portfolio × Month)")
                 st.dataframe(view[cols].sort_values(["Month","Portfolio"]), use_container_width=True)
 
-            # keep existing correlation captions
+            # keep correlation captions
             try:
                 c1, c2 = st.columns(2)
                 with c1:
@@ -320,12 +359,12 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             except Exception:
                 pass
 
-        host_df = combined_df.copy() if not combined_df.empty else detail_df.copy()
-        if host_df is None or host_df.empty:
-            host_df = pd.DataFrame([{"Message": "No data for selected filters"}])
-        return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA correlation"), host_df
+        # ---- host return (hide the duplicate bottom table) ----
+        host_df = pd.DataFrame()   # empty so the app won't render the second (duplicate) table
+        return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), host_df
 
     except Exception as e:
+        # fail-safe: show stack in the app but still return a valid dataframe (keeps the blue panel away)
         import traceback
         st.error(f"NPS module error: {e}")
         st.code(traceback.format_exc())
