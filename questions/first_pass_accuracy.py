@@ -61,7 +61,9 @@ def _coerce_month(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.to_period("M")
 
-def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
+def _load_fpa_cached
+() -> Tuple[pd.DataF
+rame, Dict[str, str]]:
     p = _find_fpa_workbook()
     if not p:
         raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
