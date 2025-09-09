@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Tuple, Optional
+import re
+from collections import Counter
 import pandas as pd
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 
 
+# ---------- helpers ----------
 def _find_col(df: pd.DataFrame, candidates) -> Optional[str]:
     cols = {str(c).strip().lower(): c for c in df.columns}
     for c in candidates:
@@ -21,14 +24,14 @@ def _prepare_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     Normalizes the surveys dataframe:
       - Month_received -> month period
       - portfolio -> proper-cased string
-      - NPS -> numeric score 0-10 or textual class mapped to score buckets
+      - NPS -> bucket (promoter/passive/detractor)
+      - Suggestions -> normalized text (if present)
     """
     if df_raw is None or df_raw.empty:
         return pd.DataFrame()
 
     df = df_raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    lower_map = {c.lower(): c for c in df.columns}
 
     # ---- portfolio ----
     portfolio_col = _find_col(df, ["portfolio"])
@@ -72,6 +75,17 @@ def _prepare_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
         )
 
     df["nps_bucket"] = cat
+
+    # ---- Suggestions (optional) ----
+    sug_col = _find_col(df, ["suggestions", "suggestion", "comments", "comment", "feedback"])
+    if sug_col:
+        df["suggestions"] = df[sug_col].astype(str).str.strip()
+        # Strip obviously empty placeholders
+        df.loc[df["suggestions"].str.len() == 0, "suggestions"] = np.nan
+        df.loc[df["suggestions"].str.lower().isin(["nan", "none", "na", "null"]), "suggestions"] = np.nan
+    else:
+        df["suggestions"] = np.nan
+
     return df
 
 
@@ -103,6 +117,98 @@ def _aggregate_nps(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return by_month_portfolio, latest_pivot
 
 
+# ---------- Sentiment & Category labelling for Suggestions ----------
+_POS_WORDS = {
+    "good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
+    "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"
+}
+_NEG_WORDS = {
+    "bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
+    "rude","unhelpful","expensive","issue","problem","bug","error","crash","difficult","worst"
+}
+
+_CATEGORY_PATTERNS = [
+    ("Turnaround Time / Speed", [r"\bslow\b", r"\bdelay", r"waiting", r"\bresponse time\b", r"\bfaster\b", r"\bspeed", r"\bturnaround\b", r"\bSLA\b"]),
+    ("Communication & Support", [r"call back", r"communicat", r"follow[- ]?up", r"support", r"contact", r"update", r"rude", r"behaviou?r"]),
+    ("Charges & Billing", [r"charge", r"fee", r"billing", r"invoice", r"refund", r"payment", r"expensive", r"cost"]),
+    ("Process & Policy", [r"process", r"policy", r"approval", r"paperwork", r"form", r"step", r"escalat"]),
+    ("App / Portal / Tech", [r"\bapp\b", r"portal", r"website", r"login", r"error", r"bug", r"crash", r"ui\b", r"\bux\b", r"technical"]),
+    ("Product / Features", [r"feature", r"option", r"coverage", r"benefit", r"plan", r"pricing", r"add", r"improv"]),
+    ("Staff & Behavior", [r"agent", r"executive", r"representative", r"staff", r"polite", r"rude", r"attitude", r"helpful"]),
+    ("Clarity & Information", [r"clear", r"explain", r"information", r"transparen", r"confus", r"guid", r" educate "]),
+]
+
+def _get_vader():
+    try:
+        # NLTK VADER (works if corpora installed)
+        from nltk.sentiment import SentimentIntensityAnalyzer  # type: ignore
+        return SentimentIntensityAnalyzer()
+    except Exception:
+        try:
+            # Or lightweight vaderSentiment package
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore
+            return SentimentIntensityAnalyzer()
+        except Exception:
+            return None
+
+_SIA = _get_vader()
+
+def _fallback_sentiment(text: str) -> float:
+    """Very small lexicon fallback → returns a pseudo compound score in [-1,1]."""
+    toks = re.findall(r"\b\w+\b", text.lower())
+    if not toks:
+        return 0.0
+    score = sum(1 for t in toks if t in _POS_WORDS) - sum(1 for t in toks if t in _NEG_WORDS)
+    return max(-1.0, min(1.0, score / max(len(toks), 4)))
+
+def _sentiment_label(text: str) -> Tuple[str, float]:
+    if not isinstance(text, str) or not text.strip():
+        return "neutral", 0.0
+    if _SIA is not None:
+        try:
+            comp = float(_SIA.polarity_scores(text).get("compound", 0.0))
+        except Exception:
+            comp = _fallback_sentiment(text)
+    else:
+        comp = _fallback_sentiment(text)
+    if comp >= 0.05:
+        return "positive", comp
+    if comp <= -0.05:
+        return "negative", comp
+    return "neutral", comp
+
+# compile category regex once
+_CAT_REGEX = [(name, [re.compile(pat, re.IGNORECASE) for pat in pats]) for name, pats in _CATEGORY_PATTERNS]
+
+def _categorize(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return "Other"
+    for name, regs in _CAT_REGEX:
+        for r in regs:
+            if r.search(text):
+                return name
+    return "Other"
+
+
+def _analyze_suggestions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds 'sentiment', 'sentiment_score', 'category' to rows with suggestions.
+    Returns a frame with those columns for non-null suggestions.
+    """
+    sug = df[df["suggestions"].notna()].copy()
+    if sug.empty:
+        return sug
+
+    labs, scores, cats = [], [], []
+    for s in sug["suggestions"].astype(str):
+        lab, sc = _sentiment_label(s)
+        labs.append(lab); scores.append(sc); cats.append(_categorize(s))
+    sug["sentiment"] = labs
+    sug["sentiment_score"] = scores
+    sug["category"] = cats
+    return sug
+
+
 def _sidebar_filters(df: pd.DataFrame) -> Dict[str, Any]:
     with st.sidebar:
         st.header("Filters")
@@ -118,6 +224,7 @@ def _sidebar_filters(df: pd.DataFrame) -> Dict[str, Any]:
     return {"portfolio": port, "start": start, "end": end}
 
 
+# ---------- UI entry ----------
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
     """
     Entry point required by app.py.
@@ -137,7 +244,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
     by_month_portfolio, _latest_pivot = _aggregate_nps(df)
 
-    # Apply filters
+    # Apply filters to NPS view
     if flt["portfolio"] and flt["portfolio"] != "(All)":
         by_month_portfolio = by_month_portfolio[by_month_portfolio["portfolio"] == flt["portfolio"]]
     if flt["start"] is not None:
@@ -162,7 +269,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     # ----- Left: Styled NPS Trend Chart -----
     with left:
         if not by_month_portfolio.empty:
-            # Pastel color cycle
             pastel = ["#A3C4F3", "#CDE7BE", "#F6C1C1", "#FFD6A5", "#BDB2FF", "#FFAFCC", "#BEE1E6", "#E2ECE9"]
             fig, ax = plt.subplots()
             for i, (p, g) in enumerate(by_month_portfolio.groupby("portfolio")):
@@ -176,35 +282,92 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     label=p,
                     color=pastel[i % len(pastel)],
                 )
-
-            # Styling per request
-            # No border: hide all spines except bottom (which we'll set grey)
+            # Styling (no border, no y-axis, soft grey x-axis, no grid)
             for spine in ["top", "right", "left"]:
                 ax.spines[spine].set_visible(False)
-            ax.spines["bottom"].set_color("#D3D3D3")  # soft grey x-axis
+            ax.spines["bottom"].set_color("#D3D3D3")
             ax.tick_params(axis="x", colors="#6E6E6E")
-            # No y-axis
             ax.get_yaxis().set_visible(False)
-            # No gridlines
             ax.grid(False)
-
-            ax.set_xlabel("")  # cleaner
+            ax.set_xlabel("")
             ax.set_title("NPS Trend", fontsize=12, pad=6)
             ax.legend(loc="best", fontsize=8, frameon=False)
-
             st.pyplot(fig, use_container_width=True)
 
     # ----- Right: Detail Table -----
     with right:
         show_cols = ["portfolio", "_month", "NPS%", "promoter", "passive", "detractor", "unknown", "Total"]
         detail = by_month_portfolio[show_cols].rename(columns={"_month": "Month", "NPS%": "NPS"})
-        # Lightweight formatting
         if not detail.empty:
             detail = detail.copy()
-            # Round NPS to 1 decimal
             detail["NPS"] = detail["NPS"].round(1)
         st.markdown("#### Detail (by Portfolio × Month)")
         st.dataframe(detail, use_container_width=True)
 
-    # Return the detail DF to the host app
-    return ("NPS by Portfolio", "Reads surveys/ (Sheet 1), buckets by Month_received, and computes NPS."), detail
+    # ===== Suggestions Analysis =====
+    st.markdown("---")
+    st.markdown("### Suggestions Analysis")
+
+    sug = _analyze_suggestions(df)
+    # Apply same filters to suggestions
+    if not sug.empty:
+        if flt["portfolio"] and flt["portfolio"] != "(All)":
+            sug = sug[sug["portfolio"] == flt["portfolio"]]
+        if flt["start"] is not None:
+            sug = sug[sug["_month"] >= flt["start"]]
+        if flt["end"] is not None:
+            sug = sug[sug["_month"] <= flt["end"]]
+
+    if sug.empty:
+        st.info("No suggestions available in the selected range.")
+    else:
+        # Layout: sentiment chart | category table
+        s_left, s_right = st.columns([1, 1])
+
+        with s_left:
+            # Stacked bar: sentiment counts by portfolio
+            sent_pivot = sug.pivot_table(index="portfolio", columns="sentiment", values="suggestions", aggfunc="count", fill_value=0)
+            sent_pivot = sent_pivot[["negative","neutral","positive"]] if set(["negative","neutral","positive"]).issubset(sent_pivot.columns) else sent_pivot
+            fig2, ax2 = plt.subplots()
+            x = np.arange(len(sent_pivot.index))
+            bottom = np.zeros(len(x))
+            for col in sent_pivot.columns:
+                ax2.bar(x, sent_pivot[col].values, bottom=bottom, label=col.capitalize())
+                bottom += sent_pivot[col].values
+
+            # style (soft grey x-axis, no y-axis/grid, no border)
+            ax2.set_xticks(x, sent_pivot.index, rotation=0)
+            for spine in ["top", "right", "left"]:
+                ax2.spines[spine].set_visible(False)
+            ax2.spines["bottom"].set_color("#D3D3D3")
+            ax2.get_yaxis().set_visible(False)
+            ax2.grid(False)
+            ax2.set_title("Suggestions Sentiment by Portfolio", fontsize=12, pad=6)
+            ax2.legend(loc="best", fontsize=8, frameon=False)
+            st.pyplot(fig2, use_container_width=True)
+
+        with s_right:
+            # Category summary in the filtered range
+            total_rows = len(sug)
+            cat_summary = (
+                sug.groupby("category")
+                   .agg(Count=("category","size"),
+                        Pos=("sentiment", lambda s: (s=="positive").sum()),
+                        Neg=("sentiment", lambda s: (s=="negative").sum()))
+                   .sort_values("Count", ascending=False)
+            )
+            if total_rows > 0:
+                cat_summary["%"] = (cat_summary["Count"] / total_rows * 100).round(1)
+                cat_summary["Positive %"] = (cat_summary["Pos"] / cat_summary["Count"] * 100).round(1)
+                cat_summary["Negative %"] = (cat_summary["Neg"] / cat_summary["Count"] * 100).round(1)
+            # Add one short example per category
+            examples = (
+                sug.groupby("category")["suggestions"]
+                   .apply(lambda s: (s.dropna().iloc[0] if len(s.dropna()) else ""))
+            )
+            cat_summary = cat_summary.join(examples.rename("Example")).drop(columns=["Pos","Neg"])
+            st.markdown("#### Categories (filtered range)")
+            st.dataframe(cat_summary[["Count","%","Positive %","Negative %","Example"]], use_container_width=True)
+
+    # Return the NPS detail DF to the host app (unchanged contract)
+    return ("NPS by Portfolio", "Reads surveys/ (Sheet 1), computes NPS, and analyzes Suggestions sentiment & categories."), detail
