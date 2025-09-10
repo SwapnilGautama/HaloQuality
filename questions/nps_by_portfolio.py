@@ -277,6 +277,14 @@ def _complaints_monthly(store: Dict[str, Any]) -> pd.DataFrame:
              .reset_index())
     return out
 
+# small helper for correlations
+def _pearson(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
+    if x not in df or y not in df: return np.nan
+    d = df[[x,y]].dropna()
+    if len(d) < 3: return np.nan
+    r = d[x].corr(d[y])
+    return float(r) if pd.notna(r) else np.nan
+
 # ----------------- UI entry -----------------
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
     """Always returns ((title, subtitle), dataframe) and never raises to the host."""
@@ -313,10 +321,147 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             overall_nps = np.nan
         st.markdown(f"### Overall NPS (selected range): **{overall_nps:.1f}**")
 
-        # Tabs
-        tab1, tab2, tab3 = st.tabs(["Overview", "Sentiments", "NPS Correlation"])
+        # Pre-compute “combined” data so Insights and Correlation can reuse it
+        base = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown","Total"]]\
+                  .rename(columns={"NPS%":"NPS"}).copy()
+        fpa_monthly   = _load_fpa_from_store_or_disk(store)
+        cases_monthly = _cases_monthly(store)
+        comp_monthly  = _complaints_monthly(store)
+        sd_all        = _sentiments(s)
 
-        # ---- Tab 1: overview (unchanged) ----
+        if not sd_all.empty:
+            sent_m = (sd_all.groupby(["Portfolio","_month"])["sent_label"].value_counts()
+                              .unstack(fill_value=0)
+                              .reset_index())
+            for c in ["positive","negative","neutral"]:
+                if c not in sent_m.columns: sent_m[c] = 0
+            sent_m["S_Tot"] = sent_m[["positive","negative","neutral"]].sum(axis=1)
+            sent_m["Pos%"]  = (sent_m["positive"] / sent_m["S_Tot"].replace(0, np.nan) * 100.0)
+            sent_m["Neg%"]  = (sent_m["negative"] / sent_m["S_Tot"].replace(0, np.nan) * 100.0)
+            sent_m["NetSent%"] = sent_m["Pos%"] - sent_m["Neg%"]
+            sent_m = sent_m[["Portfolio","_month","Pos%","Neg%","NetSent%"]]
+        else:
+            sent_m = pd.DataFrame(columns=["Portfolio","_month","Pos%","Neg%","NetSent%"])
+
+        combined = base.merge(fpa_monthly,   on=["Portfolio","_month"], how="outer")\
+                       .merge(cases_monthly, on=["Portfolio","_month"], how="outer")\
+                       .merge(comp_monthly,  on=["Portfolio","_month"], how="outer")\
+                       .merge(sent_m,        on=["Portfolio","_month"], how="left")
+        combined["Complaints/1000"] = (
+            pd.to_numeric(combined.get("Total Complaints"), errors="coerce") /
+            pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
+        ) * 1000.0
+        combined["Detractors%"] = (
+            pd.to_numeric(combined.get("detractor"), errors="coerce") /
+            pd.to_numeric(combined.get("Total"), errors="coerce")
+        ) * 100.0
+
+        if sel_port != "(All)":
+            combined = combined[combined["Portfolio"] == sel_port]
+        if start is not None:
+            combined = combined[combined["_month"] >= start]
+        if end is not None:
+            combined = combined[combined["_month"] <= end]
+
+        view = combined.rename(columns={"_month":"Month"}).copy()
+        for c in ["NPS","FPA%","Complaints/1000","Detractors%","Pos%","Neg%","NetSent%"]:
+            if c in view.columns:
+                view[c] = pd.to_numeric(view[c], errors="coerce").round(1)
+
+        # Tabs (Insights added first)
+        tab0, tab1, tab2, tab3 = st.tabs(["Insights", "Overview", "Sentiments", "NPS Correlation"])
+
+        # -------------------- Tab 0: INSIGHTS --------------------
+        with tab0:
+            st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:.25rem 0 1rem 0;'>What’s happening and why</h4>",
+                        unsafe_allow_html=True)
+
+            # month series for overall NPS across the selection
+            nps_m = pd.DataFrame()
+            if not nps.empty:
+                # roll up to month across portfolios (weighted)
+                m = (nps.groupby("_month")[["promoter","passive","detractor","unknown"]].sum(min_count=1))
+                m["Total"] = m.sum(axis=1)
+                nps_m = pd.DataFrame({
+                    "Month": m.index.astype("period[M]"),
+                    "NPS":   ((m["promoter"] - m["detractor"]) / m["Total"].replace(0,np.nan) * 100.0)
+                }).dropna()
+
+            latest_month = str(view["Month"].dropna().max()) if "Month" in view.columns and not view.empty else None
+            latest_slice = view[view["Month"] == view["Month"].dropna().max()] if latest_month else pd.DataFrame()
+
+            # quick deltas
+            delta_nps = np.nan
+            if len(nps_m) >= 2:
+                delta_nps = float(nps_m["NPS"].iloc[-1] - nps_m["NPS"].iloc[-2])
+
+            # best / worst portfolios in latest month (by NPS)
+            best_txt = worst_txt = "n/a"
+            if not latest_slice.empty and "NPS" in latest_slice:
+                ls = latest_slice.dropna(subset=["NPS"])
+                if not ls.empty:
+                    best = ls.loc[ls["NPS"].idxmax()]
+                    worst = ls.loc[ls["NPS"].idxmin()]
+                    best_txt  = f"{best['Portfolio']} ({best['NPS']:.1f})"
+                    worst_txt = f"{worst['Portfolio']} ({worst['NPS']:.1f})"
+
+            # correlations over the filtered view
+            r_fpa  = _pearson(view, "FPA%", "NPS")
+            r_det  = _pearson(view, "Detractors%", "NPS")
+            r_neg  = _pearson(view, "Neg%", "NPS")
+            r_comp = _pearson(view, "Complaints/1000", "NPS")
+
+            def _r_words(r: float | np.nan) -> str:
+                if pd.isna(r): return "n/a"
+                a = abs(r)
+                band = "weak"
+                if a >= 0.7: band = "strong"
+                elif a >= 0.4: band = "moderate"
+                sign = "positive" if r >= 0 else "negative"
+                return f"{band} {sign} (r={r:+.2f})"
+
+            # story bullets
+            colA, colB = st.columns((1.1, 1))
+            with colA:
+                st.markdown("#### At a glance")
+                st.markdown(
+                    f"""
+- **Overall NPS** in the selected range: **{overall_nps:.1f}**.
+- **Latest month:** **{latest_month or 'n/a'}** &nbsp;•&nbsp; Δ vs previous: **{(delta_nps if not np.isnan(delta_nps) else np.nan):+.1f}** pp.
+- **Top portfolio (latest):** {best_txt} &nbsp;•&nbsp; **Bottom:** {worst_txt}.
+                    """.strip()
+                )
+                st.markdown("#### Drivers (correlations across the selection)")
+                st.markdown(
+                    f"""
+- **Detractors% ↔ NPS:** {_r_words(r_det)}  
+- **Negative suggestions% ↔ NPS:** {_r_words(r_neg)}  
+- **FPA% ↔ NPS:** {_r_words(r_fpa)}  
+- **Complaints/1000 ↔ NPS:** {_r_words(r_comp)}
+                    """.strip()
+                )
+
+            with colB:
+                st.markdown("#### Latest month snapshot")
+                if not latest_slice.empty:
+                    show_cols = [c for c in ["Portfolio","Month","NPS","Detractors%","Neg%","NetSent%","FPA%","Complaints/1000"]
+                                 if c in latest_slice.columns]
+                    st.dataframe(latest_slice[show_cols].sort_values("NPS", ascending=False),
+                                 use_container_width=True)
+                else:
+                    st.info("No month-level records to show for the current selection.")
+
+            # quick explanation
+            st.markdown(
+                """
+**How to read this:**  
+- Higher **Detractors%** and **Negative suggestion%** tend to pull NPS down when the correlation is *negative*.  
+- A *positive* correlation between **FPA%** and **NPS** suggests rising accuracy is associated with happier customers.  
+- **Complaints/1000** provides external context; a strong negative link to NPS can indicate operational pain points driving sentiment.
+                """.strip()
+            )
+
+        # -------------------- Tab 1: OVERVIEW (unchanged) --------------------
         with tab1:
             left, right = st.columns([1,1])
             with left:
@@ -340,7 +485,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 st.markdown("#### Detail (by Portfolio × Month)")
                 st.dataframe(detail_df, use_container_width=True)
 
-        # ---- Tab 2: sentiments (unchanged) ----
+        # -------------------- Tab 2: SENTIMENTS (unchanged) --------------------
         with tab2:
             sd = _sentiments(s)
             if sel_port != "(All)": sd = sd[sd["Portfolio"] == sel_port]
@@ -399,69 +544,10 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if fig_mom is not None:
                 st.pyplot(fig_mom, use_container_width=True)
 
-        # ---- Tab 3: NPS Correlation (with correlation panel & MoM deltas) ----
+        # -------------------- Tab 3: NPS CORRELATION (unchanged content) --------------------
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
 
-            # Base NPS (includes component counts)
-            base = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown","Total"]]\
-                      .rename(columns={"NPS%":"NPS"}).copy()
-
-            # FPA (from store OR disk)
-            fpa_monthly = _load_fpa_from_store_or_disk(store)
-
-            # Cases & Complaints
-            cases_monthly = _cases_monthly(store)
-            comp_monthly  = _complaints_monthly(store)
-
-            # Month-level sentiments by portfolio
-            sd_all = _sentiments(s)
-            if not sd_all.empty:
-                sent_m = (sd_all.groupby(["Portfolio","_month"])["sent_label"].value_counts()
-                                  .unstack(fill_value=0)
-                                  .reset_index())
-                for c in ["positive","negative","neutral"]:
-                    if c not in sent_m.columns: sent_m[c] = 0
-                sent_m["S_Tot"] = sent_m[["positive","negative","neutral"]].sum(axis=1)
-                sent_m["Pos%"]  = (sent_m["positive"] / sent_m["S_Tot"].replace(0, np.nan) * 100.0)
-                sent_m["Neg%"]  = (sent_m["negative"] / sent_m["S_Tot"].replace(0, np.nan) * 100.0)
-                sent_m["NetSent%"] = sent_m["Pos%"] - sent_m["Neg%"]
-                sent_m = sent_m[["Portfolio","_month","Pos%","Neg%","NetSent%"]]
-            else:
-                sent_m = pd.DataFrame(columns=["Portfolio","_month","Pos%","Neg%","NetSent%"])
-
-            # Merge panel
-            combined = base.copy()
-            combined = combined.merge(fpa_monthly, on=["Portfolio","_month"], how="outer")
-            combined = combined.merge(cases_monthly, on=["Portfolio","_month"], how="outer")
-            combined = combined.merge(comp_monthly, on=["Portfolio","_month"], how="outer")
-            combined = combined.merge(sent_m, on=["Portfolio","_month"], how="left")
-
-            # KPIs
-            combined["Complaints/1000"] = (
-                pd.to_numeric(combined.get("Total Complaints"), errors="coerce") /
-                pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
-            ) * 1000.0
-            combined["Detractors%"] = (
-                pd.to_numeric(combined.get("detractor"), errors="coerce") /
-                pd.to_numeric(combined.get("Total"), errors="coerce")
-            ) * 100.0
-
-            # Apply filters
-            if sel_port != "(All)":
-                combined = combined[combined["Portfolio"] == sel_port]
-            if start is not None:
-                combined = combined[combined["_month"] >= start]
-            if end is not None:
-                combined = combined[combined["_month"] <= end]
-
-            # Pretty view & formatting
-            view = combined.rename(columns={"_month":"Month"})
-            for c in ["NPS","FPA%","Complaints/1000","Detractors%","Pos%","Neg%","NetSent%"]:
-                if c in view.columns:
-                    view[c] = pd.to_numeric(view[c], errors="coerce").round(1)
-
-            # --- layout: chart (left) + table (right) ---
             left, right = st.columns([1,1])
 
             with left:
@@ -495,7 +581,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                         if c in view.columns]
                 st.dataframe(view[cols].sort_values(["Portfolio","Month"]), use_container_width=True)
 
-            # ---- Correlation snapshot (selected range) ----
             st.markdown("#### Correlation snapshot (selected range)")
             corr_cols = st.columns(5)
 
@@ -518,7 +603,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             with corr_cols[4]:
                 st.metric("NPS vs Complaints/1000", _corr_pair(view, "NPS", "Complaints/1000"))
 
-            # ---- MoM deltas (latest vs previous) ----
             st.markdown("#### MoM Δ (latest vs previous)")
             if "Month" in view.columns and not view.empty:
                 def _delta_last_two(g: pd.DataFrame, col: str):
