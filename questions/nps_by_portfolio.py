@@ -1,7 +1,7 @@
 # questions/nps_by_portfolio.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Iterable, List, Tuple
+from typing import Dict, Any, Optional, Iterable, List
 from pathlib import Path
 import re
 import numpy as np
@@ -253,12 +253,10 @@ def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
     columns -> Portfolio, _month, FPA%
     Priority: store['fpa'] (already-normalized) → all workbooks on disk.
     """
-    # Prefer already-provided normalized data in store
     fpa_raw = store.get("fpa", pd.DataFrame()) if isinstance(store, dict) else pd.DataFrame()
     if fpa_raw is not None and not fpa_raw.empty and {"Portfolio","_month","FPA%"} <= set(fpa_raw.columns):
         return fpa_raw[["Portfolio","_month","FPA%"]].copy()
 
-    # Otherwise, combine ALL workbooks (Jan–Aug etc.)
     paths = _find_fpa_workbooks()
     if not paths:
         return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
@@ -275,7 +273,6 @@ def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
 
     allf = pd.concat(frames, ignore_index=True)
-    # month rollup per portfolio
     g = (allf.dropna(subset=["_month"])
               .groupby(["portfolio","_month"])["_pass"]
               .agg(passed="sum", total="count")
@@ -286,24 +283,53 @@ def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
 
 # ----------------- Cases / Complaints -----------------
 def _cases_monthly(store: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Build monthly *completed* volume by Portfolio.
+    Prefer completed/closed date fields; fall back to created if necessary.
+    """
     cs = store.get("cases", pd.DataFrame())
     if cs is None or cs.empty:
         return pd.DataFrame(columns=["Portfolio","_month","Total Cases Complete"])
+
     df = cs.copy()
-    p = _find_col(df, ["portfolio"]); df["Portfolio"] = df[p].map(_norm_portfolio) if p else "Unknown"
-    d = _find_col(df, ["create date","created date","create_date","start date","report date","date"])
-    df["_month"] = pd.to_datetime(df[d], errors="coerce", dayfirst=True).dt.to_period("M") if d else pd.NaT
-    id_col = _find_col(df, ["case id","case_id","unique identifier","unique id","unique identifier.","id","case reference","case"])
-    if id_col:
-        out = (df.dropna(subset=["_month"])
-                 .groupby(["Portfolio","_month"])[id_col].nunique()
-                 .reset_index()
-                 .rename(columns={id_col: "Total Cases Complete"}))
+    p = _find_col(df, ["portfolio"])
+    df["Portfolio"] = df[p].map(_norm_portfolio) if p else "Unknown"
+
+    # Prefer completion/closed date columns; else fall back to created.
+    date_candidates = [
+        "completed date","date completed","completion date","completed_date","completed",
+        "closed date","date closed","closed_date","closed",
+        "finish date","end date","resolved date","resolution date",
+        "create date","created date","create_date","start date","report date","date"
+    ]
+    d = _find_col(df, date_candidates)
+    # Try to parse the found date; if missing or all NaT, try a secondary.
+    def _parse_dates(series: pd.Series) -> pd.Series:
+        s = pd.to_datetime(series, errors="coerce", dayfirst=True)
+        if s.notna().sum() == 0:
+            # Try more liberal parsing for formats like '2025-08' / 'Aug-2025'
+            s = pd.to_datetime(series.astype(str), errors="coerce", infer_datetime_format=True)
+        return s
+
+    if d:
+        parsed = _parse_dates(df[d])
     else:
-        out = (df.dropna(subset=["_month"])
-                 .groupby(["Portfolio","_month"])
-                 .size().to_frame("Total Cases Complete")
-                 .reset_index())
+        parsed = pd.Series(pd.NaT, index=df.index)
+
+    if parsed.notna().sum() == 0:
+        # final fallback: look specifically for any of these and pick the first that parses
+        for alt in ["create date","created date","report date","date"]:
+            col = _find_col(df, [alt])
+            if col:
+                parsed = _parse_dates(df[col])
+                if parsed.notna().sum() > 0:
+                    break
+
+    df["_month"] = parsed.dt.to_period("M")
+    out = (df.dropna(subset=["_month"])
+             .groupby(["Portfolio","_month"])
+             .size().to_frame("Total Cases Complete")
+             .reset_index())
     return out
 
 def _complaints_monthly(store: Dict[str, Any]) -> pd.DataFrame:
@@ -312,13 +338,27 @@ def _complaints_monthly(store: Dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame(columns=["Portfolio","_month","Total Complaints"])
     df = comp.copy()
     p = _find_col(df, ["portfolio"]); df["Portfolio"] = df[p].map(_norm_portfolio) if p else "Unknown"
-    d = _find_col(df, ["date complaint received - dd/mm/yy","date complaint received","complaint date",
-                       "received date","received_date","date","month"])
-    if d and d.lower()=="month":
-        m = df[d].astype(str).str.strip().str[:3].str.title()
-        df["_month"] = pd.to_datetime(m + " 2025", format="%b %Y", errors="coerce").dt.to_period("M")
+
+    # Detect a month-like field robustly
+    month_candidates = [
+        "month", "date complaint received - dd/mm/yy","date complaint received","complaint date",
+        "received date","received_date","date","report date","created date","create date"
+    ]
+    d = _find_col(df, month_candidates)
+
+    if d:
+        # Try robust date parsing for various formats (e.g., "2025-08", "Aug-2025", "01/08/2025")
+        parsed = pd.to_datetime(df[d], errors="coerce", dayfirst=True)
+        if parsed.isna().all():
+            parsed = pd.to_datetime(df[d].astype(str), errors="coerce", infer_datetime_format=True)
+        if parsed.isna().all() and d.lower() == "month":
+            # Fallback: if it's a plain month name, assume the current calendar year in the dataset (e.g., 2025)
+            mm = df[d].astype(str).str[:3].str.title()
+            parsed = pd.to_datetime(mm + " 2025", format="%b %Y", errors="coerce")
     else:
-        df["_month"] = pd.to_datetime(df[d], errors="coerce", dayfirst=True).dt.to_period("M") if d else pd.NaT
+        parsed = pd.Series(pd.NaT, index=df.index)
+
+    df["_month"] = parsed.dt.to_period("M")
     out = (df.dropna(subset=["_month"])
              .groupby(["Portfolio","_month"])
              .size().to_frame("Total Complaints")
@@ -364,7 +404,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         # Pre-compute “combined” data so Insights and Correlation can reuse it
         base = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown","Total"]]\
                   .rename(columns={"NPS%":"NPS"}).copy()
-        fpa_monthly   = _load_fpa_from_store_or_disk(store)   # <-- now multi-file Jan–Aug+
+        fpa_monthly   = _load_fpa_from_store_or_disk(store)
         cases_monthly = _cases_monthly(store)
         comp_monthly  = _complaints_monthly(store)
         sd_all        = _sentiments(s)
@@ -383,14 +423,19 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         else:
             sent_m = pd.DataFrame(columns=["Portfolio","_month","Pos%","Neg%","NetSent%"])
 
-        combined = base.merge(fpa_monthly,   on=["Portfolio","_month"], how="outer")\
-                       .merge(cases_monthly, on=["Portfolio","_month"], how="outer")\
-                       .merge(comp_monthly,  on=["Portfolio","_month"], how="outer")\
-                       .merge(sent_m,        on=["Portfolio","_month"], how="left")
-        combined["Complaints/1000"] = (
-            pd.to_numeric(combined.get("Total Complaints"), errors="coerce") /
-            pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
-        ) * 1000.0
+        combined = (base
+            .merge(fpa_monthly,   on=["Portfolio","_month"], how="outer")
+            .merge(cases_monthly, on=["Portfolio","_month"], how="outer")
+            .merge(comp_monthly,  on=["Portfolio","_month"], how="outer")
+            .merge(sent_m,        on=["Portfolio","_month"], how="left"))
+
+        # Robust rate: only compute when denominator > 0
+        num = pd.to_numeric(combined.get("Total Complaints"), errors="coerce")
+        den = pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
+        combined["Complaints/1000"] = np.where((den > 0) & pd.notna(num),
+                                               (num / den) * 1000.0,
+                                               np.nan)
+
         combined["Detractors%"] = (
             pd.to_numeric(combined.get("detractor"), errors="coerce") /
             pd.to_numeric(combined.get("Total"), errors="coerce")
