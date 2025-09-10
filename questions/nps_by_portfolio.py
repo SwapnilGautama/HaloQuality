@@ -1,14 +1,16 @@
 # questions/nps_by_portfolio.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Iterable, List, Tuple
+from typing import Dict, Any, Optional, Iterable
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ------------- palette (kept) -------------
+# =========================
+# shared palette / styling
+# =========================
 _DARK_BLUE = "#0b3d91"   # titles
 _DARK_GREY = "#333333"   # text
 _SOFT_GREY = "#E0E0E0"   # axes
@@ -18,27 +20,32 @@ _SENT_POS = "#7BC47F"
 _BUBBLE_FILL = "#8ECAE6"
 _BUBBLE_EDGE = "#5A7AA1"
 
-def _style_axes(ax: plt.Axes) -> None:
-    ax.tick_params(colors=_DARK_GREY, labelcolor=_DARK_GREY)
-    for sp in ("top", "right"):
-        ax.spines[sp].set_visible(False)
-    for sp in ("bottom", "left"):
-        ax.spines[sp].set_color(_SOFT_GREY)
-        ax.spines[sp].set_linewidth(1.25)
-    ax.grid(False)
-
 def _soft_pastels(n: int) -> list:
     base = ["#A3C4F3","#CDE7BE","#F6C1C1","#FFD6A5","#BDB2FF","#FFAFCC","#BEE1E6","#E2ECE9"]
     return [base[i % len(base)] for i in range(n)]
 
-# ------------- misc helpers (kept) -------------
+def _style_axes(ax: plt.Axes) -> None:
+    ax.tick_params(colors=_DARK_GREY, labelcolor=_DARK_GREY)
+    for sp in ("top","right"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("bottom","left"):
+        ax.spines[sp].set_color(_SOFT_GREY)
+        ax.spines[sp].set_linewidth(1.25)
+    ax.grid(False)
+
+# =========================
+# helpers
+# =========================
 def _find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    if df is None or df.empty: return None
+    if df is None or df.empty:
+        return None
     m = {str(c).strip().lower(): c for c in df.columns}
+    # exact (case-insensitive)
     for c in candidates:
         lc = str(c).strip().lower()
-        if lc in m: return m[lc]
-    # loose contains() fallback
+        if lc in m:
+            return m[lc]
+    # loose contains()
     for c in df.columns:
         cl = str(c).strip().lower()
         for n in candidates:
@@ -47,25 +54,35 @@ def _find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
     return None
 
 def _norm_portfolio(x: Any) -> str:
-    t = str(x).strip().title() if pd.notna(x) else "Unknown"
-    return t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
+    if pd.isna(x):
+        return "Unknown"
+    t = str(x).strip().title()
+    t = t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
+    return t
 
-# ------------- lexical sentiment (kept) -------------
+# =========================
+# basic lexical sentiment
+# =========================
 _POS = {"good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
         "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"}
 _NEG = {"bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
         "rude","unhelpful","expensive","issue","problem","bug","error","crash","difficult","worst"}
 
 def _lex_sentiment(text: str) -> float:
-    if not isinstance(text, str) or not text.strip(): return 0.0
+    if not isinstance(text, str) or not text.strip():
+        return 0.0
     toks = re.findall(r"\b\w+\b", text.lower())
-    if not toks: return 0.0
+    if not toks:
+        return 0.0
     score = sum(1 for t in toks if t in _POS) - sum(1 for t in toks if t in _NEG)
     return max(-1.0, min(1.0, score / max(len(toks), 4)))
 
-# ------------- SURVEYS -------------
+# =========================
+# surveys (NPS + suggestions)
+# =========================
 def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
-    if df_raw is None or df_raw.empty: return pd.DataFrame()
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame()
     df = df_raw.copy()
 
     pcol = _find_col(df, ["portfolio"])
@@ -74,7 +91,6 @@ def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     mcol = _find_col(df, ["month_received","month received","month"])
     if mcol:
         parsed = pd.to_datetime(df[mcol], errors="coerce", dayfirst=True, infer_datetime_format=True)
-        # rescue text month like "June" without year
         miss = parsed.isna()
         if miss.any():
             mm = df.loc[miss, mcol].astype(str).str[:3].str.title()
@@ -86,34 +102,39 @@ def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
     scol = _find_col(df, ["nps","nps score","nps_score","nps (0-10)","score","rating"])
     score = pd.to_numeric(df[scol], errors="coerce") if scol else pd.Series([np.nan]*len(df))
     bucket = np.where(score >= 9, "promoter", np.where(score >= 7, "passive",
-             np.where(score >= 0, "detractor","unknown")))
+             np.where(score >= 0, "detractor", "unknown")))
     df["nps_bucket"] = bucket
 
-    s_col = _find_col(df, ["suggestions","suggestion","comments","comment","feedback"])
-    df["Suggestions"] = df[s_col].astype(str).str.strip() if s_col else np.nan
-    df.loc[df["Suggestions"].astype(str).str.lower().isin(["", "nan", "none", "null"]), "Suggestions"] = np.nan
+    sug = _find_col(df, ["suggestions","suggestion","comments","comment","feedback"])
+    df["Suggestions"] = df[sug].astype(str).str.strip() if sug else np.nan
+    df.loc[df["Suggestions"].astype(str).str.lower().isin(["","nan","none","null"]), "Suggestions"] = np.nan
     return df
 
 def _aggregate_nps(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
     df = df[df["_month"].notna()].copy()
     g = df.groupby(["Portfolio","_month"])["nps_bucket"].value_counts().unstack(fill_value=0)
     for c in ["promoter","passive","detractor","unknown"]:
-        if c not in g.columns: g[c] = 0
+        if c not in g.columns:
+            g[c] = 0
     g["Total"] = g[["promoter","passive","detractor","unknown"]].sum(axis=1).replace(0, np.nan)
     g["NPS%"] = ((g["promoter"] - g["detractor"]) / g["Total"]) * 100.0
     return g.reset_index()
 
 def _sentiments(df: pd.DataFrame) -> pd.DataFrame:
     sug = df[df["Suggestions"].notna()].copy()
-    if sug.empty: return sug
+    if sug.empty:
+        return sug
     score = sug["Suggestions"].map(_lex_sentiment)
     lab = np.where(score >= 0.05, "positive", np.where(score <= -0.05, "negative", "neutral"))
     sug["sent_score"] = score
     sug["sent_label"] = lab
     return sug
 
-# ------------- MoM trend for Sentiments tab (kept) -------------
+# =========================
+# mini MoM chart for Sentiments tab (kept)
+# =========================
 def _fig_mom_nps_pos(nps_df: pd.DataFrame, sd_df: pd.DataFrame):
     if nps_df is None: nps_df = pd.DataFrame()
     if sd_df is None:  sd_df  = pd.DataFrame()
@@ -152,16 +173,18 @@ def _fig_mom_nps_pos(nps_df: pd.DataFrame, sd_df: pd.DataFrame):
     ax.legend(frameon=False, loc="upper right")
     return fig
 
-# ------------- RUN (tabs) -------------
+# =========================
+# RUN (tabs)
+# =========================
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
-    # Surveys in store (Sheet1)
+    # ---- load surveys (Sheet1) ----
     surveys = store.get("surveys", pd.DataFrame())
     s = _prep_surveys(surveys)
     if s.empty or s["_month"].isna().all():
         msg = pd.DataFrame([{"Message": "No usable surveys (check Month_received, NPS, Suggestions)."}])
         return ("NPS by Portfolio", "Surveys (Sheet 1)"), msg
 
-    # Sidebar filters (kept)
+    # ---- sidebar filters (kept) ----
     with st.sidebar:
         st.header("Filters")
         ports = ["(All)"] + sorted(s["Portfolio"].dropna().unique().tolist())
@@ -170,12 +193,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         start = st.selectbox("From month", months, index=0) if months else None
         end   = st.selectbox("To month", months, index=len(months)-1) if months else None
 
-    # Aggregated NPS (kept)
+    # ---- NPS aggregation (kept) ----
     nps = _aggregate_nps(s)
     if sel_port != "(All)": nps = nps[nps["Portfolio"] == sel_port]
     if start is not None:  nps = nps[nps["_month"] >= start]
     if end   is not None:  nps = nps[nps["_month"] <= end]
 
+    # overall NPS for header (weighted)
     if not nps.empty:
         weights = nps[["promoter","passive","detractor","unknown"]].sum(axis=1)
         overall_nps = float((nps["NPS%"] * weights).sum() / weights.sum()) if weights.sum() else np.nan
@@ -185,7 +209,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
     tab1, tab2, tab3 = st.tabs(["Overview", "Sentiments", "NPS Correlation"])
 
-    # ---------- Tab 1 (kept) ----------
+    # ------------- Tab 1: Overview (unchanged) -------------
     detail_df = pd.DataFrame()
     with tab1:
         left, right = st.columns([1,1])
@@ -194,9 +218,9 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 fig, ax = plt.subplots()
                 for i, (p, g) in enumerate(nps.groupby("Portfolio")):
                     g = g.sort_values("_month")
-                    ax.plot(g["_month"].astype(str), g["NPS%"], marker="o",
-                            linewidth=2, markersize=4, label=p,
-                            color=_soft_pastels(8)[i % 8])
+                    ax.plot(g["_month"].astype(str), g["NPS%"],
+                            marker="o", linewidth=2, markersize=4,
+                            label=p, color=_soft_pastels(8)[i % 8])
                 for sp in ["top","right","left"]: ax.spines[sp].set_visible(False)
                 ax.spines["bottom"].set_color(_SOFT_GREY)
                 ax.get_yaxis().set_visible(False); ax.grid(False); ax.set_xlabel("")
@@ -206,23 +230,14 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         with right:
             if not nps.empty:
                 detail_df = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown"]]\
-                              .rename(columns={"_month":"Month","NPS%":"NPS"}).copy()
+                               .rename(columns={"_month":"Month","NPS%":"NPS"}).copy()
                 detail_df["NPS"] = detail_df["NPS"].round(1)
             st.markdown("#### Detail (by Portfolio × Month)")
             st.dataframe(detail_df, use_container_width=True)
 
-    # ---------- Tab 2 (hardened; visuals preserved) ----------
+    # ------------- Tab 2: Sentiments (unchanged visuals/logic) -------------
     with tab2:
         sd = _sentiments(s)
-        # if Suggestions exist but sentiment label somehow missing, rebuild on the fly
-        if not sd.empty and "sent_label" not in sd.columns:
-            try:
-                score = sd["Suggestions"].map(_lex_sentiment)
-                sd["sent_label"] = np.where(score >= 0.05, "positive",
-                                    np.where(score <= -0.05, "negative", "neutral"))
-            except Exception:
-                sd = sd.head(0)  # fail safe → show "no suggestions" message
-
         if sel_port != "(All)": sd = sd[sd["Portfolio"] == sel_port]
         if start is not None:  sd = sd[sd["_month"] >= start]
         if end   is not None:  sd = sd[sd["_month"] <= end]
@@ -231,14 +246,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             st.info("No suggestions available in the selected range.")
         else:
             s_left, s_right = st.columns([1,1])
+
             with s_left:
-                pv = sd.pivot_table(
-                    index="Portfolio",
-                    columns="sent_label",
-                    values="Suggestions",
-                    aggfunc="count",
-                    fill_value=0,
-                )
+                pv = sd.pivot_table(index="Portfolio",
+                                    columns="sent_label",
+                                    values="Suggestions",
+                                    aggfunc="count",
+                                    fill_value=0)
                 order = [c for c in ["negative","neutral","positive"] if c in pv.columns]
                 pv = pv[order]
                 fig2, ax2 = plt.subplots()
@@ -256,6 +270,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 leg = ax2.legend(loc="best", fontsize=8, frameon=False)
                 for t in leg.get_texts(): t.set_color(_DARK_GREY)
                 st.pyplot(fig2, use_container_width=True)
+
             with s_right:
                 cat = (sd.groupby("Portfolio")["sent_label"].value_counts()
                          .unstack(fill_value=0)
@@ -275,99 +290,121 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     npstab = npstab.rename(columns={"promoter":"Promoters","detractor":"Detractors"})
                     cat = cat.join(npstab[["NPS","Promoters","Detractors"]], how="left")
 
-                ordered_cols = [c for c in ["Sugg","Pos%","Neg%","NetSent%","NPS","Promoters","Detractors"] if c in cat.columns]
+                ordered_cols = [c for c in ["Sugg","Pos%","Neg%","NetSent%","NPS","Promoters","Detractors"]
+                                if c in cat.columns]
                 st.markdown("#### Sentiment Summary (filtered range)")
                 st.dataframe(cat[ordered_cols], use_container_width=True)
 
-        # optional MoM mini trend (kept)
         fig_mom = _fig_mom_nps_pos(nps, sd if "sent_label" in sd.columns else pd.DataFrame())
         if fig_mom is not None:
             st.pyplot(fig_mom, use_container_width=True)
 
-    # ---------- Tab 3 (NPS Correlation; **updated**) ----------
+    # ------------- Tab 3: NPS Correlation (UPDATED – FPA from cases) -------------
     with tab3:
         st.markdown("#### Combined KPIs — NPS, FPA%, Complaints/1000")
 
         # Base NPS panel
         base = nps[["Portfolio","_month","NPS%"]].rename(columns={"NPS%":"NPS"}).copy()
 
-        # --- FPA: Portfolio + Activity Date, Review Result == Pass  (store['fpa'] as loaded by data_store) ---
-        fpa_raw = store.get("fpa", pd.DataFrame())
-        if fpa_raw is None or fpa_raw.empty:
-            fpa_raw = store.get("ops", pd.DataFrame())  # last resort
+        # ---- pull normalized 'cases' and 'complaints' from the store ----
+        cases_df = store.get("cases", pd.DataFrame()).copy()
+        comp_df  = store.get("complaints", pd.DataFrame()).copy()
 
-        if fpa_raw is None or fpa_raw.empty:
-            fpa_out = pd.DataFrame(columns=["Portfolio","_month","FPA%"])
-        else:
-            fpa = fpa_raw.copy()
-            p_fpa = _find_col(fpa, ["portfolio"]) or "Portfolio"
-            fpa["Portfolio"] = fpa[p_fpa].map(_norm_portfolio) if p_fpa in fpa.columns else "Unknown"
+        # Helper: compute FPA% from cases (Review Result == Pass)
+        def _fpa_from_cases(cases: pd.DataFrame) -> pd.DataFrame:
+            if cases is None or cases.empty:
+                return pd.DataFrame(columns=["portfolio","_month","FPA%","Total_Cases_Complete"])
+            c = cases.copy()
+            # must have canonical join keys
+            if "portfolio" not in c.columns or "_month" not in c.columns:
+                # try to build them if missing
+                pcol = _find_col(c, ["portfolio"]) or "portfolio"
+                dcol = _find_col(c, ["create date","created date","create_date","date"])
+                c["portfolio"] = c[pcol] if pcol in c.columns else "Unknown"
+                c["_month"] = pd.to_datetime(c[dcol], errors="coerce", dayfirst=True).dt.to_period("M") if dcol else pd.NaT
 
-            d_fpa = _find_col(fpa, ["activity date","activity_date","activitydate","date"])
-            fpa["_month"] = pd.to_datetime(fpa[d_fpa], errors="coerce", dayfirst=True).dt.to_period("M") if d_fpa else pd.NaT
+            pass_col = None
+            for cand in ["review result","review_result","result","qa result","qa_result","outcome"]:
+                if cand in c.columns:
+                    pass_col = cand
+                    break
+            if pass_col is None:
+                return pd.DataFrame(columns=["portfolio","_month","FPA%","Total_Cases_Complete"])
 
-            r_fpa = _find_col(fpa, ["review result","review_result","result","qa result","fpa result"])
-            # normalize to 'pass'
-            if r_fpa:
-                rr = fpa[r_fpa].astype(str).str.strip().str.lower()
-                is_pass = rr.eq("pass") | rr.str.startswith("pass")
+            pass_vals = {"pass","passed","p","true","1","yes","y"}
+            c["is_pass"] = (
+                c[pass_col].astype(str).str.strip().str.lower().isin(pass_vals)
+            )
+
+            id_col = "id" if "id" in c.columns else None
+            if id_col:
+                g = (c.dropna(subset=["_month"])
+                       .groupby(["portfolio","_month"], dropna=False)
+                       .agg(Total_Cases_Complete=(id_col, "nunique"),
+                            Pass=("is_pass", "sum"))
+                       .reset_index())
             else:
-                is_pass = pd.Series(False, index=fpa.index)
+                g = (c.dropna(subset=["_month"])
+                       .groupby(["portfolio","_month"], dropna=False)
+                       .agg(Total_Cases_Complete=("is_pass","size"),
+                            Pass=("is_pass","sum"))
+                       .reset_index())
 
-            fpa["_is_pass"] = is_pass.astype(int)
-            grouped = (fpa.dropna(subset=["_month"])
-                         .groupby(["Portfolio","_month"])["_is_pass"]
-                         .agg(FPA_num="sum", FPA_den="count")
-                         .reset_index())
-            grouped["FPA%"] = (pd.to_numeric(grouped["FPA_num"], errors="coerce") /
-                               pd.to_numeric(grouped["FPA_den"], errors="coerce") * 100.0)
-            fpa_out = grouped[["Portfolio","_month","FPA%"]]
+            g["FPA%"] = (g["Pass"] * 100.0 / g["Total_Cases_Complete"].replace(0, np.nan)).round(1)
+            g["FPA%"] = g["FPA%"].fillna(0.0)
+            return g[["portfolio","_month","FPA%","Total_Cases_Complete"]]
 
-        # --- Cases: Portfolio + Create Date (unique Case ID) ---
-        cases_raw = store.get("cases", pd.DataFrame())
-        if cases_raw is None or cases_raw.empty:
-            completes_out = pd.DataFrame(columns=["Portfolio","_month","Total Cases Complete"])
+        # FPA% & completes from cases
+        fpa_agg = _fpa_from_cases(cases_df)
+        if not fpa_agg.empty:
+            fpa_agg["Portfolio"] = fpa_agg["portfolio"].map(_norm_portfolio)
+            fpa_agg = fpa_agg.drop(columns=["portfolio"])
+
+        # Complaints per month
+        if comp_df is not None and not comp_df.empty:
+            if "portfolio" not in comp_df.columns:
+                p_comp = _find_col(comp_df, ["portfolio"]) or "portfolio"
+                comp_df["portfolio"] = comp_df[p_comp] if p_comp in comp_df.columns else "Unknown"
+            if "_month" not in comp_df.columns:
+                d_comp = _find_col(comp_df, [
+                    "date complaint received - dd/mm/yy","date complaint received",
+                    "received_date","received date","date","report date"
+                ])
+                comp_df["_month"] = pd.to_datetime(comp_df[d_comp], errors="coerce", dayfirst=True).dt.to_period("M") if d_comp else pd.NaT
+            comp_agg = (comp_df.dropna(subset=["_month"])
+                          .groupby(["portfolio","_month"], dropna=False)
+                          .size().rename("Total Complaints").reset_index())
+            comp_agg["Portfolio"] = comp_agg["portfolio"].map(_norm_portfolio)
+            comp_agg = comp_agg.drop(columns=["portfolio"])
         else:
-            cs = cases_raw.copy()
-            p_cases = _find_col(cs, ["portfolio"]) or "Portfolio"
-            cs["Portfolio"] = cs[p_cases].map(_norm_portfolio) if p_cases in cs.columns else "Unknown"
-            d_cases = _find_col(cs, ["create date","created date","create_date","report date","start date"])
-            cs["_month"] = pd.to_datetime(cs[d_cases], errors="coerce", dayfirst=True).dt.to_period("M") if d_cases else pd.NaT
+            comp_agg = pd.DataFrame(columns=["Portfolio","_month","Total Complaints"])
 
-            id_cases = _find_col(cs, ["case id","case_id","unique identifier","unique id","case reference","case"])
+        # If we also want a straight completes table from cases (for /1000)
+        if cases_df is not None and not cases_df.empty:
+            if "portfolio" not in cases_df.columns:
+                p_cases = _find_col(cases_df, ["portfolio"]) or "portfolio"
+                cases_df["portfolio"] = cases_df[p_cases] if p_cases in cases_df.columns else "Unknown"
+            if "_month" not in cases_df.columns:
+                d_cases = _find_col(cases_df, ["create date","created date","create_date","date"])
+                cases_df["_month"] = pd.to_datetime(cases_df[d_cases], errors="coerce", dayfirst=True).dt.to_period("M") if d_cases else pd.NaT
+            id_cases = "id" if "id" in cases_df.columns else None
             if id_cases:
-                completes_g = (cs.dropna(subset=["_month"])
-                                 .groupby(["Portfolio","_month"])[id_cases]
-                                 .nunique().reset_index()
-                                 .rename(columns={id_cases: "Total Cases Complete"}))
+                completes = (cases_df.dropna(subset=["_month"])
+                               .groupby(["portfolio","_month"], dropna=False)[id_cases]
+                               .nunique().rename("Total Cases Complete").reset_index())
             else:
-                completes_g = (cs.dropna(subset=["_month"])
-                                 .groupby(["Portfolio","_month"])
-                                 .size().to_frame("Total Cases Complete").reset_index())
-            completes_out = completes_g
-
-        # --- Complaints: Portfolio + Date Complaint Received ---
-        comp_raw = store.get("complaints", pd.DataFrame())
-        if comp_raw is None or comp_raw.empty:
-            comp_out = pd.DataFrame(columns=["Portfolio","_month","Total Complaints"])
+                completes = (cases_df.dropna(subset=["_month"])
+                               .groupby(["portfolio","_month"], dropna=False)
+                               .size().rename("Total Cases Complete").reset_index())
+            completes["Portfolio"] = completes["portfolio"].map(_norm_portfolio)
+            completes = completes.drop(columns=["portfolio"])
         else:
-            cp = comp_raw.copy()
-            p_comp = _find_col(cp, ["portfolio"]) or "Portfolio"
-            cp["Portfolio"] = cp[p_comp].map(_norm_portfolio) if p_comp in cp.columns else "Unknown"
-            d_comp = _find_col(cp, [
-                "date complaint received - dd/mm/yy","date complaint received",
-                "received_date","received date","date","report date"
-            ])
-            cp["_month"] = pd.to_datetime(cp[d_comp], errors="coerce", dayfirst=True).dt.to_period("M") if d_comp else pd.NaT
-            comp_out = (cp.dropna(subset=["_month"])
-                          .groupby(["Portfolio","_month"])
-                          .size().to_frame("Total Complaints")
-                          .reset_index())
+            completes = pd.DataFrame(columns=["Portfolio","_month","Total Cases Complete"])
 
-        # Merge panel
-        combined = base.merge(fpa_out, on=["Portfolio","_month"], how="outer")
-        combined = combined.merge(completes_out, on=["Portfolio","_month"], how="outer")
-        combined = combined.merge(comp_out, on=["Portfolio","_month"], how="outer")
+        # Merge the panels together with the NPS base
+        combined = base.merge(fpa_agg, on=["Portfolio","_month"], how="left")
+        combined = combined.merge(completes, on=["Portfolio","_month"], how="left")
+        combined = combined.merge(comp_agg, on=["Portfolio","_month"], how="left")
 
         # KPI: complaints per 1000 completes
         combined["Complaints/1000"] = (
@@ -375,7 +412,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             pd.to_numeric(combined["Total Cases Complete"], errors="coerce")
         ) * 1000.0
 
-        # Filters
+        # Apply filters
         if sel_port != "(All)":
             combined = combined[combined["Portfolio"] == sel_port]
         if start is not None:
@@ -383,7 +420,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         if end is not None:
             combined = combined[combined["_month"] <= end]
 
-        # Present
+        # Present as table
         view = combined.rename(columns={"_month":"Month"})
         for c in ["NPS","FPA%","Complaints/1000"]:
             if c in view.columns:
@@ -393,9 +430,9 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         if "Total Cases Complete" in view.columns:
             view["Total Cases Complete"] = pd.to_numeric(view["Total Cases Complete"], errors="coerce").astype("Int64")
 
-        cols_order = [c for c in ["Portfolio","Month","NPS","FPA%","Complaints/1000","Total Complaints","Total Cases Complete"]
-                      if c in view.columns]
-        st.dataframe(view[cols_order].sort_values(["Portfolio","Month"]), use_container_width=True)
+        cols = [c for c in ["Portfolio","Month","NPS","FPA%","Complaints/1000","Total Complaints","Total Cases Complete"]
+                if c in view.columns]
+        st.dataframe(view[cols].sort_values(["Portfolio","Month"]), use_container_width=True)
 
-    # return the title + a small dataframe for host compatibility
+    # return host-compatible tuple (kept)
     return ("NPS by Portfolio", "Surveys (Sheet 1)"), detail_df
