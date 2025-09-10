@@ -1,7 +1,7 @@
 # questions/nps_by_portfolio.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Iterable
+from typing import Dict, Any, Optional, Iterable, List, Tuple
 from pathlib import Path
 import re
 import numpy as np
@@ -51,7 +51,7 @@ def _lex_sentiment(text: str) -> float:
     score = sum(1 for t in toks if t in _POS) - sum(1 for t in toks if t in _NEG)
     return max(-1.0, min(1.0, score / max(len(toks), 4)))
 
-# ----------------- NEW: key-theme extraction + slope helpers -----------------
+# ----------------- AI key-theme extraction + effect-size helpers -----------------
 _STOP = {
     "the","a","an","and","or","for","to","of","in","on","at","by","with","from","as","is","are",
     "was","were","be","been","it","this","that","these","those","we","you","they","i","he","she",
@@ -86,7 +86,6 @@ def _top_phrases(texts, k: int = 6):
         return [*top_bi, *top_uni]
     return top_bi[:k]
 
-# small helpers for correlations / effect sizes
 def _pearson(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
     if x not in df or y not in df: return np.nan
     d = df[[x,y]].dropna()
@@ -117,7 +116,6 @@ _SENT_NEU = "#F4C27A"
 _SENT_POS = "#7BC47F"
 
 def _style_axes(ax: plt.Axes) -> None:
-    """Soft-grey axes, dark-grey fonts."""
     ax.tick_params(colors=_DARK_GREY, labelcolor=_DARK_GREY)
     ax.xaxis.label.set_color(_DARK_GREY)
     ax.yaxis.label.set_color(_DARK_GREY)
@@ -128,7 +126,7 @@ def _style_axes(ax: plt.Axes) -> None:
         ax.spines[sp].set_linewidth(1.25)
     ax.grid(False)
 
-# --- (used by Sentiments tab) ---
+# --- Sentiments MoM figure ---
 def _fig_mom_nps_pos(nps_df: pd.DataFrame, sd_df: pd.DataFrame):
     if nps_df is None: nps_df = pd.DataFrame()
     if sd_df is None:  sd_df  = pd.DataFrame()
@@ -155,8 +153,8 @@ def _fig_mom_nps_pos(nps_df: pd.DataFrame, sd_df: pd.DataFrame):
     mm["_label"] = mm["_month"].astype(str).tolist()
     x = np.arange(len(mm))
     fig, ax = plt.subplots(figsize=(8.8, 3.6))
-    ax.plot(x, mm["NPS"], linewidth=2.8, color=_BUBBLE_FILL, label="NPS %")
-    ax.plot(x, mm["Pos%"], linewidth=2.8, color=_SENT_POS, label="Positive %")
+    ax.plot(x, mm["NPS"], linewidth=2.8, label="NPS %")
+    ax.plot(x, mm["Pos%"], linewidth=2.8, label="Positive %")
     ax.set_xticks(x); ax.set_xticklabels(mm["_label"].tolist(), rotation=0, color=_DARK_GREY)
     _style_axes(ax); ax.get_yaxis().set_visible(False); ax.set_xlabel("")
     ax.set_title("MoM Trend — NPS % & Positive Sentiment %", color=_DARK_BLUE, pad=10)
@@ -209,43 +207,18 @@ def _sentiments(df: pd.DataFrame) -> pd.DataFrame:
     sug["sent_score"] = score; sug["sent_label"] = lab
     return sug
 
-# ----------------- ops/service (legacy helpers kept as-is) -----------------
-def _prep_ops(df_ops: pd.DataFrame) -> pd.DataFrame:
-    if df_ops is None or df_ops.empty: return pd.DataFrame()
-    d = df_ops.copy()
-    pcol = _find_col(d, ["portfolio"])
-    d["Portfolio"] = d[pcol].map(_norm_portfolio) if pcol else "Unknown"
-    rcol = _find_col(d, ["report_date","report date","date","createddate","create_date"])
-    d["_month"] = pd.to_datetime(d[rcol], errors="coerce").dt.to_period("M") if rcol else pd.NaT
-    wcol = _find_col(d, ["within sla","sla_status","sla status"])
-    d["_within"] = d[wcol].astype(str).str.lower().str.contains("within").astype(int) if wcol else 0
-    ccol = _find_col(d, ["completes","completed","checks","volume","total"])
-    d["_completes"] = pd.to_numeric(d[ccol], errors="coerce").fillna(0.0) if ccol else 1.0
-    return d
-
-def _ops_kpis(d_ops: pd.DataFrame) -> pd.DataFrame:
-    if d_ops.empty: return pd.DataFrame()
-    g = d_ops.groupby(["Portfolio","_month"]).agg(
-        Within=("_within","sum"),
-        Total=("Portfolio","size"),
-        Completes=("_completes","sum"),
-    ).reset_index()
-    g["SLA%"] = (g["Within"] / g["Total"]) * 100.0
-    return g
-
-# ----------------- Correlation helpers (FPA loader, cases, complaints) -----------------
-def _find_fpa_workbook() -> Optional[Path]:
+# ----------------- FPA multi-file loader (mirrors FPA question) -----------------
+def _find_fpa_workbooks() -> List[Path]:
     roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
     patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
+    hits: List[Path] = []
     for root in roots:
         if not root.exists():
             continue
-        hits = []
         for pat in patterns:
             hits.extend(root.glob(pat))
-        if hits:
-            return sorted(hits)[-1]
-    return None
+    hits = sorted(set(hits), key=lambda p: (p.name, p.stat().st_mtime_ns if p.exists() else 0))
+    return hits
 
 def _read_excel_any(path: Path) -> pd.DataFrame:
     try:
@@ -253,43 +226,65 @@ def _read_excel_any(path: Path) -> pd.DataFrame:
     except Exception:
         return pd.read_excel(path, header=0)
 
+def _normalize_one_fpa(df: pd.DataFrame) -> pd.DataFrame:
+    # keep only what we need for NPS correlation
+    def _pick(df, opts):
+        cols = {c.lower(): c for c in df.columns}
+        for o in opts:
+            if o.lower() in cols: return cols[o.lower()]
+        return None
+    col_date = _pick(df, ["Activity Date", "ActivityDate", "Date", "Activity date"])
+    col_result = _pick(df, ["Review Result", "Review result", "Result"])
+    col_port = _pick(df, ["Portfolio", "portfolio"])
+    if col_date is None or col_result is None:
+        raise KeyError("Missing required FPA columns")
+    out = df.rename(columns={col_date: "date", col_result: "result", col_port: "portfolio" if col_port else "portfolio"}).copy()
+    out["portfolio"] = out.get("portfolio", "Unknown")
+    out["portfolio"] = out["portfolio"].astype(str).map(_norm_portfolio)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
+    out["_month"] = out["date"].dt.to_period("M")
+    res = out["result"].astype(str).str.strip().str.lower()
+    out["_pass"] = res.str.startswith("pass").astype(int)
+    return out[["portfolio","_month","_pass"]]
+
 def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
     """
-    Return a normalized FPA frame with columns: Portfolio, _month, FPA%
-    Priority: store['fpa'] → workbook on disk.
+    Return normalized FPA month rollups across **ALL workbooks**:
+    columns -> Portfolio, _month, FPA%
+    Priority: store['fpa'] (already-normalized) → all workbooks on disk.
     """
-    fpa_raw = store.get("fpa", pd.DataFrame())
-    if fpa_raw is None or fpa_raw.empty:
-        p = _find_fpa_workbook()
-        if p:
-            try:
-                fpa_raw = _read_excel_any(p)
-            except Exception:
-                fpa_raw = pd.DataFrame()
+    # Prefer already-provided normalized data in store
+    fpa_raw = store.get("fpa", pd.DataFrame()) if isinstance(store, dict) else pd.DataFrame()
+    if fpa_raw is not None and not fpa_raw.empty and {"Portfolio","_month","FPA%"} <= set(fpa_raw.columns):
+        return fpa_raw[["Portfolio","_month","FPA%"]].copy()
 
-    if fpa_raw is None or fpa_raw.empty:
+    # Otherwise, combine ALL workbooks (Jan–Aug etc.)
+    paths = _find_fpa_workbooks()
+    if not paths:
         return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
 
-    fpa = fpa_raw.copy()
-    p_fpa = _find_col(fpa, ["portfolio"])
-    fpa["Portfolio"] = fpa[p_fpa].map(_norm_portfolio) if p_fpa else "Unknown"
+    frames = []
+    for p in paths:
+        try:
+            df = _read_excel_any(p)
+            frames.append(_normalize_one_fpa(df))
+        except Exception:
+            continue
 
-    d_fpa = _find_col(fpa, ["activity date","activity_date","activitydate","date"])
-    if d_fpa is None:
-        d_fpa = "date" if "date" in fpa.columns else None
-    fpa["_month"] = pd.to_datetime(fpa[d_fpa], errors="coerce", dayfirst=True).dt.to_period("M") if d_fpa else pd.NaT
+    if not frames:
+        return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
 
-    r_fpa = _find_col(fpa, ["review result","review_result","result","qa result","fpa result"])
-    res = fpa[r_fpa].astype(str).str.strip().str.lower() if r_fpa else ""
-    fpa["_pass"] = res.str.startswith("pass").astype(int)
-
-    g = (fpa.dropna(subset=["_month"])
-           .groupby(["Portfolio","_month"])["_pass"]
-           .agg(passed="sum", total="count")
-           .reset_index())
+    allf = pd.concat(frames, ignore_index=True)
+    # month rollup per portfolio
+    g = (allf.dropna(subset=["_month"])
+              .groupby(["portfolio","_month"])["_pass"]
+              .agg(passed="sum", total="count")
+              .reset_index())
     g["FPA%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan))
+    g = g.rename(columns={"portfolio":"Portfolio"})
     return g[["Portfolio","_month","FPA%"]]
 
+# ----------------- Cases / Complaints -----------------
 def _cases_monthly(store: Dict[str, Any]) -> pd.DataFrame:
     cs = store.get("cases", pd.DataFrame())
     if cs is None or cs.empty:
@@ -369,7 +364,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         # Pre-compute “combined” data so Insights and Correlation can reuse it
         base = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown","Total"]]\
                   .rename(columns={"NPS%":"NPS"}).copy()
-        fpa_monthly   = _load_fpa_from_store_or_disk(store)
+        fpa_monthly   = _load_fpa_from_store_or_disk(store)   # <-- now multi-file Jan–Aug+
         cases_monthly = _cases_monthly(store)
         comp_monthly  = _complaints_monthly(store)
         sd_all        = _sentiments(s)
@@ -413,18 +408,16 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if c in view.columns:
                 view[c] = pd.to_numeric(view[c], errors="coerce").round(1)
 
-        # Tabs (Insights added first)
+        # Tabs
         tab0, tab1, tab2, tab3 = st.tabs(["Insights", "Overview", "Sentiments", "NPS Correlation"])
 
-        # -------------------- Tab 0: INSIGHTS (ENHANCED) --------------------
+        # -------------------- Tab 0: INSIGHTS (AI) --------------------
         with tab0:
             st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:.25rem 0 1rem 0;'>What’s happening and why</h4>",
                         unsafe_allow_html=True)
 
-            # month series for overall NPS across the selection
             nps_m = pd.DataFrame()
             if not nps.empty:
-                # roll up to month across portfolios (weighted)
                 m = (nps.groupby("_month")[["promoter","passive","detractor","unknown"]].sum(min_count=1))
                 m["Total"] = m.sum(axis=1)
                 nps_m = pd.DataFrame({
@@ -435,12 +428,10 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             latest_month = str(view["Month"].dropna().max()) if "Month" in view.columns and not view.empty else None
             latest_slice = view[view["Month"] == view["Month"].dropna().max()] if latest_month else pd.DataFrame()
 
-            # quick deltas
             delta_nps = np.nan
             if len(nps_m) >= 2:
                 delta_nps = float(nps_m["NPS"].iloc[-1] - nps_m["NPS"].iloc[-2])
 
-            # best / worst portfolios in latest month (by NPS)
             best_txt = worst_txt = "n/a"
             if not latest_slice.empty and "NPS" in latest_slice:
                 ls = latest_slice.dropna(subset=["NPS"])
@@ -450,13 +441,11 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     best_txt  = f"{best['Portfolio']} ({best['NPS']:.1f})"
                     worst_txt = f"{worst['Portfolio']} ({worst['NPS']:.1f})"
 
-            # correlations over the filtered view
             r_fpa  = _pearson(view, "FPA%", "NPS")
             r_det  = _pearson(view, "Detractors%", "NPS")
             r_neg  = _pearson(view, "Neg%", "NPS")
             r_comp = _pearson(view, "Complaints/1000", "NPS")
 
-            # NEW: slopes — what a 10-unit move implies for NPS
             b_fpa  = _slope(view, "FPA%", "NPS")
             b_det  = _slope(view, "Detractors%", "NPS")
             b_neg  = _slope(view, "Neg%", "NPS")
@@ -464,8 +453,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
             def _r_words(r: float | np.nan) -> str:
                 if pd.isna(r): return "n/a"
-                a = abs(r)
-                band = "weak"
+                a = abs(r); band = "weak"
                 if a >= 0.7: band = "strong"
                 elif a >= 0.4: band = "moderate"
                 sign = "positive" if r >= 0 else "negative"
@@ -478,9 +466,9 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 unit_txt = "pp" if "Complaints" not in label else "units"
                 return f"- **{label}**: each **+{unit:g} {unit_txt}** is associated with **{change:+.1f} pp** in NPS."
 
-            # NEW: negative-theme story (overall + latest)
             neg_story_overall: list[str] = []
             neg_story_latest: list[str] = []
+            sd_all = _sentiments(s)
             if not sd_all.empty:
                 sd_f = sd_all.copy()
                 if sel_port != "(All)": sd_f = sd_f[sd_f["Portfolio"] == sel_port]
@@ -494,15 +482,14 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                         if not neg_latest.empty:
                             neg_story_latest = _top_phrases(neg_latest["Suggestions"].tolist(), k=4)
 
-            # story bullets
             colA, colB = st.columns((1.1, 1))
             with colA:
                 st.markdown("#### At a glance")
                 st.markdown(
                     f"""
 - **Overall NPS** in the selected range: **{overall_nps:.1f}**.
-- **Latest month:** **{latest_month or 'n/a'}** &nbsp;•&nbsp; Δ vs previous: **{(delta_nps if not np.isnan(delta_nps) else np.nan):+.1f}** pp.
-- **Top portfolio (latest):** {best_txt} &nbsp;•&nbsp; **Bottom:** {worst_txt}.
+- **Latest month:** **{latest_month or 'n/a'}** • Δ vs previous: **{(delta_nps if not np.isnan(delta_nps) else np.nan):+.1f}** pp.
+- **Top portfolio (latest):** {best_txt} • **Bottom:** {worst_txt}.
                     """.strip()
                 )
                 st.markdown("#### Drivers (correlations across the selection)")
@@ -514,16 +501,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 - **Complaints/1000 ↔ NPS:** {_r_words(r_comp)}
                     """.strip()
                 )
-                # NEW: what the correlations mean (effect sizes)
                 st.markdown("#### What the numbers imply")
-                st.markdown(
-                    "\n".join([
-                        _implication("Detractors%", b_det, 10.0),
-                        _implication("Negative suggestions%", b_neg, 10.0),
-                        _implication("FPA%", b_fpa, 10.0),
-                        _implication("Complaints/1000", b_comp, 10.0),
-                    ])
-                )
+                st.markdown("\n".join([
+                    _implication("Detractors%", b_det, 10.0),
+                    _implication("Negative suggestions%", b_neg, 10.0),
+                    _implication("FPA%", b_fpa, 10.0),
+                    _implication("Complaints/1000", b_comp, 10.0),
+                ]))
 
             with colB:
                 st.markdown("#### Latest month snapshot")
@@ -535,7 +519,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 else:
                     st.info("No month-level records to show for the current selection.")
 
-            # NEW: negative themes callouts
             if neg_story_overall:
                 chips = " • ".join([f"`{t}`" for t in neg_story_overall[:6]])
                 st.markdown(f"**Negative comment themes (overall selection):** {chips}")
@@ -543,7 +526,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 chips2 = " • ".join([f"`{t}`" for t in neg_story_latest[:4]])
                 st.markdown(f"**Latest month negatives:** {chips2}")
 
-            # UPDATED: how to read this — now anchored in themes + effect sizes
             how_lines = [
                 "**How to read this:**",
                 "- When **Detractors%** or **Negative suggestions%** rise, NPS typically falls (see effect sizes above).",
@@ -557,7 +539,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 )
             st.markdown("\n".join(how_lines))
 
-        # -------------------- Tab 1: OVERVIEW (unchanged from older version) --------------------
+        # -------------------- Tab 1: OVERVIEW --------------------
         with tab1:
             left, right = st.columns([1,1])
             with left:
@@ -581,7 +563,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 st.markdown("#### Detail (by Portfolio × Month)")
                 st.dataframe(detail_df, use_container_width=True)
 
-        # -------------------- Tab 2: SENTIMENTS (unchanged from older version) --------------------
+        # -------------------- Tab 2: SENTIMENTS --------------------
         with tab2:
             sd = _sentiments(s)
             if sel_port != "(All)": sd = sd[sd["Portfolio"] == sel_port]
@@ -640,42 +622,53 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if fig_mom is not None:
                 st.pyplot(fig_mom, use_container_width=True)
 
-        # -------------------- Tab 3: NPS CORRELATION (unchanged from older version) --------------------
+        # -------------------- Tab 3: NPS CORRELATION (with local Month filter) --------------------
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
+
+            # Localized Month filter (does NOT affect other tabs)
+            month_opts = ["(All)"] + sorted(view["Month"].dropna().astype(str).unique().tolist())
+            sel_corr_month = st.selectbox("Month (local to this tab)", options=month_opts, index=len(month_opts)-1 if len(month_opts)>1 else 0, key="nps_corr_month")
+            if sel_corr_month != "(All)":
+                corr_df = view[view["Month"].astype(str) == sel_corr_month].copy()
+            else:
+                corr_df = view.copy()
 
             left, right = st.columns([1,1])
 
             with left:
-                plot_df = view.dropna(subset=["NPS","Complaints/1000"]).copy()
-                size = (plot_df.get("FPA%", pd.Series(index=plot_df.index, dtype=float)).fillna(0.0)
-                        .clip(lower=0, upper=100))
-                s_px = (size / 100.0) * 1800.0 + 80.0
+                plot_df = corr_df.dropna(subset=["NPS","Complaints/1000"]).copy()
+                if not plot_df.empty:
+                    size = (plot_df.get("FPA%", pd.Series(index=plot_df.index, dtype=float)).fillna(0.0)
+                            .clip(lower=0, upper=100))
+                    s_px = (size / 100.0) * 1800.0 + 80.0
 
-                fig_sc, ax_sc = plt.subplots(figsize=(6.6, 4.4))
-                ax_sc.scatter(
-                    plot_df["NPS"], plot_df["Complaints/1000"],
-                    s=s_px, color=_BUBBLE_FILL, edgecolor=_BUBBLE_EDGE, alpha=0.85
-                )
-                for _, r in plot_df.iterrows():
-                    lab = f"{r.get('Portfolio','')}"
-                    try:
-                        ax_sc.text(float(r["NPS"]), float(r["Complaints/1000"]),
-                                   lab, fontsize=8, color=_DARK_GREY, ha="center", va="bottom")
-                    except Exception:
-                        pass
-                ax_sc.set_xlabel("NPS %", color=_DARK_GREY)
-                ax_sc.set_ylabel("Complaints per 1000", color=_DARK_GREY)
-                _style_axes(ax_sc)
-                ttl_month = str(plot_df["Month"].max()) if "Month" in plot_df.columns and not plot_df["Month"].isna().all() else ""
-                ax_sc.set_title(f"NPS vs Complaints/1000 {f'({ttl_month})' if ttl_month else ''}", color=_DARK_BLUE, pad=6)
-                st.pyplot(fig_sc, use_container_width=True)
-                st.caption("Bubble size ∝ FPA% (larger = higher FPA).")
+                    fig_sc, ax_sc = plt.subplots(figsize=(6.6, 4.4))
+                    ax_sc.scatter(
+                        plot_df["NPS"], plot_df["Complaints/1000"],
+                        s=s_px, color=_BUBBLE_FILL, edgecolor=_BUBBLE_EDGE, alpha=0.85
+                    )
+                    for _, r in plot_df.iterrows():
+                        lab = f"{r.get('Portfolio','')}"
+                        try:
+                            ax_sc.text(float(r["NPS"]), float(r["Complaints/1000"]),
+                                       lab, fontsize=8, color=_DARK_GREY, ha="center", va="bottom")
+                        except Exception:
+                            pass
+                    ax_sc.set_xlabel("NPS %", color=_DARK_GREY)
+                    ax_sc.set_ylabel("Complaints per 1000", color=_DARK_GREY)
+                    _style_axes(ax_sc)
+                    ttl_month = sel_corr_month if sel_corr_month != "(All)" else ""
+                    ax_sc.set_title(f"NPS vs Complaints/1000 {f'({ttl_month})' if ttl_month else ''}", color=_DARK_BLUE, pad=6)
+                    st.pyplot(fig_sc, use_container_width=True)
+                    st.caption("Bubble size ∝ FPA% (larger = higher FPA).")
+                else:
+                    st.info("No rows available for the selected month.")
 
             with right:
                 cols = [c for c in ["Portfolio","Month","Complaints/1000","FPA%","NPS","Detractors%","Pos%","Neg%","NetSent%"]
-                        if c in view.columns]
-                st.dataframe(view[cols].sort_values(["Portfolio","Month"]), use_container_width=True)
+                        if c in corr_df.columns]
+                st.dataframe(corr_df[cols].sort_values(["Portfolio","Month"]), use_container_width=True)
 
             st.markdown("#### Correlation snapshot (selected range)")
             corr_cols = st.columns(5)
@@ -689,15 +682,15 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 return f"r = {r:+.2f}"
 
             with corr_cols[0]:
-                st.metric("FPA% vs Complaints/1000", _corr_pair(view, "FPA%", "Complaints/1000"))
+                st.metric("FPA% vs Complaints/1000", _corr_pair(corr_df, "FPA%", "Complaints/1000"))
             with corr_cols[1]:
-                st.metric("FPA% vs NPS", _corr_pair(view, "FPA%", "NPS"))
+                st.metric("FPA% vs NPS", _corr_pair(corr_df, "FPA%", "NPS"))
             with corr_cols[2]:
-                st.metric("Detractors% vs NPS", _corr_pair(view, "Detractors%", "NPS"))
+                st.metric("Detractors% vs NPS", _corr_pair(corr_df, "Detractors%", "NPS"))
             with corr_cols[3]:
-                st.metric("NetSent% vs NPS", _corr_pair(view, "NetSent%", "NPS"))
+                st.metric("NetSent% vs NPS", _corr_pair(corr_df, "NetSent%","NPS"))
             with corr_cols[4]:
-                st.metric("NPS vs Complaints/1000", _corr_pair(view, "NPS", "Complaints/1000"))
+                st.metric("NPS vs Complaints/1000", _corr_pair(corr_df, "NPS","Complaints/1000"))
 
             st.markdown("#### MoM Δ (latest vs previous)")
             if "Month" in view.columns and not view.empty:
@@ -727,5 +720,4 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         st.error(f"Unexpected error in NPS module: {e}")
         df_out = pd.DataFrame([{"error": str(e)}])
 
-    # Always return a tuple so the app runner never throws
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
