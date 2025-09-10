@@ -46,7 +46,7 @@ def _lex_sentiment(text: str) -> float:
     return max(-1.0, min(1.0, score / max(len(toks), 4)))
 
 
-# ----------------- palette & styling (NEW) -----------------
+# ----------------- palette & styling -----------------
 _DARK_BLUE = "#0b3d91"   # titles
 _DARK_GREY = "#333333"   # all chart fonts
 _SOFT_GREY = "#E0E0E0"   # axes
@@ -69,6 +69,66 @@ def _style_axes(ax: plt.Axes) -> None:
         ax.spines[sp].set_color(_SOFT_GREY)
         ax.spines[sp].set_linewidth(1.25)
     ax.grid(False)
+
+# --- MoM NPS & Positive% (Sentiments tab) ---
+def _fig_mom_nps_pos(nps_df: pd.DataFrame, sd_df: pd.DataFrame):
+    if nps_df is None: nps_df = pd.DataFrame()
+    if sd_df is None:  sd_df  = pd.DataFrame()
+
+    if not nps_df.empty:
+        nm = (nps_df.groupby("_month")[["promoter","passive","detractor","unknown"]]
+                    .sum(min_count=1).reset_index())
+        nm["Total"] = nm[["promoter","passive","detractor","unknown"]].sum(axis=1)
+        nm["NPS"] = ((nm["promoter"] - nm["detractor"]) / nm["Total"].replace(0, np.nan) * 100.0)
+        nps_m = nm[["_month","NPS"]]
+    else:
+        nps_m = pd.DataFrame(columns=["_month","NPS"])
+
+    if not sd_df.empty:
+        sm = (sd_df.groupby("_month")
+                    .agg(Pos=("sent_label", lambda s: (s=="positive").sum()),
+                         Total=("sent_label","size"))
+                    .reset_index())
+        sm["Pos%"] = sm["Pos"] / sm["Total"].replace(0, np.nan) * 100.0
+        pos_m = sm[["_month","Pos%"]]
+    else:
+        pos_m = pd.DataFrame(columns=["_month","Pos%"])
+
+    if nps_m.empty and pos_m.empty:
+        return None
+
+    mm = pd.merge(nps_m, pos_m, on="_month", how="outer").sort_values("_month")
+    mm["_label"] = mm["_month"].astype(str).tolist()
+    x = np.arange(len(mm))
+
+    if len(x) >= 2:
+        xd = np.linspace(x.min(), x.max(), num=max(200, len(x)*20))
+        def _interp_safe(arr):
+            arr = np.asarray(arr, dtype=float)
+            mask = np.isfinite(arr)
+            if mask.sum() < 2:
+                return np.full_like(xd, np.nan, dtype=float)
+            return np.interp(xd, x[mask], arr[mask])
+        y1 = _interp_safe(mm["NPS"].to_numpy())
+        y2 = _interp_safe(mm["Pos%"].to_numpy())
+        fig, ax = plt.subplots(figsize=(8.8, 3.6))
+        ax.plot(xd, y1, linewidth=2.8, color=_BUBBLE_FILL, label="NPS %")
+        ax.plot(xd, y2, linewidth=2.8, color=_SENT_POS, label="Positive %")
+        ax.set_xticks(x)
+        ax.set_xticklabels(mm["_label"].tolist(), rotation=0, color=_DARK_GREY)
+    else:
+        fig, ax = plt.subplots(figsize=(8.8, 3.6))
+        ax.plot(x, mm["NPS"], linewidth=2.8, color=_BUBBLE_FILL, label="NPS %")
+        ax.plot(x, mm["Pos%"], linewidth=2.8, color=_SENT_POS, label="Positive %")
+        ax.set_xticks(x)
+        ax.set_xticklabels(mm["_label"].tolist(), rotation=0, color=_DARK_GREY)
+
+    _style_axes(ax)
+    ax.get_yaxis().set_visible(False)
+    ax.set_xlabel("")
+    ax.set_title("MoM Trend — NPS % & Positive Sentiment %", color=_DARK_BLUE, pad=10)
+    ax.legend(frameon=False, loc="upper right")
+    return fig
 
 
 # ----------------- surveys (NPS + suggestions) -----------------
@@ -236,6 +296,10 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if start is not None:  sd = sd[sd["_month"] >= start]
             if end   is not None:  sd = sd[sd["_month"] <= end]
 
+            fig_mom = _fig_mom_nps_pos(nps, sd)
+            if fig_mom is not None:
+                st.pyplot(fig_mom, use_container_width=True)
+
             if sd.empty:
                 st.info("No suggestions available in the selected range.")
             else:
@@ -247,7 +311,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     pv = pv[order]
                     fig2, ax2 = plt.subplots()
                     x = np.arange(len(pv.index)); bottom = np.zeros(len(x))
-                    # pastel colors per segment (NEW)
                     color_map = {"negative": _SENT_NEG, "neutral": _SENT_NEU, "positive": _SENT_POS}
                     for col in pv.columns:
                         ax2.bar(x, pv[col].values, bottom=bottom, label=col.capitalize(), color=color_map.get(col, _SENT_NEU))
@@ -257,12 +320,11 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     for sp in ["top","right","left"]: ax2.spines[sp].set_visible(False)
                     ax2.spines["bottom"].set_color("#D3D3D3")
                     ax2.get_yaxis().set_visible(False); ax2.grid(False)
-                    ax2.set_title("Suggestions Sentiment by Portfolio", fontsize=12, color=_DARK_BLUE)  # dark-blue title
+                    ax2.set_title("Suggestions Sentiment by Portfolio", fontsize=12, color=_DARK_BLUE)
                     leg = ax2.legend(loc="best", fontsize=8, frameon=False)
-                    for t in leg.get_texts(): t.set_color(_DARK_GREY)  # legend text dark grey
+                    for t in leg.get_texts(): t.set_color(_DARK_GREY)
                     st.pyplot(fig2, use_container_width=True)
                 with s_right:
-                    # existing sentiment summary
                     cat = (sd.groupby("Portfolio")["sent_label"].value_counts()
                              .unstack(fill_value=0)
                              .reindex(columns=[c for c in ["positive","neutral","negative"] if c in sd["sent_label"].unique()], fill_value=0))
@@ -271,7 +333,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     cat["Neg%"]   = (cat.get("negative",0)/cat["Sugg"]*100).round(1)
                     cat["NetSent%"] = (cat["Pos%"] - cat["Neg%"]).round(1)
 
-                    # NEW: add NPS + Promoters/Detractors for the same filtered range
                     if not nps.empty:
                         npstab = (nps.groupby("Portfolio")[["promoter","detractor","passive","unknown"]]
                                     .sum(min_count=1))
@@ -281,14 +342,14 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                         npstab = npstab.rename(columns={"promoter":"Promoters","detractor":"Detractors"})
                         cat = cat.join(npstab[["NPS","Promoters","Detractors"]], how="left")
 
-                    # final column order
                     ordered_cols = [c for c in ["Sugg","Pos%","Neg%","NetSent%","NPS","Promoters","Detractors"] if c in cat.columns]
                     st.markdown("#### Sentiment Summary (filtered range)")
                     st.dataframe(cat[ordered_cols], use_container_width=True)
 
-        # ---- Tab 3: correlation (NPS × Sentiment × SLA% + Complaints chart) ----
+        # ---- Tab 3: correlation (updated) ----
         combined_df = pd.DataFrame()
         with tab3:
+            # ---------------- build panel ----------------
             ops = _prep_ops(ops_raw)
             ops_kpi = _ops_kpis(ops)
             comp = _prep_complaints(complaints_raw)
@@ -304,7 +365,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 sent_m["Neg%"] = (sent_m["Neg"]/sent_m["Sugg"]*100).round(1)
                 sent_m["NetSent%"] = (sent_m["Pos%"] - sent_m["Neg%"]).round(1)
 
-            base = nps[["Portfolio","_month","NPS%"]].rename(columns={"NPS%":"NPS"}).copy()
+            base = nps[["Portfolio","_month","NPS%","promoter","detractor","passive","unknown"]].rename(columns={"NPS%":"NPS"}).copy()
             combined_df = base.merge(sent_m[["Portfolio","_month","Sugg","Pos%","Neg%","NetSent%"]], how="left", on=["Portfolio","_month"])
             if not ops_kpi.empty:
                 combined_df = combined_df.merge(ops_kpi[["Portfolio","_month","SLA%","Completes"]], how="left", on=["Portfolio","_month"])
@@ -312,11 +373,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 comp_m = comp.groupby(["Portfolio","_month"]).size().to_frame("Complaints").reset_index()
                 combined_df = combined_df.merge(comp_m, how="left", on=["Portfolio","_month"])
 
-            if sel_port != "(All)": combined_df = combined_df[combined_df["Portfolio"] == sel_port]
-            if start is not None:  combined_df = combined_df[combined_df["_month"] >= start]
-            if end   is not None:  combined_df = combined_df[combined_df["_month"] <= end]
-
-            # add Complaints/1000 for the table
+            # derive complaints per 1000 (keep Completes internal; don't display it)
             if "Complaints" in combined_df.columns:
                 if "Completes" in combined_df.columns:
                     combined_df["Complaints_per_1000"] = (pd.to_numeric(combined_df["Complaints"], errors="coerce") /
@@ -324,85 +381,167 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 else:
                     combined_df["Complaints_per_1000"] = np.nan
 
+            # filters
+            if sel_port != "(All)": combined_df = combined_df[combined_df["Portfolio"] == sel_port]
+            if start is not None:  combined_df = combined_df[combined_df["_month"] >= start]
+            if end   is not None:  combined_df = combined_df[combined_df["_month"] <= end]
+            combined_df = combined_df.sort_values(["_month","Portfolio"]).reset_index(drop=True)
+
+            # compute MoM deltas for table (per portfolio)
+            def _delta(group, col):
+                return group[col] - group[col].shift(1)
+            for c in ["NPS","NetSent%","Complaints_per_1000"]:
+                if c in combined_df.columns:
+                    combined_df[f"Δ{c}"] = combined_df.groupby("Portfolio")[c].apply(lambda g: _delta(g, c))
+
             latest_m = combined_df["_month"].max() if not combined_df.empty else None
+            prev_m   = (combined_df["_month"].dropna().unique()[-2] if combined_df["_month"].nunique() >= 2 else None)
             latest = combined_df[combined_df["_month"] == latest_m].copy() if latest_m is not None else pd.DataFrame()
+            prev   = combined_df[combined_df["_month"] == prev_m].copy() if prev_m is not None else pd.DataFrame()
 
-            # LHS: chart area
-            c_left, c_right = st.columns([1,1])
-            with c_left:
+            # ---------------- layout ----------------
+            top_left, top_right = st.columns([1,1])
+
+            # ---- LHS: NPS vs Complaints (/1000) with toggles & arrows ----
+            with top_left:
                 plotted_any = False
+                size_by = st.radio("Bubble size", ["Suggestions","Complaints/1000"], index=0, horizontal=True, key="size_by_corr")
+                show_move = st.checkbox("Show movement arrows (latest vs prior)", value=False, key="move_arrows")
 
-                # 1) Draw SLA scatter if available (STYLED)
-                if not latest.empty and "SLA%" in latest.columns and latest["SLA%"].notna().any():
-                    fig3, ax3 = plt.subplots()
-                    x = latest["NPS"]; y = latest["SLA%"]; s = (latest["Sugg"].fillna(0)+1)*3
-                    ax3.scatter(x, y, s=s, c=_BUBBLE_FILL, alpha=0.75, edgecolors=_BUBBLE_EDGE, linewidths=0.6)
-                    for _, r in latest.iterrows():
-                        ax3.annotate(r["Portfolio"], (r["NPS"], r["SLA%"]), fontsize=9, xytext=(3,3), textcoords="offset points", color=_DARK_GREY)
-                    ax3.set_xlabel("NPS %"); ax3.set_ylabel("SLA %")
-                    _style_axes(ax3)  # soft-grey axes + dark-grey fonts
-                    ax3.set_title(f"NPS vs SLA% (Latest: {str(latest_m)})", fontsize=12, color=_DARK_BLUE)
-                    st.pyplot(fig3, use_container_width=True)
-                    st.caption("Bubble size ∝ number of Suggestions (Sugg).")
-                    plotted_any = True
-
-                # 2) Always try to draw NPS vs Complaints(/1000) (STYLED)
                 if not latest.empty and "Complaints" in latest.columns and "NPS" in latest.columns:
-                    compl = pd.to_numeric(latest["Complaints"], errors="coerce")
-                    y = compl.copy()
+                    y = pd.to_numeric(latest["Complaints"], errors="coerce")
                     y_label = "Complaints (count)"
-                    if "Completes" in latest.columns:
-                        completes = pd.to_numeric(latest["Completes"], errors="coerce")
-                        rate = compl / completes * 1000
-                        y = np.where((completes > 0) & np.isfinite(rate), rate, compl)
-                        y_label = "Complaints per 1000 (fallback to count if completes = 0)"
+                    if "Complaints_per_1000" in latest.columns and latest["Complaints_per_1000"].notna().any():
+                        y = pd.to_numeric(latest["Complaints_per_1000"], errors="coerce")
+                        y_label = "Complaints per 1000"
                     dfp = latest.copy()
-                    dfp["y"] = pd.to_numeric(y, errors="coerce")
+                    dfp["y"] = y
                     dfp = dfp[dfp["NPS"].notna() & dfp["y"].notna()]
-                    if len(dfp) >= 2:
+                    if len(dfp) >= 1:
                         figc, axc = plt.subplots()
-                        size = (dfp["Sugg"].fillna(0).astype(float) + 1) * 3
+                        if size_by == "Suggestions":
+                            size = (dfp["Sugg"].fillna(0).astype(float) + 1) * 3
+                        else:
+                            size = (dfp["y"].fillna(0).astype(float) + 1) * 5
                         axc.scatter(dfp["NPS"], dfp["y"], s=size, c=_BUBBLE_FILL, alpha=0.75, edgecolors=_BUBBLE_EDGE, linewidths=0.6)
                         for _, r in dfp.iterrows():
                             axc.annotate(r["Portfolio"], (r["NPS"], r["y"]), fontsize=9, xytext=(3,3), textcoords="offset points", color=_DARK_GREY)
                         axc.set_xlabel("NPS %"); axc.set_ylabel(y_label)
-                        _style_axes(axc)  # left y-axis soft grey; fonts dark grey
+                        _style_axes(axc)
                         axc.set_title(f"NPS vs {y_label} (Latest: {str(latest_m)})", fontsize=12, color=_DARK_BLUE)
+
+                        # movement arrows from previous month
+                        if show_move and not prev.empty:
+                            prev_xy = prev[["Portfolio","NPS","Complaints_per_1000"]].rename(
+                                columns={"NPS":"NPS_prev","Complaints_per_1000":"y_prev"})
+                            step = prev_xy.merge(dfp[["Portfolio","NPS","y"]], on="Portfolio", how="inner")
+                            for _, r in step.iterrows():
+                                if np.isfinite(r["NPS_prev"]) and np.isfinite(r["y_prev"]) and np.isfinite(r["NPS"]) and np.isfinite(r["y"]):
+                                    axc.annotate("", xy=(r["NPS"], r["y"]), xytext=(r["NPS_prev"], r["y_prev"]),
+                                                 arrowprops=dict(arrowstyle="->", lw=1, alpha=0.4, color=_DARK_GREY))
+
                         st.pyplot(figc, use_container_width=True)
-                        st.caption("Bubble size ∝ number of Suggestions (Sugg).")
+                        cap = "Bubble size ∝ " + ("Suggestions (Sugg)" if size_by=="Suggestions" else "Complaints per 1000")
+                        st.caption(cap)
                         plotted_any = True
 
-                # If nothing plotted, show the banner; otherwise suppress it.
                 if not plotted_any:
-                    st.info("SLA/Service data not available for the latest month; showing table only.")
+                    st.info("Not enough data to draw the correlation chart for the latest month.")
 
-            # RHS: table with Complaints/1000 included
-            with c_right:
+            # ---- RHS: Drivers (weighted OLS) ----
+            with top_right:
+                drv_cols = [c for c in ["NetSent%","SLA%","Complaints_per_1000"] if c in combined_df.columns]
+                dfm = combined_df.dropna(subset=["NPS"] + drv_cols).copy()
+                if len(dfm) >= 5:
+                    def _std(x):
+                        x = pd.to_numeric(x, errors="coerce"); return (x - x.mean()) / x.std(ddof=0)
+                    X = pd.DataFrame({c: _std(dfm[c]) for c in drv_cols})
+                    X["intercept"] = 1.0
+                    y = _std(dfm["NPS"])
+                    w = np.clip(pd.to_numeric(dfm.get("Sugg", 1), errors="coerce").fillna(1), 1, None).to_numpy()
+                    W = np.diag(w)
+                    try:
+                        beta = np.linalg.pinv(X.T @ W @ X) @ (X.T @ W @ y.to_numpy())
+                        yhat = (X @ beta)
+                        r2 = float(1 - ((w*(y - yhat)**2).sum() / (w*(y - y.mean())**2).sum()))
+                        coefs = pd.Series(beta, index=X.columns).drop("intercept", errors="ignore").sort_values(key=np.abs, ascending=False)
+                        st.markdown("#### Drivers of NPS (standardized, weighted)")
+                        st.dataframe(coefs.rename("Effect (β)").to_frame().style.format("{:.2f}"), use_container_width=True)
+                        st.caption(f"Weighted R² ≈ {r2:.2f} — β shows relative impact on NPS (↑ positive, ↓ negative).")
+                        # Outliers
+                        res = (y - yhat)
+                        df_out = dfm.assign(Residual=res, Pred=yhat)
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown("**Over-performers** (actual > predicted)")
+                            st.dataframe(df_out.nlargest(3, "Residual")[["Portfolio","_month","NPS"]], use_container_width=True)
+                        with c2:
+                            st.markdown("**Under-performers** (actual < predicted)")
+                            st.dataframe(df_out.nsmallest(3, "Residual")[["Portfolio","_month","NPS"]], use_container_width=True)
+                    except Exception:
+                        st.info("Driver model could not be fit on the current selection.")
+                else:
+                    st.info("Not enough data to fit a driver model on the current selection.")
+
+            # ---- Row 2: Quadrant & Lag-1 cards + table ----
+            row2_left, row2_right = st.columns([1,1])
+
+            # Quadrant: NPS vs NetSent%
+            with row2_left:
+                if not latest.empty and "NetSent%" in latest.columns and latest["NetSent%"].notna().any():
+                    figq, axq = plt.subplots()
+                    xs = pd.to_numeric(latest["NetSent%"], errors="coerce")
+                    ys = pd.to_numeric(latest["NPS"], errors="coerce")
+                    ok = np.isfinite(xs) & np.isfinite(ys)
+                    xs, ys = xs[ok], ys[ok]
+                    labs = latest.loc[ok, "Portfolio"]
+                    axq.scatter(xs, ys, s=60, c=_BUBBLE_FILL, alpha=0.75, edgecolors=_BUBBLE_EDGE, linewidths=0.6)
+                    # medians
+                    mx, my = np.nanmedian(xs), np.nanmedian(ys)
+                    axq.axvline(mx, color=_SOFT_GREY); axq.axhline(my, color=_SOFT_GREY)
+                    for xi, yi, lab in zip(xs, ys, labs):
+                        axq.annotate(lab, (xi, yi), fontsize=9, xytext=(3,3), textcoords="offset points", color=_DARK_GREY)
+                    axq.set_xlabel("NetSent %"); axq.set_ylabel("NPS %")
+                    _style_axes(axq); axq.set_title("Quadrant — NPS vs NetSent% (latest)", color=_DARK_BLUE)
+                    st.pyplot(figq, use_container_width=True)
+                    # who sits where?
+                    low_low = latest.loc[(latest["NetSent%"]<=mx) & (latest["NPS"]<=my), "Portfolio"].tolist()
+                    hi_low  = latest.loc[(latest["NetSent%"]> mx) & (latest["NPS"]<=my), "Portfolio"].tolist()
+                    st.caption(f"Low Sentiment & Low NPS: {', '.join(low_low) if low_low else '—'}  |  High Sentiment & Low NPS: {', '.join(hi_low) if hi_low else '—'}")
+                else:
+                    st.info("Not enough NetSent% data for the latest month to build the quadrant.")
+
+            # Lag-1 correlations + KPI table (with deltas, and no 'Completes')
+            with row2_right:
+                def lag1_pairs(df, xcol, ycol):
+                    if xcol not in df.columns or ycol not in df.columns: return np.nan
+                    d = df.sort_values(["Portfolio","_month"]).copy()
+                    d["NPS_next"] = d.groupby("Portfolio")[ycol].shift(-1)
+                    z = d[[xcol, "NPS_next"]].dropna()
+                    return z[xcol].corr(z["NPS_next"]) if len(z) >= 3 else np.nan
+
+                lag_net = lag1_pairs(combined_df, "NetSent%", "NPS")
+                lag_sla = lag1_pairs(combined_df, "SLA%", "NPS") if "SLA%" in combined_df.columns else np.nan
+                m1, m2 = st.columns(2)
+                with m1: st.metric("Lag-1: NetSent% → next-month NPS", f"{lag_net:.2f}" if pd.notna(lag_net) else "n/a")
+                with m2: st.metric("Lag-1: SLA% → next-month NPS", f"{lag_sla:.2f}" if pd.notna(lag_sla) else "n/a")
+
+                # right table (replace Completes with Complaints/1000 + deltas)
                 view = combined_df.rename(columns={"_month":"Month","NPS%":"NPS"}).copy()
-                for c in ["NPS","SLA%","Pos%","Neg%","NetSent%","Complaints_per_1000"]:
+                for c in ["NPS","SLA%","Pos%","Neg%","NetSent%","Complaints_per_1000","ΔNPS","ΔNetSent%","ΔComplaints_per_1000"]:
                     if c in view.columns: view[c] = view[c].round(1)
-                cols = [c for c in ["Portfolio","Month","NPS","NetSent%","Pos%","Neg%","Sugg","Complaints","Completes","Complaints_per_1000","SLA%"] if c in view.columns]
+                cols = [c for c in [
+                    "Portfolio","Month","NPS","ΔNPS","NetSent%","ΔNetSent%","Pos%","Neg%","Sugg",
+                    "Complaints","Complaints_per_1000","ΔComplaints_per_1000","SLA%"
+                ] if c in view.columns]
                 st.markdown("#### Combined KPIs (Portfolio × Month)")
                 st.dataframe(view[cols].sort_values(["Month","Portfolio"]), use_container_width=True)
 
-            # keep correlation captions
-            try:
-                c1, c2 = st.columns(2)
-                with c1:
-                    corr = view[["NPS","SLA%"]].dropna() if "SLA%" in view.columns else pd.DataFrame()
-                    st.caption(f"Pearson(NPS, SLA%): **{float(corr.corr().iloc[0,1]):.2f}**" if len(corr)>=2 else "Pearson(NPS, SLA%): not enough data")
-                with c2:
-                    corr2 = view[["NPS","NetSent%"]].dropna() if "NetSent%" in view.columns else pd.DataFrame()
-                    st.caption(f"Pearson(NPS, Net Sentiment): **{float(corr2.corr().iloc[0,1]):.2f}**" if len(corr2)>=2 else "Pearson(NPS, Net Sentiment): not enough data")
-            except Exception:
-                pass
-
-        # ---- host return (hide the duplicate bottom table) ----
-        host_df = pd.DataFrame()   # empty so the app won't render the second (duplicate) table
+        # ---- host return (hide duplicate bottom table) ----
+        host_df = pd.DataFrame()
         return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), host_df
 
     except Exception as e:
-        # fail-safe: show stack in the app but still return a valid dataframe (keeps the blue panel away)
         import traceback
         st.error(f"NPS module error: {e}")
         st.code(traceback.format_exc())
