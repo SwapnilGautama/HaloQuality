@@ -377,10 +377,11 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 with s_right:
                     cat = (sd.groupby("Portfolio")["sent_label"].value_counts()
                              .unstack(fill_value=0)
-                             .reindex(columns=[c for c in ["positive","neutral","negative"] if c in sd["sent_label"].unique()], fill_value=0))
-                    cat["Sugg"]   = cat.sum(axis=1)
-                    cat["Pos%"]   = (cat.get("positive",0)/cat["Sugg"]*100).round(1)
-                    cat["Neg%"]   = (cat.get("negative",0)/cat["Sugg"]*100).round(1)
+                             .reindex(columns=[c for c in ["positive","neutral","negative"]
+                                               if c in sd["sent_label"].unique()], fill_value=0))
+                    cat["Sugg"]     = cat.sum(axis=1)
+                    cat["Pos%"]     = (cat.get("positive",0)/cat["Sugg"]*100).round(1)
+                    cat["Neg%"]     = (cat.get("negative",0)/cat["Sugg"]*100).round(1)
                     cat["NetSent%"] = (cat["Pos%"] - cat["Neg%"]).round(1)
 
                     if not nps.empty:
@@ -392,7 +393,8 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                         npstab = npstab.rename(columns={"promoter":"Promoters","detractor":"Detractors"})
                         cat = cat.join(npstab[["NPS","Promoters","Detractors"]], how="left")
 
-                    ordered_cols = [c for c in ["Sugg","Pos%","Neg%","NetSent%","NPS","Promoters","Detractors"] if c in cat.columns]
+                    ordered_cols = [c for c in ["Sugg","Pos%","Neg%","NetSent%","NPS","Promoters","Detractors"]
+                                    if c in cat.columns]
                     st.markdown("#### Sentiment Summary (filtered range)")
                     st.dataframe(cat[ordered_cols], use_container_width=True)
 
@@ -400,12 +402,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if fig_mom is not None:
                 st.pyplot(fig_mom, use_container_width=True)
 
-        # ---- Tab 3: NPS Correlation (UPDATED table subset + existing scatter) ----
+        # ---- Tab 3: NPS Correlation (UPDATED: Detractors% + Sentiment %) ----
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
 
-            # Base NPS
-            base = nps[["Portfolio","_month","NPS%"]].rename(columns={"NPS%":"NPS"}).copy()
+            # Base NPS (includes component counts)
+            base = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown","Total"]]\
+                      .rename(columns={"NPS%":"NPS"}).copy()
 
             # FPA (from store OR disk)
             fpa_monthly = _load_fpa_from_store_or_disk(store)
@@ -414,21 +417,39 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             cases_monthly = _cases_monthly(store)
             comp_monthly  = _complaints_monthly(store)
 
+            # Month-level sentiments by portfolio
+            sd_all = _sentiments(s)
+            if not sd_all.empty:
+                sent_m = (sd_all.groupby(["Portfolio","_month"])["sent_label"].value_counts()
+                                  .unstack(fill_value=0)
+                                  .reset_index())
+                # ensure columns
+                for c in ["positive","negative","neutral"]:
+                    if c not in sent_m.columns: sent_m[c] = 0
+                sent_m["S_Tot"] = sent_m[["positive","negative","neutral"]].sum(axis=1)
+                sent_m["Pos%"]  = (sent_m["positive"] / sent_m["S_Tot"].replace(0, np.nan) * 100.0)
+                sent_m["Neg%"]  = (sent_m["negative"] / sent_m["S_Tot"].replace(0, np.nan) * 100.0)
+                sent_m["NetSent%"] = sent_m["Pos%"] - sent_m["Neg%"]
+                sent_m = sent_m[["Portfolio","_month","Pos%","Neg%","NetSent%"]]
+            else:
+                sent_m = pd.DataFrame(columns=["Portfolio","_month","Pos%","Neg%","NetSent%"])
+
             # Merge panel
             combined = base.copy()
             combined = combined.merge(fpa_monthly, on=["Portfolio","_month"], how="outer")
             combined = combined.merge(cases_monthly, on=["Portfolio","_month"], how="outer")
             combined = combined.merge(comp_monthly, on=["Portfolio","_month"], how="outer")
+            combined = combined.merge(sent_m, on=["Portfolio","_month"], how="left")
 
-            # Add detractors count
-            detr_df = nps[["Portfolio","_month","detractor"]].rename(columns={"detractor":"Detractors"})
-            combined = combined.merge(detr_df, on=["Portfolio","_month"], how="left")
-
-            # Derived KPI
+            # KPIs
             combined["Complaints/1000"] = (
                 pd.to_numeric(combined.get("Total Complaints"), errors="coerce") /
                 pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
             ) * 1000.0
+            combined["Detractors%"] = (
+                pd.to_numeric(combined.get("detractor"), errors="coerce") /
+                pd.to_numeric(combined.get("Total"), errors="coerce")
+            ) * 100.0
 
             # Apply filters
             if sel_port != "(All)":
@@ -440,7 +461,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
             # Pretty view & formatting
             view = combined.rename(columns={"_month":"Month"})
-            for c in ["NPS","FPA%","Complaints/1000"]:
+            for c in ["NPS","FPA%","Complaints/1000","Detractors%","Pos%","Neg%","NetSent%"]:
                 if c in view.columns:
                     view[c] = pd.to_numeric(view[c], errors="coerce").round(1)
 
@@ -477,7 +498,8 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 st.caption("Bubble size ∝ FPA% (larger = higher FPA).")
 
             with right:
-                cols = [c for c in ["Portfolio","Month","Complaints/1000","FPA%","NPS","Detractors"] if c in view.columns]
+                cols = [c for c in ["Portfolio","Month","Complaints/1000","FPA%","NPS","Detractors%","Pos%","Neg%","NetSent%"]
+                        if c in view.columns]
                 st.dataframe(view[cols].sort_values(["Portfolio","Month"]), use_container_width=True)
 
             st.caption("Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation")
