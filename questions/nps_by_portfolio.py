@@ -207,7 +207,6 @@ def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
     """
     fpa_raw = store.get("fpa", pd.DataFrame())
     if fpa_raw is None or fpa_raw.empty:
-        # try disk (same strategy as FPA question)
         p = _find_fpa_workbook()
         if p:
             try:
@@ -268,7 +267,6 @@ def _complaints_monthly(store: Dict[str, Any]) -> pd.DataFrame:
     d = _find_col(df, ["date complaint received - dd/mm/yy","date complaint received","complaint date",
                        "received date","received_date","date","month"])
     if d and d.lower()=="month":
-        # month text like 'June' (assume 2025)
         m = df[d].astype(str).str.strip().str[:3].str.title()
         df["_month"] = pd.to_datetime(m + " 2025", format="%b %Y", errors="coerce").dt.to_period("M")
     else:
@@ -401,7 +399,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if fig_mom is not None:
                 st.pyplot(fig_mom, use_container_width=True)
 
-        # ---- Tab 3: NPS Correlation (UPDATED: correlation panel + MoM deltas) ----
+        # ---- Tab 3: NPS Correlation (with correlation panel & MoM deltas) ----
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
 
@@ -499,7 +497,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
             # ---- Correlation snapshot (selected range) ----
             st.markdown("#### Correlation snapshot (selected range)")
-            corr_cols = st.columns(4)
+            corr_cols = st.columns(5)
 
             def _corr_pair(df: pd.DataFrame, x: str, y: str) -> str:
                 if x not in df or y not in df: return "n/a"
@@ -517,6 +515,8 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 st.metric("Detractors% vs NPS", _corr_pair(view, "Detractors%", "NPS"))
             with corr_cols[3]:
                 st.metric("NetSent% vs NPS", _corr_pair(view, "NetSent%", "NPS"))
+            with corr_cols[4]:
+                st.metric("NPS vs Complaints/1000", _corr_pair(view, "NPS", "Complaints/1000"))
 
             # ---- MoM deltas (latest vs previous) ----
             st.markdown("#### MoM Δ (latest vs previous)")
