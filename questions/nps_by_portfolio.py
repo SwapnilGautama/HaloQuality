@@ -224,7 +224,6 @@ def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
 
     d_fpa = _find_col(fpa, ["activity date","activity_date","activitydate","date"])
     if d_fpa is None:
-        # a few files keep "date" already canonical
         d_fpa = "date" if "date" in fpa.columns else None
     fpa["_month"] = pd.to_datetime(fpa[d_fpa], errors="coerce", dayfirst=True).dt.to_period("M") if d_fpa else pd.NaT
 
@@ -402,7 +401,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if fig_mom is not None:
                 st.pyplot(fig_mom, use_container_width=True)
 
-        # ---- Tab 3: NPS Correlation (UPDATED: Detractors% + Sentiment %) ----
+        # ---- Tab 3: NPS Correlation (UPDATED: correlation panel + MoM deltas) ----
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
 
@@ -423,7 +422,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 sent_m = (sd_all.groupby(["Portfolio","_month"])["sent_label"].value_counts()
                                   .unstack(fill_value=0)
                                   .reset_index())
-                # ensure columns
                 for c in ["positive","negative","neutral"]:
                     if c not in sent_m.columns: sent_m[c] = 0
                 sent_m["S_Tot"] = sent_m[["positive","negative","neutral"]].sum(axis=1)
@@ -479,8 +477,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     plot_df["NPS"], plot_df["Complaints/1000"],
                     s=s_px, color=_BUBBLE_FILL, edgecolor=_BUBBLE_EDGE, alpha=0.85
                 )
-
-                # labels
                 for _, r in plot_df.iterrows():
                     lab = f"{r.get('Portfolio','')}"
                     try:
@@ -488,7 +484,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                                    lab, fontsize=8, color=_DARK_GREY, ha="center", va="bottom")
                     except Exception:
                         pass
-
                 ax_sc.set_xlabel("NPS %", color=_DARK_GREY)
                 ax_sc.set_ylabel("Complaints per 1000", color=_DARK_GREY)
                 _style_axes(ax_sc)
@@ -501,6 +496,49 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 cols = [c for c in ["Portfolio","Month","Complaints/1000","FPA%","NPS","Detractors%","Pos%","Neg%","NetSent%"]
                         if c in view.columns]
                 st.dataframe(view[cols].sort_values(["Portfolio","Month"]), use_container_width=True)
+
+            # ---- Correlation snapshot (selected range) ----
+            st.markdown("#### Correlation snapshot (selected range)")
+            corr_cols = st.columns(4)
+
+            def _corr_pair(df: pd.DataFrame, x: str, y: str) -> str:
+                if x not in df or y not in df: return "n/a"
+                d = df[[x,y]].dropna()
+                if len(d) < 3: return "n/a"
+                r = d[x].corr(d[y])
+                if pd.isna(r): return "n/a"
+                return f"r = {r:+.2f}"
+
+            with corr_cols[0]:
+                st.metric("FPA% vs Complaints/1000", _corr_pair(view, "FPA%", "Complaints/1000"))
+            with corr_cols[1]:
+                st.metric("FPA% vs NPS", _corr_pair(view, "FPA%", "NPS"))
+            with corr_cols[2]:
+                st.metric("Detractors% vs NPS", _corr_pair(view, "Detractors%", "NPS"))
+            with corr_cols[3]:
+                st.metric("NetSent% vs NPS", _corr_pair(view, "NetSent%", "NPS"))
+
+            # ---- MoM deltas (latest vs previous) ----
+            st.markdown("#### MoM Δ (latest vs previous)")
+            if "Month" in view.columns and not view.empty:
+                def _delta_last_two(g: pd.DataFrame, col: str):
+                    g = g.sort_values("Month")
+                    v = pd.to_numeric(g[col], errors="coerce").dropna()
+                    if len(v) >= 2: return v.iloc[-1] - v.iloc[-2]
+                    return np.nan
+                momo = (view.groupby("Portfolio")
+                            .apply(lambda g: pd.Series({
+                                "ΔNPS": _delta_last_two(g, "NPS"),
+                                "ΔFPA%": _delta_last_two(g, "FPA%"),
+                                "ΔComplaints/1000": _delta_last_two(g, "Complaints/1000"),
+                                "ΔNetSent%": _delta_last_two(g, "NetSent%"),
+                            }))
+                            .reset_index())
+                for c in ["ΔNPS","ΔFPA%","ΔComplaints/1000","ΔNetSent%"]:
+                    momo[c] = momo[c].round(1)
+                st.dataframe(momo.sort_values("Portfolio"), use_container_width=True)
+            else:
+                st.caption("Not enough month data for MoM deltas in the current selection.")
 
             st.caption("Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation")
             df_out = view
