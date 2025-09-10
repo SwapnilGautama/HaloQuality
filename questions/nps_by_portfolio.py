@@ -1,7 +1,7 @@
 # questions/nps_by_portfolio.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Iterable
+from typing import Dict, Any, Optional, Iterable, Tuple, List
 from pathlib import Path
 import re
 import numpy as np
@@ -50,6 +50,44 @@ def _lex_sentiment(text: str) -> float:
         return 0.0
     score = sum(1 for t in toks if t in _POS) - sum(1 for t in toks if t in _NEG)
     return max(-1.0, min(1.0, score / max(len(toks), 4)))
+
+# ----------------- NEW: lightweight key-theme extraction -----------------
+_STOP = {
+    "the","a","an","and","or","for","to","of","in","on","at","by","with","from","as","is","are",
+    "was","were","be","been","it","this","that","these","those","we","you","they","i","he","she",
+    "them","our","your","their","us","but","so","if","than","then","too","very","can","could",
+    "would","should","may","might","will","just","also","not","no","yes","all","any","each","every",
+    "more","most","some","such","into","within","about","over","under","per","etc","na","none","null"
+}
+
+def _clean_tokens(text: str) -> List[str]:
+    toks = re.findall(r"\b[a-zA-Z][a-zA-Z\-']+\b", str(text).lower())
+    out = []
+    for t in toks:
+        t = t.strip("-'")
+        if len(t) < 3: 
+            continue
+        if t in _STOP:
+            continue
+        out.append(t)
+    return out
+
+def _top_phrases(texts: Iterable[str], k: int = 6) -> List[str]:
+    """Return top unigrams/bigrams from a list of texts (negative comments)."""
+    from collections import Counter
+    uni = Counter()
+    bi  = Counter()
+    for t in texts:
+        toks = _clean_tokens(t)
+        uni.update(toks)
+        bi.update([" ".join(pair) for pair in zip(toks, toks[1:]) if pair[0] != pair[1]])
+    # favor bigrams if available, then unigrams
+    top_bi = [w for w,_ in bi.most_common(k)]
+    if len(top_bi) < k:
+        need = k - len(top_bi)
+        top_uni = [w for w,_ in uni.most_common(need)]
+        return [*top_bi, *top_uni]
+    return top_bi[:k]
 
 # ----------------- palette & styling -----------------
 _DARK_BLUE = "#0b3d91"   # titles
@@ -285,6 +323,17 @@ def _pearson(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
     r = d[x].corr(d[y])
     return float(r) if pd.notna(r) else np.nan
 
+# NEW: slope (what a 1-unit change in X means for Y)
+def _slope(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
+    if x not in df or y not in df: return np.nan
+    d = df[[x,y]].dropna()
+    if len(d) < 3: return np.nan
+    try:
+        b1, b0 = np.polyfit(d[x].astype(float), d[y].astype(float), 1)  # y = b1*x + b0
+        return float(b1)
+    except Exception:
+        return np.nan
+
 # ----------------- UI entry -----------------
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
     """Always returns ((title, subtitle), dataframe) and never raises to the host."""
@@ -368,6 +417,25 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if c in view.columns:
                 view[c] = pd.to_numeric(view[c], errors="coerce").round(1)
 
+        # ----------------- NEW: negative-theme story (respect filters) -----------------
+        neg_story_overall: List[str] = []
+        neg_story_latest: List[str] = []
+        latest_month = str(view["Month"].dropna().max()) if "Month" in view.columns and not view.empty else None
+
+        if not sd_all.empty:
+            sd_f = sd_all.copy()
+            if sel_port != "(All)": sd_f = sd_f[sd_f["Portfolio"] == sel_port]
+            if start is not None:   sd_f = sd_f[sd_f["_month"] >= start]
+            if end is not None:     sd_f = sd_f[sd_f["_month"] <= end]
+            neg = sd_f[sd_f["sent_label"] == "negative"].dropna(subset=["Suggestions"])
+
+            if not neg.empty:
+                neg_story_overall = _top_phrases(neg["Suggestions"].tolist(), k=6)
+                if latest_month:
+                    neg_latest = neg[neg["_month"] == neg["_month"].max()]
+                    if not neg_latest.empty:
+                        neg_story_latest = _top_phrases(neg_latest["Suggestions"].tolist(), k=4)
+
         # Tabs (Insights added first)
         tab0, tab1, tab2, tab3 = st.tabs(["Insights", "Overview", "Sentiments", "NPS Correlation"])
 
@@ -387,7 +455,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     "NPS":   ((m["promoter"] - m["detractor"]) / m["Total"].replace(0,np.nan) * 100.0)
                 }).dropna()
 
-            latest_month = str(view["Month"].dropna().max()) if "Month" in view.columns and not view.empty else None
             latest_slice = view[view["Month"] == view["Month"].dropna().max()] if latest_month else pd.DataFrame()
 
             # quick deltas
@@ -411,6 +478,12 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             r_neg  = _pearson(view, "Neg%", "NPS")
             r_comp = _pearson(view, "Complaints/1000", "NPS")
 
+            # NEW: slopes — what 10-unit moves imply for NPS
+            b_fpa  = _slope(view, "FPA%", "NPS")
+            b_det  = _slope(view, "Detractors%", "NPS")
+            b_neg  = _slope(view, "Neg%", "NPS")
+            b_comp = _slope(view, "Complaints/1000", "NPS")
+
             def _r_words(r: float | np.nan) -> str:
                 if pd.isna(r): return "n/a"
                 a = abs(r)
@@ -419,6 +492,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 elif a >= 0.4: band = "moderate"
                 sign = "positive" if r >= 0 else "negative"
                 return f"{band} {sign} (r={r:+.2f})"
+
+            def _implication(label: str, slope: float | np.nan, unit: float = 10.0) -> str:
+                if pd.isna(slope): 
+                    return f"- {label}: insufficient data to infer an effect size."
+                change = slope * unit
+                unit_txt = "pp" if "Detractors%" in label or "FPA%" in label or "Neg%" in label else "units"
+                return f"- **{label}**: each **+{unit:g} {unit_txt}** is associated with **{change:+.1f} pp** in NPS."
 
             # story bullets
             colA, colB = st.columns((1.1, 1))
@@ -441,6 +521,17 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     """.strip()
                 )
 
+                # NEW: what the correlations mean (effect sizes)
+                st.markdown("#### What the numbers imply")
+                st.markdown(
+                    "\n".join([
+                        _implication("Detractors%", b_det, 10.0),
+                        _implication("Negative suggestions%", b_neg, 10.0),
+                        _implication("FPA%", b_fpa, 10.0),
+                        _implication("Complaints/1000", b_comp, 10.0),
+                    ])
+                )
+
             with colB:
                 st.markdown("#### Latest month snapshot")
                 if not latest_slice.empty:
@@ -451,15 +542,27 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 else:
                     st.info("No month-level records to show for the current selection.")
 
-            # quick explanation
-            st.markdown(
-                """
-**How to read this:**  
-- Higher **Detractors%** and **Negative suggestion%** tend to pull NPS down when the correlation is *negative*.  
-- A *positive* correlation between **FPA%** and **NPS** suggests rising accuracy is associated with happier customers.  
-- **Complaints/1000** provides external context; a strong negative link to NPS can indicate operational pain points driving sentiment.
-                """.strip()
-            )
+            # NEW: negative themes callouts
+            if neg_story_overall:
+                chips = " • ".join([f"`{t}`" for t in neg_story_overall[:6]])
+                st.markdown(f"**Negative comment themes (overall selection):** {chips}")
+            if neg_story_latest:
+                chips2 = " • ".join([f\"`{t}`\" for t in neg_story_latest[:4]])
+                st.markdown(f"**Latest month negatives:** {chips2}")
+
+            # UPDATED: how to read this — now anchored in themes + effect sizes
+            how_lines = [
+                "**How to read this:**",
+                "- When **Detractors%** or **Negative suggestions%** rise, NPS typically falls (see effect sizes above).",
+                "- A positive **FPA% → NPS** link means better first-time accuracy shows up as happier customers.",
+                "- **Complaints/1000** adds operational context; higher complaint density aligns with lower NPS.",
+            ]
+            if neg_story_overall:
+                how_lines.append(
+                    f"- This period’s dominant **negative themes** include: {', '.join(neg_story_overall[:6])}. "
+                    "If these spike in the latest month, expect pressure on NPS."
+                )
+            st.markdown("\n".join(how_lines))
 
         # -------------------- Tab 1: OVERVIEW (unchanged) --------------------
         with tab1:
