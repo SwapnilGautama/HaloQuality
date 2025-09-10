@@ -262,6 +262,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     for t in leg.get_texts(): t.set_color(_DARK_GREY)  # legend text dark grey
                     st.pyplot(fig2, use_container_width=True)
                 with s_right:
+                    # existing sentiment summary
                     cat = (sd.groupby("Portfolio")["sent_label"].value_counts()
                              .unstack(fill_value=0)
                              .reindex(columns=[c for c in ["positive","neutral","negative"] if c in sd["sent_label"].unique()], fill_value=0))
@@ -269,8 +270,21 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     cat["Pos%"]   = (cat.get("positive",0)/cat["Sugg"]*100).round(1)
                     cat["Neg%"]   = (cat.get("negative",0)/cat["Sugg"]*100).round(1)
                     cat["NetSent%"] = (cat["Pos%"] - cat["Neg%"]).round(1)
+
+                    # NEW: add NPS + Promoters/Detractors for the same filtered range
+                    if not nps.empty:
+                        npstab = (nps.groupby("Portfolio")[["promoter","detractor","passive","unknown"]]
+                                    .sum(min_count=1))
+                        npstab["Total"] = npstab[["promoter","detractor","passive","unknown"]].sum(axis=1)
+                        npstab["NPS"] = ((npstab["promoter"] - npstab["detractor"]) /
+                                         npstab["Total"].replace(0, np.nan) * 100).round(1)
+                        npstab = npstab.rename(columns={"promoter":"Promoters","detractor":"Detractors"})
+                        cat = cat.join(npstab[["NPS","Promoters","Detractors"]], how="left")
+
+                    # final column order
+                    ordered_cols = [c for c in ["Sugg","Pos%","Neg%","NetSent%","NPS","Promoters","Detractors"] if c in cat.columns]
                     st.markdown("#### Sentiment Summary (filtered range)")
-                    st.dataframe(cat[["Sugg","Pos%","Neg%","NetSent%"]], use_container_width=True)
+                    st.dataframe(cat[ordered_cols], use_container_width=True)
 
         # ---- Tab 3: correlation (NPS × Sentiment × SLA% + Complaints chart) ----
         combined_df = pd.DataFrame()
