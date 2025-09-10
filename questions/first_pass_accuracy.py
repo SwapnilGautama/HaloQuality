@@ -28,12 +28,11 @@ _RCA1_CUM_LINE = "#74C69D"
 JAN_2025 = pd.Period("2025-01")
 
 # ======================
-# Data loading  (UPDATED to read ALL monthly workbooks)
+# Data loading
 # ======================
 def _find_fpa_workbooks() -> List[Path]:
     """
     Find ALL FirstPassAccuracy workbooks across common locations.
-    Previously we returned only the last/most recent file; now we return all.
     """
     roots = [
         Path("data/first_pass_accuracy"),
@@ -72,6 +71,7 @@ def _workbook_cache_key(p: Path) -> str:
 
 @st.cache_data(show_spinner=False)
 def _read_fpa_cached(path_str: str, path_key: str) -> pd.DataFrame:
+    """Cache reads of individual workbooks."""
     return _read_excel_any(Path(path_str))
 
 def _normalize_one_fpa(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -110,35 +110,52 @@ def _normalize_one_fpa(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
             if c in out.columns]
     return out[keep], col_map
 
+# ---------- NEW: fast combine cache ----------
+def _workbooks_signature(paths: List[Path]) -> str:
+    parts = []
+    for p in paths:
+        try:
+            stt = p.stat()
+            parts.append(f"{p.resolve()}::{stt.st_size}::{stt.st_mtime_ns}")
+        except Exception:
+            parts.append(str(p))
+    return "|".join(parts)
+
+@st.cache_data(show_spinner=False)
+def _combine_normalised_fpa_cached(
+    sig: str,
+    path_strs: List[str],
+    path_keys: List[str],
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Build the single combined normalised FPA dataframe and cache it.
+    """
+    frames = []
+    last_map: Dict[str, str] = {}
+    for p_str, key in zip(path_strs, path_keys):
+        df_src = _read_fpa_cached(p_str, key)      # cached per-file
+        norm, cmap = _normalize_one_fpa(df_src)    # fast normaliser
+        frames.append(norm)
+        last_map = cmap
+    if not frames:
+        empty = pd.DataFrame(columns=["date", "_m", "result", "is_pass", "portfolio"])
+        return empty, {}
+    combined = pd.concat(frames, ignore_index=True)
+    return combined, last_map
+# ---------------------------------------------
+
 def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
-    Load and combine ALL FPA workbooks (Jan–Aug etc.), normalize, and return:
-      df: per-row QA checks with date/_m/result/is_pass (+ optional dims)
-      col_map: last detected mapping (for debugging)
+    Load and combine ALL FPA workbooks (Jan–Aug etc.) using a cached combine step.
     """
     paths = _find_fpa_workbooks()
     if not paths:
         raise FileNotFoundError("Could not find any FirstPassAccuracy workbooks (FirstPassAccuracy*.xlsx).")
 
-    frames: List[pd.DataFrame] = []
-    last_map: Dict[str, str] = {}
-
-    for p in paths:
-        try:
-            df = _read_fpa_cached(str(p), _workbook_cache_key(p))
-            norm, cmap = _normalize_one_fpa(df)
-            frames.append(norm)
-            last_map = cmap
-        except Exception:
-            # Skip unreadable/malformed files but continue
-            continue
-
-    if not frames:
-        # keep expected columns; downstream gracefully handles empty
-        empty = pd.DataFrame(columns=["date", "_m", "result", "is_pass", "portfolio"])
-        return empty, {}
-
-    combined = pd.concat(frames, ignore_index=True)
+    sig = _workbooks_signature(paths)
+    path_strs = [str(p) for p in paths]
+    path_keys  = [_workbook_cache_key(p) for p in paths]
+    combined, last_map = _combine_normalised_fpa_cached(sig, path_strs, path_keys)
     return combined, last_map
 
 # ======================
@@ -189,7 +206,7 @@ def _table_portfolio_mom(df: pd.DataFrame) -> pd.DataFrame:
     return piv.sort_index().fillna(0).astype(int)
 
 # ======================
-# Reason labelling (cached) — unchanged logic
+# Reason labelling (cached)
 # ======================
 @st.cache_data(show_spinner=False)
 def _label_all_cached_for_2025(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -431,7 +448,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         st.error(f"FPA file found, but a required column is missing: {e}")
         return ("", pd.DataFrame())
 
-    # Overview
+    # Overview series
     mom = _series_mom(df_raw)
     if mom.empty:
         st.info("No First-Pass Accuracy rows found from Jan-25 onward.")
@@ -440,22 +457,12 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     latest = df_raw["_m"].max()
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
-    st.sidebar.header("Filters (2025) — Fail reasons")
-    fails_all = _label_all(df_raw)
-    if not fails_all.empty:
-        fails_2025 = fails_all[fails_all["_m"] >= JAN_2025].copy()
-        all_reasons = sorted(fails_2025["reason"].unique().tolist())
-        all_portfolios = sorted(fails_2025["portfolio"].dropna().unique().tolist())
-    else:
-        all_reasons, all_portfolios = [], []
-    sel_reasons = st.sidebar.multiselect("Fail reasons", options=all_reasons, default=all_reasons)
-    sel_portfolios = st.sidebar.multiselect("Portfolios", options=all_portfolios, default=all_portfolios)
-
+    # Build tabs (we'll compute fail-reasons lazily inside an expander)
     tab_overview, tab_comparisons, tab_comp_acc = st.tabs(["Overview", "Comparisons", "Complaints and Accuracy"])
 
     # ---------------- Overview ----------------
     with tab_overview:
-        for b in _heuristic_insights(mom, df_raw, fails_all):
+        for b in _heuristic_insights(mom, df_raw, None):
             st.markdown(f"- {b}")
 
         c1, c2 = st.columns((1.1, 1.0), gap="large")
@@ -466,24 +473,42 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if not piv_portfolio_mom.empty:
                 st.dataframe(piv_portfolio_mom, use_container_width=True)
 
-        reasons_latest, lastp = _label_all_latest(df_raw, fails_precomputed=fails_all)
-        matrix_2025 = _pivot_fail_matrix(fails_all)
+        # ---------- Lazy fail reasons and matrix ----------
+        with st.expander("Fail reasons (AI-labelled) — click to compute", expanded=False):
+            with st.spinner("Labelling failures…"):
+                fails_all = _label_all(df_raw)  # cached
+            reasons_latest, lastp = _label_all_latest(df_raw, fails_precomputed=fails_all)
+            matrix_2025 = _pivot_fail_matrix(fails_all)
 
-        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y')}</h4>", unsafe_allow_html=True)
-        r1, r2 = st.columns((1.0, 1.2), gap="large")
-        with r1:
-            if not reasons_latest.empty: st.pyplot(_fig_pareto_full(reasons_latest))
-            else: st.info("No fail reasons available for the latest month.")
-        with r2:
-            if not matrix_2025.empty:
-                if sel_reasons:
-                    matrix_2025 = matrix_2025.loc[matrix_2025.index.get_level_values("reason").isin(sel_reasons)]
-                if sel_portfolios:
-                    matrix_2025 = matrix_2025.loc[matrix_2025.index.get_level_values("portfolio").isin(sel_portfolios)]
-                st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month (2025)</h4>", unsafe_allow_html=True)
-                st.dataframe(matrix_2025, use_container_width=True)
-            else:
-                st.info("No 2025 fail reason data available to populate the matrix.")
+            st.markdown(
+                f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y') if not pd.isna(lastp) else ''}</h4>",
+                unsafe_allow_html=True,
+            )
+            r1, r2 = st.columns((1.0, 1.2), gap="large")
+            with r1:
+                if not reasons_latest.empty:
+                    st.pyplot(_fig_pareto_full(reasons_latest))
+                else:
+                    st.info("No fail reasons available for the latest month.")
+            with r2:
+                if not matrix_2025.empty:
+                    st.markdown(
+                        f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month (2025)</h4>",
+                        unsafe_allow_html=True,
+                    )
+                    # optional filters inside expander (useful when data is large)
+                    reasons_opts = sorted(matrix_2025.index.get_level_values("reason").unique().tolist())
+                    port_opts = sorted(matrix_2025.index.get_level_values("portfolio").unique().tolist())
+                    sel_reasons = st.multiselect("Filter reasons", options=reasons_opts, default=reasons_opts)
+                    sel_ports = st.multiselect("Filter portfolios", options=port_opts, default=port_opts)
+                    mat_view = matrix_2025.copy()
+                    if sel_reasons:
+                        mat_view = mat_view.loc[mat_view.index.get_level_values("reason").isin(sel_reasons)]
+                    if sel_ports:
+                        mat_view = mat_view.loc[mat_view.index.get_level_values("portfolio").isin(sel_ports)]
+                    st.dataframe(mat_view, use_container_width=True)
+                else:
+                    st.info("No 2025 fail reason data available to populate the matrix.")
 
     # ===================== Comparisons (ZERO rows filtered) =====================
     with tab_comparisons:
