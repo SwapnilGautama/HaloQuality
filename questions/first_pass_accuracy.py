@@ -28,19 +28,28 @@ _RCA1_CUM_LINE = "#74C69D"
 JAN_2025 = pd.Period("2025-01")
 
 # ======================
-# Data loading
+# Data loading  (UPDATED to read ALL monthly workbooks)
 # ======================
-def _find_fpa_workbook() -> Optional[Path]:
-    roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
+def _find_fpa_workbooks() -> List[Path]:
+    """
+    Find ALL FirstPassAccuracy workbooks across common locations.
+    Previously we returned only the last/most recent file; now we return all.
+    """
+    roots = [
+        Path("data/first_pass_accuracy"),
+        Path("first_pass_accuracy"),
+        Path("data/first_pass_accuracy/"),
+    ]
     patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
+    hits: List[Path] = []
     for root in roots:
         if not root.exists():
             continue
         for pat in patterns:
-            hits = sorted(root.glob(pat))
-            if hits:
-                return hits[-1]
-    return None
+            hits.extend(root.glob(pat))
+    # sort deterministically by filename then mtime
+    hits = sorted(set(hits), key=lambda p: (p.name, p.stat().st_mtime_ns if p.exists() else 0))
+    return hits
 
 def _read_excel_any(path: Path) -> pd.DataFrame:
     try:
@@ -65,12 +74,10 @@ def _workbook_cache_key(p: Path) -> str:
 def _read_fpa_cached(path_str: str, path_key: str) -> pd.DataFrame:
     return _read_excel_any(Path(path_str))
 
-def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
-    p = _find_fpa_workbook()
-    if not p:
-        raise FileNotFoundError("Could not find a FirstPassAccuracy workbook (FirstPassAccuracy*.xlsx).")
-    df = _read_fpa_cached(str(p), _workbook_cache_key(p))
-
+def _normalize_one_fpa(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Normalize a single FPA workbook to a common schema.
+    """
     col_map = {
         "date": _pick(df, ["Activity Date", "ActivityDate", "Date", "Activity date"]),
         "result": _pick(df, ["Review Result", "Review result", "Result"]),
@@ -85,17 +92,54 @@ def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
     }
     missing = [k for k, v in col_map.items() if k in ("date", "result") and v is None]
     if missing:
-        raise KeyError(f"Missing required columns for FPA: {missing}")
+        # Skip malformed file upstream
+        raise KeyError(f"Missing required columns: {missing}")
 
-    df = df.rename(columns={v: k for k, v in col_map.items() if v})
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
-    df["_m"] = df["date"].dt.to_period("M")
-    res = df["result"].astype(str).str.strip().str.lower()
-    df["is_pass"] = res.str.startswith("pass")
+    out = df.rename(columns={v: k for k, v in col_map.items() if v}).copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
+    out["_m"] = out["date"].dt.to_period("M")
+    res = out["result"].astype(str).str.strip().str.lower()
+    out["is_pass"] = res.str.startswith("pass")
     for opt in ("portfolio", "team", "individual", "location"):
-        if opt in df.columns:
-            df[opt] = df[opt].astype("category")
-    return df, col_map
+        if opt in out.columns:
+            out[opt] = out[opt].astype("category")
+
+    keep = [c for c in ["date", "_m", "result", "is_pass",
+                        "portfolio", "scheme", "comment", "rca2",
+                        "team", "work_type", "individual", "location"]
+            if c in out.columns]
+    return out[keep], col_map
+
+def _load_fpa() -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Load and combine ALL FPA workbooks (Jan–Aug etc.), normalize, and return:
+      df: per-row QA checks with date/_m/result/is_pass (+ optional dims)
+      col_map: last detected mapping (for debugging)
+    """
+    paths = _find_fpa_workbooks()
+    if not paths:
+        raise FileNotFoundError("Could not find any FirstPassAccuracy workbooks (FirstPassAccuracy*.xlsx).")
+
+    frames: List[pd.DataFrame] = []
+    last_map: Dict[str, str] = {}
+
+    for p in paths:
+        try:
+            df = _read_fpa_cached(str(p), _workbook_cache_key(p))
+            norm, cmap = _normalize_one_fpa(df)
+            frames.append(norm)
+            last_map = cmap
+        except Exception:
+            # Skip unreadable/malformed files but continue
+            continue
+
+    if not frames:
+        # keep expected columns; downstream gracefully handles empty
+        empty = pd.DataFrame(columns=["date", "_m", "result", "is_pass", "portfolio"])
+        return empty, {}
+
+    combined = pd.concat(frames, ignore_index=True)
+    return combined, last_map
 
 # ======================
 # Normalization helpers (robust filtering)
@@ -355,7 +399,7 @@ def _merge_complaints_fpa_for_chart(m_comp: pd.DataFrame, m_fpa: pd.DataFrame) -
         m_fpa.rename(columns={"pass_pct": "pass_pct"}),
         on="month", how="outer",
     ).sort_values("month", key=lambda s: pd.to_datetime(s, format="%b-%y"))
-    df["complaints_per_1000"] = df["complaints_per_1000"].fillna(0).astype(float).round(1)
+    df["complaints_per_1000"] = df["complaints_per_1000"] .fillna(0).astype(float).round(1)
     df["pass_pct"] = df["pass_pct"].fillna(0).astype(float).round(0)
     return df
 
