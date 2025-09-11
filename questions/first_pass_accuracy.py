@@ -633,6 +633,54 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         else:
             st.info("Cannot compute Scheme × Individual predictions (missing one of those columns).")
 
+        # ---------------- Worst schemes — 2025 pass rate (new) ----------------
+        st.divider()
+        st.markdown(
+            f"<h5 style='color:{_DARK_BLUE};margin:.25rem 0 .5rem 0;'>Worst schemes — 2025 pass rate</h5>",
+            unsafe_allow_html=True,
+        )
+        if "scheme" in df_raw.columns:
+            df_2025_scheme = df_raw[df_raw["_m"] >= JAN_2025].copy()
+            if df_2025_scheme.empty:
+                st.info("No 2025 rows available to compute scheme pass rates.")
+            else:
+                agg = (df_2025_scheme.groupby("scheme")
+                       .agg(total=("is_pass", "size"),
+                            passed=("is_pass", "sum"))
+                       .reset_index())
+                MIN_SAMPLES_SCHEME = 30  # stability guard
+                agg = agg[agg["total"] >= MIN_SAMPLES_SCHEME].copy()
+                if agg.empty:
+                    st.info("Not enough scheme volume in 2025 (need at least 30 cases per scheme).")
+                else:
+                    agg["pass_rate%"] = (agg["passed"] * 100.0 / agg["total"]).round(1)
+
+                    latest_m = df_2025_scheme["_m"].max()
+                    lt = (df_2025_scheme[df_2025_scheme["_m"] == latest_m]
+                          .groupby("scheme")
+                          .agg(lt_total=("is_pass", "size"),
+                               lt_passed=("is_pass", "sum"))
+                          .reset_index())
+                    lt["lt_pass_rate%"] = (lt["lt_passed"] * 100.0 / lt["lt_total"].replace(0, np.nan)).round(1)
+                    agg = agg.merge(lt, on="scheme", how="left")
+
+                    # Bottom 5 by pass rate (ties by larger total to prioritize higher exposure)
+                    worst5 = (agg.sort_values(by=["pass_rate%", "total"], ascending=[True, False])
+                                  .head(5)[["scheme", "pass_rate%", "total", "lt_pass_rate%"]]
+                                  .rename(columns={
+                                      "scheme": "Scheme",
+                                      "pass_rate%": "Pass % (2025)",
+                                      "total": "Total (2025)",
+                                      "lt_pass_rate%": f"Latest month pass % ({pd.Period(latest_m).to_timestamp().strftime('%b-%y')})"
+                                  }))
+                    st.dataframe(worst5, use_container_width=True)
+                    st.caption(
+                        "Bottom 5 schemes by overall pass rate in 2025 (min 30 cases). "
+                        "Latest-month % shows current direction for each scheme."
+                    )
+        else:
+            st.info("Cannot compute worst schemes (no Scheme column).")
+
     # ---------------- OVERVIEW (restored ORIGINAL tab) ----------------
     with tab_overview:
         # original bullets (simple MoM headline)
