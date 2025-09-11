@@ -706,8 +706,15 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if have_individual:
             if have_team:
                 mgr_opts = sorted(df_raw["team"].dropna().astype(str).unique().tolist())
-                default_mgrs = mgr_opts
-                sel_mgrs_for_ind = st.multiselect("Team manager (Individuals section)", options=mgr_opts, default=default_mgrs, key="cmp_ind_managers")
+                # --- Modified default: prefer "Divya Dayanidhi" if available ---
+                preferred_manager = "Divya Dayanidhi"
+                default_mgrs = [preferred_manager] if preferred_manager in mgr_opts else mgr_opts
+                sel_mgrs_for_ind = st.multiselect(
+                    "Team manager (Individuals section)",
+                    options=mgr_opts,
+                    default=default_mgrs,
+                    key="cmp_ind_managers"
+                )
                 df_ind = df_raw[_mask_in(df_raw["team"], sel_mgrs_for_ind)].copy() if sel_mgrs_for_ind else df_raw.head(0).copy()
             else:
                 st.caption("Team manager column not found; Individuals section will not filter by manager.")
