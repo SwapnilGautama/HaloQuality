@@ -86,16 +86,18 @@ with st.spinner("Loading data..."):
         store = load_store()
 
 # ============================== Router + query box ==============================
-# default prompt is now "fpa"
-q_default = st.session_state.get("q", "fpa")
+# FIX: initialize once; let the widget own the value thereafter
+if "q" not in st.session_state:
+    st.session_state["q"] = "fpa"   # one-time default on first load only
+
 q = st.text_input(
     "Type your question (e.g., 'comp', 'complaint', or 'fpa'; say 'with filters' to open the filter pane)",
-    value=q_default,
+    key="q",   # <- binds state; no 'value=' so it won't be reset on reruns
 )
-st.session_state["q"] = q
 
 # Route
-match = sem_router.match(q) if hasattr(sem_router, "match") else {"slug": "complaints_june_by_portfolio", "params": {}}
+user_query = (q or "").strip()
+match = sem_router.match(user_query) if hasattr(sem_router, "match") else {"slug": "complaints_june_by_portfolio", "params": {}}
 slug = match.get("slug", "complaints_june_by_portfolio")
 params = match.get("params", {}) or {}
 
@@ -107,7 +109,7 @@ def _wants_sidebar(text: str, p: Dict[str, Any]) -> bool:
     keywords = ("filter", "filters", "filter pane", "with filters", "show filters")
     return any(k in t for k in keywords)
 
-SHOW_SIDEBAR = _wants_sidebar(q, params)
+SHOW_SIDEBAR = _wants_sidebar(user_query, params)
 
 # Apply CSS to hide sidebar only when NOT requested
 if not SHOW_SIDEBAR:
@@ -123,7 +125,7 @@ if not SHOW_SIDEBAR:
 
 # ============================== Run question ===============================
 try:
-    result, df = _run_question(store, slug, params, user_text=q)
+    result, df = _run_question(store, slug, params, user_text=user_query)
 except Exception:
     st.error("Sorry—couldn't run that question.")
     st.code(traceback.format_exc())
