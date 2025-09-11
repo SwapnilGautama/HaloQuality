@@ -121,9 +121,8 @@ def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label=
         out["per_1000"] = per.replace([np.inf, -np.inf], np.nan)
     return out
 
-def _months_13() -> List[str]:
-    base = pd.period_range("2024-06", "2025-06", freq="M")
-    return [str(p) for p in base]
+def _months_jan_to_aug_2025() -> List[str]:
+    return [f"2025-{i:02d}" for i in range(1, 9)]
 
 
 # -------------------------------
@@ -404,7 +403,7 @@ def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
     cases["_month"] = _build_month_column(cases, date_c)
     comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
 
-    want = [f"2025-{i:02d}" for i in range(1, 7)]
+    want = _months_jan_to_aug_2025()
     cases_m = cases.loc[cases["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
     comp_m = comp.loc[comp["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
     per_1000 = (comp_m * 1000 / cases_m.replace(0, np.nan)).fillna(0.0).round(1)
@@ -520,7 +519,7 @@ def _mom_line_fig(df: pd.DataFrame):
     ax.plot(df["month"], df["per_1000"], marker="o", linewidth=2.5, color="#9ecae1")
     for x, y in zip(df["month"], df["per_1000"]):
         ax.text(x, y + 0.03, f"{y:.1f}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-    ax.set_title("Complaints per 1,000 — MoM (Jan–Jun ’25)", pad=8, color=_DARK_BLUE)
+    ax.set_title("Complaints per 1,000 — MoM (Jan–Aug ’25)", pad=8, color=_DARK_BLUE)
     ax.set_ylim(bottom=0)
     ax.spines["left"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -597,7 +596,9 @@ def _portfolio_list(cases: pd.DataFrame, comp: pd.DataFrame) -> List[str]:
         ports |= set(cases[port_c].dropna().astype(str).unique().tolist())
     if port_k and port_k in comp.columns:
         ports |= set(comp[port_k].dropna().astype(str).unique().tolist())
-    return sorted([p for p in ports if p and p.lower() != "nan"])
+    # Keep only specific tabs in required order if present
+    desired = ["Chichester", "London", "Northwest", "Scotland"]
+    return [p for p in desired if p in ports]
 
 @st.cache_data(show_spinner=False)
 def _portfolio_mom_series(cases: pd.DataFrame, comp: pd.DataFrame, portfolio: str) -> pd.DataFrame:
@@ -610,7 +611,7 @@ def _portfolio_mom_series(cases: pd.DataFrame, comp: pd.DataFrame, portfolio: st
     cases["_month"] = _build_month_column(cases, date_c)
     comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
 
-    months = _months_13()
+    months = _months_jan_to_aug_2025()
     cs = cases.loc[(cases[port_c] == portfolio) & (cases["_month"].isin(months))].groupby("_month").size().reindex(months, fill_value=0)
     cp = comp.loc[(comp[port_k] == portfolio) & (comp["_month"].isin(months))].groupby("_month").size().reindex(months, fill_value=0)
     per = (cp * 1000 / cs.replace(0, np.nan)).fillna(0.0).values
@@ -660,8 +661,10 @@ def _reason_trend_df(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.Dat
         return pd.DataFrame()
     comp = comp.copy()
     comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
-    months = ["2025-04", "2025-05", "2025-06"]
-    lab_months = ["Apr’25", "May’25", "Jun’25"]
+
+    # Jan–Aug 2025 split
+    months = _months_jan_to_aug_2025()
+    lab_months = [pd.Period(m).to_timestamp().strftime("%b’%y") for m in months]
 
     out = { "RCA1": ["Delay","Procedure","Communication","System","Incorrect/Incomplete information"] }
     for m, label in zip(months, lab_months):
@@ -692,7 +695,7 @@ def _fig_reason_trend(df: pd.DataFrame):
     ax.set_xticklabels(df["RCA1"], rotation=0, color=_DARK_GREY)
     ax.set_ylim(0, 100)
     ax.legend(frameon=False, loc="upper right")
-    ax.set_title("Reason Trend (Apr–Jun ’25) — % split", color=_DARK_BLUE)
+    ax.set_title("Reason Trend (Jan–Aug ’25) — % split", color=_DARK_BLUE)
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY)
@@ -708,8 +711,9 @@ def _delay_split_df(comp: pd.DataFrame, portfolio: str, use_ai: bool) -> pd.Data
         return pd.DataFrame()
     comp = comp.copy()
     comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
-    months = ["2025-04", "2025-05", "2025-06"]
-    labels = ["Apr’25", "May’25", "Jun’25"]
+
+    months = _months_jan_to_aug_2025()
+    labels = [pd.Period(m).to_timestamp().strftime("%b’%y") for m in months]
 
     rows = []
     for m, lab in zip(months, labels):
@@ -742,7 +746,7 @@ def _fig_delay_split(df: pd.DataFrame):
     ax.set_xticks(x); ax.set_xticklabels(df["month"], color=_DARK_GREY)
     ax.set_ylim(0, 100)
     ax.legend(frameon=False, loc="upper right")
-    ax.set_title("Delay split — External vs Aptia (Apr–Jun ’25)", color=_DARK_BLUE)
+    ax.set_title("Delay split — External vs Aptia (Jan–Aug ’25)", color=_DARK_BLUE)
     for sp in ["left", "right", "top"]:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(_SOFT_GREY); ax.spines["bottom"].set_linewidth(1.25)
@@ -859,8 +863,8 @@ def _build_ppt(table_df: pd.DataFrame, mom_df: pd.DataFrame, rca1_df: pd.DataFra
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
     """
     Tabs:
-      - Overall (original dashboard, unchanged except 2nd row filters & table)
-      - One tab per Portfolio with the layout from the screenshot
+      - Overall
+      - Chichester, London, Northwest, Scotland (only these, if present)
     """
     # Hide sidebar / toolbar / parsed filters AND any alert (blue) boxes
     st.markdown(
@@ -988,7 +992,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             with t1:
                 df_trend = _portfolio_mom_series(cases, comp, portfolio)
                 if not df_trend.empty:
-                    st.pyplot(_fig_portfolio_trend(df_trend, f"{portfolio} trend Jun’24–Jun’25"))
+                    st.pyplot(_fig_portfolio_trend(df_trend, f"{portfolio} trend Jan–Aug ’25"))
             with t2:
                 df_reason_trend = _reason_trend_df(comp, portfolio, use_ai=use_ai)
                 if not df_reason_trend.empty:
