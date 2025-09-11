@@ -626,17 +626,60 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 chips2 = " • ".join([f"`{t}`" for t in neg_story_latest[:4]])
                 st.markdown(f"**Latest month negatives:** {chips2}")
 
+            # -------------------- NEW: Detractor sentiment & issues --------------------
+            # Focus only on detractors' suggestions within current selection and summarise their sentiment + key issues.
+            det_comment = ""
+            try:
+                sel = s.copy()
+                if sel_port != "(All)": sel = sel[sel["Portfolio"] == sel_port]
+                if start is not None:   sel = sel[sel["_month"] >= start]
+                if end is not None:     sel = sel[sel["_month"] <= end]
+
+                det = sel[(sel["nps_bucket"] == "detractor") & (sel["Suggestions"].notna())].copy()
+                if not det.empty:
+                    # Sentiment for detractors
+                    det["sent_score"] = det["Suggestions"].map(_lex_sentiment)
+                    det["sent_label"] = np.where(det["sent_score"] >= 0.05, "positive",
+                                          np.where(det["sent_score"] <= -0.05, "negative", "neutral"))
+                    total_det = int(det.shape[0])
+                    neg_share = (det["sent_label"].eq("negative").mean() * 100.0) if total_det else 0.0
+                    pos_share = (det["sent_label"].eq("positive").mean() * 100.0) if total_det else 0.0
+
+                    # Key issues from detractor suggestions
+                    det_overall_phr = _top_phrases(det["Suggestions"].tolist(), k=6)
+                    latest_m = det["_month"].max()
+                    det_latest_phr = []
+                    if pd.notna(latest_m):
+                        dlat = det[det["_month"] == latest_m]
+                        if not dlat.empty:
+                            det_latest_phr = _top_phrases(dlat["Suggestions"].tolist(), k=4)
+
+                    det_chips = " • ".join([f"`{t}`" for t in det_overall_phr]) if det_overall_phr else "—"
+                    lat_chips = " • ".join([f"`{t}`" for t in det_latest_phr]) if det_latest_phr else "—"
+
+                    st.markdown("#### Detractor sentiment & key issues")
+                    st.markdown(
+                        f"- **Detractor comments analysed:** {total_det}  "
+                        f"- **Negative share:** {neg_share:.1f}%  • **Positive share:** {pos_share:.1f}%"
+                    )
+                    st.markdown(f"- **Dominant detractor issues (overall):** {det_chips}")
+                    if pd.notna(latest_m):
+                        st.markdown(f"- **Latest month detractor issues ({str(latest_m)}):** {lat_chips}")
+                else:
+                    st.markdown("#### Detractor sentiment & key issues")
+                    st.info("No detractor suggestions available in the selected range.")
+            except Exception:
+                # Keep insights resilient even if text parsing fails
+                st.markdown("#### Detractor sentiment & key issues")
+                st.info("Could not compute detractor sentiment due to missing or malformed data.")
+
             how_lines = [
                 "**How to read this:**",
                 "- When **Detractors%** or **Negative suggestions%** rise, NPS typically falls (see effect sizes above).",
                 "- A positive **FPA% → NPS** link means better first-time accuracy shows up as happier customers.",
                 "- **Complaints/1000** provides external context; higher complaint density aligns with lower NPS.",
+                "- **Detractor sentiment & issues** highlights what detractors specifically say; recurring themes indicate where fixes will most move NPS.",
             ]
-            if neg_story_overall:
-                how_lines.append(
-                    f"- Dominant **negative themes**: {', '.join(neg_story_overall[:6])}. "
-                    "If these spike in the latest month, expect pressure on NPS."
-                )
             st.markdown("\n".join(how_lines))
 
         # -------------------- Tab 1: OVERVIEW --------------------
