@@ -1,7 +1,7 @@
 # questions/nps_by_portfolio.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Iterable, List
+from typing import Dict, Any, Optional, Iterable, List, Tuple
 from pathlib import Path
 import re
 import numpy as np
@@ -161,8 +161,136 @@ def _fig_mom_nps_pos(nps_df: pd.DataFrame, sd_df: pd.DataFrame):
     ax.legend(frameon=False, loc="upper right")
     return fig
 
-# ----------------- surveys (NPS + suggestions) -----------------
-def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
+# ======================
+# FPA multi-file loader with caching (replicates FPA treatment)
+# ======================
+def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols:
+            return cols[c.lower()]
+    return None
+
+def _find_fpa_workbooks() -> List[Path]:
+    roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
+    patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
+    hits: List[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for pat in patterns:
+            hits.extend(root.glob(pat))
+    hits = sorted(set(hits), key=lambda p: (p.name, p.stat().st_mtime_ns if p.exists() else 0))
+    return hits
+
+def _read_excel_any(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_excel(path)
+    except Exception:
+        return pd.read_excel(path, header=0)
+
+def _workbook_cache_key(p: Path) -> str:
+    try:
+        return f"{p.resolve()}::{p.stat().st_mtime_ns}"
+    except Exception:
+        return str(p)
+
+def _workbooks_signature(paths: List[Path]) -> str:
+    parts = []
+    for p in paths:
+        try:
+            stt = p.stat()
+            parts.append(f"{p.resolve()}::{stt.st_size}::{stt.st_mtime_ns}")
+        except Exception:
+            parts.append(str(p))
+    return "|".join(parts)
+
+@st.cache_data(show_spinner=False)
+def _read_fpa_cached(path_str: str, path_key: str) -> pd.DataFrame:
+    return _read_excel_any(Path(path_str))
+
+def _normalize_one_fpa(df: pd.DataFrame) -> pd.DataFrame:
+    col_date = _pick(df, ["Activity Date", "ActivityDate", "Date", "Activity date"])
+    col_result = _pick(df, ["Review Result", "Review result", "Result"])
+    col_port = _pick(df, ["Portfolio", "portfolio"])
+    if col_date is None or col_result is None:
+        raise KeyError("Missing required FPA columns")
+    out = df.rename(columns={col_date: "date", col_result: "result", col_port: "portfolio" if col_port else "portfolio"}).copy()
+    out["portfolio"] = out.get("portfolio", "Unknown")
+    out["portfolio"] = out["portfolio"].astype(str).map(_norm_portfolio)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
+    out["_month"] = out["date"].dt.to_period("M")
+    res = out["result"].astype(str).str.strip().str.lower()
+    out["_pass"] = res.str.startswith("pass").astype(int)
+    return out[["portfolio","_month","_pass"]]
+
+@st.cache_data(show_spinner=False)
+def _combine_normalised_fpa_cached(sig: str, path_strs: List[str], path_keys: List[str]) -> pd.DataFrame:
+    frames = []
+    for p_str, key in zip(path_strs, path_keys):
+        df_src = _read_fpa_cached(p_str, key)
+        frames.append(_normalize_one_fpa(df_src))
+    if not frames:
+        return pd.DataFrame(columns=["portfolio","_month","_pass"])
+    return pd.concat(frames, ignore_index=True)
+
+def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Return normalized FPA month rollups across **ALL workbooks**:
+    columns -> Portfolio, _month, FPA%
+    Priority: store['fpa'] (already/raw) → cached combine of all workbooks on disk.
+    """
+    fpa_raw = store.get("fpa", pd.DataFrame()) if isinstance(store, dict) else pd.DataFrame()
+    if fpa_raw is not None and not fpa_raw.empty:
+        return _fpa_monthly_from_df_cached(fpa_raw)
+
+    paths = _find_fpa_workbooks()
+    if not paths:
+        return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
+
+    sig = _workbooks_signature(paths)
+    path_strs = [str(p) for p in paths]
+    path_keys  = [_workbook_cache_key(p) for p in paths]
+    allf = _combine_normalised_fpa_cached(sig, path_strs, path_keys)
+    if allf.empty:
+        return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
+    g = (allf.dropna(subset=["_month"])
+              .groupby(["portfolio","_month"])["_pass"]
+              .agg(passed="sum", total="count")
+              .reset_index())
+    g["FPA%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan))
+    g = g.rename(columns={"portfolio":"Portfolio"})
+    return g[["Portfolio","_month","FPA%"]]
+
+@st.cache_data(show_spinner=False)
+def _fpa_monthly_from_df_cached(fpa_raw: pd.DataFrame) -> pd.DataFrame:
+    df = fpa_raw.copy()
+    # If already normalized, just return required columns
+    if {"Portfolio","_month","FPA%"} <= set(df.columns):
+        return df[["Portfolio","_month","FPA%"]]
+    # Else try to normalize a raw file similar to the disk-normaliser
+    if "date" in df.columns and "result" in df.columns:
+        out = df.copy()
+        out["portfolio"] = out.get("portfolio", out.get("Portfolio", "Unknown"))
+        out["portfolio"] = out["portfolio"].astype(str).map(_norm_portfolio)
+        out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
+        out["_month"] = out["date"].dt.to_period("M")
+        res = out["result"].astype(str).str.strip().str.lower()
+        out["_pass"] = res.str.startswith("pass").astype(int)
+        g = (out.dropna(subset=["_month"])
+                 .groupby(["portfolio","_month"])["_pass"]
+                 .agg(passed="sum", total="count")
+                 .reset_index())
+        g["FPA%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan))
+        g = g.rename(columns={"portfolio":"Portfolio"})
+        return g[["Portfolio","_month","FPA%"]]
+    return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
+
+# ======================
+# Surveys (NPS + suggestions) — cached transforms
+# ======================
+@st.cache_data(show_spinner=False)
+def _prep_surveys_cached(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame()
     df = df_raw.copy()
     pcol = _find_col(df, ["portfolio"])
@@ -189,7 +317,8 @@ def _prep_surveys(df_raw: pd.DataFrame) -> pd.DataFrame:
         df["Suggestions"] = np.nan
     return df
 
-def _aggregate_nps(df: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def _aggregate_nps_cached(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return pd.DataFrame()
     df = df[df["_month"].notna()].copy()
     g = df.groupby(["Portfolio","_month"])["nps_bucket"].value_counts().unstack(fill_value=0)
@@ -199,7 +328,8 @@ def _aggregate_nps(df: pd.DataFrame) -> pd.DataFrame:
     g["NPS%"] = ((g["promoter"] - g["detractor"]) / g["Total"]) * 100.0
     return g.reset_index()
 
-def _sentiments(df: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def _sentiments_cached(df: pd.DataFrame) -> pd.DataFrame:
     sug = df[df["Suggestions"].notna()].copy()
     if sug.empty: return sug
     score = sug["Suggestions"].map(_lex_sentiment)
@@ -207,95 +337,16 @@ def _sentiments(df: pd.DataFrame) -> pd.DataFrame:
     sug["sent_score"] = score; sug["sent_label"] = lab
     return sug
 
-# ----------------- FPA multi-file loader (mirrors FPA question) -----------------
-def _find_fpa_workbooks() -> List[Path]:
-    roots = [Path("data/first_pass_accuracy"), Path("first_pass_accuracy"), Path("data/first_pass_accuracy/")]
-    patterns = ["FirstPassAccuracy*.xls*", "*FirstPassAccuracy*.xls*"]
-    hits: List[Path] = []
-    for root in roots:
-        if not root.exists():
-            continue
-        for pat in patterns:
-            hits.extend(root.glob(pat))
-    hits = sorted(set(hits), key=lambda p: (p.name, p.stat().st_mtime_ns if p.exists() else 0))
-    return hits
-
-def _read_excel_any(path: Path) -> pd.DataFrame:
-    try:
-        return pd.read_excel(path)
-    except Exception:
-        return pd.read_excel(path, header=0)
-
-def _normalize_one_fpa(df: pd.DataFrame) -> pd.DataFrame:
-    # keep only what we need for NPS correlation
-    def _pick(df, opts):
-        cols = {c.lower(): c for c in df.columns}
-        for o in opts:
-            if o.lower() in cols: return cols[o.lower()]
-        return None
-    col_date = _pick(df, ["Activity Date", "ActivityDate", "Date", "Activity date"])
-    col_result = _pick(df, ["Review Result", "Review result", "Result"])
-    col_port = _pick(df, ["Portfolio", "portfolio"])
-    if col_date is None or col_result is None:
-        raise KeyError("Missing required FPA columns")
-    out = df.rename(columns={col_date: "date", col_result: "result", col_port: "portfolio" if col_port else "portfolio"}).copy()
-    out["portfolio"] = out.get("portfolio", "Unknown")
-    out["portfolio"] = out["portfolio"].astype(str).map(_norm_portfolio)
-    out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
-    out["_month"] = out["date"].dt.to_period("M")
-    res = out["result"].astype(str).str.strip().str.lower()
-    out["_pass"] = res.str.startswith("pass").astype(int)
-    return out[["portfolio","_month","_pass"]]
-
-def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Return normalized FPA month rollups across **ALL workbooks**:
-    columns -> Portfolio, _month, FPA%
-    Priority: store['fpa'] (already-normalized) → all workbooks on disk.
-    """
-    fpa_raw = store.get("fpa", pd.DataFrame()) if isinstance(store, dict) else pd.DataFrame()
-    if fpa_raw is not None and not fpa_raw.empty and {"Portfolio","_month","FPA%"} <= set(fpa_raw.columns):
-        return fpa_raw[["Portfolio","_month","FPA%"]].copy()
-
-    paths = _find_fpa_workbooks()
-    if not paths:
-        return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
-
-    frames = []
-    for p in paths:
-        try:
-            df = _read_excel_any(p)
-            frames.append(_normalize_one_fpa(df))
-        except Exception:
-            continue
-
-    if not frames:
-        return pd.DataFrame(columns=["Portfolio","_month","FPA%"])
-
-    allf = pd.concat(frames, ignore_index=True)
-    g = (allf.dropna(subset=["_month"])
-              .groupby(["portfolio","_month"])["_pass"]
-              .agg(passed="sum", total="count")
-              .reset_index())
-    g["FPA%"] = (g["passed"] * 100.0 / g["total"].replace(0, np.nan))
-    g = g.rename(columns={"portfolio":"Portfolio"})
-    return g[["Portfolio","_month","FPA%"]]
-
-# ----------------- Cases / Complaints -----------------
-def _cases_monthly(store: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Build monthly *completed* volume by Portfolio.
-    Prefer completed/closed date fields; fall back to created if necessary.
-    """
-    cs = store.get("cases", pd.DataFrame())
+# ======================
+# Cases / Complaints — cached rollups from provided store DFs
+# ======================
+@st.cache_data(show_spinner=False)
+def _cases_monthly_from_df(cs: pd.DataFrame) -> pd.DataFrame:
     if cs is None or cs.empty:
         return pd.DataFrame(columns=["Portfolio","_month","Total Cases Complete"])
-
     df = cs.copy()
     p = _find_col(df, ["portfolio"])
     df["Portfolio"] = df[p].map(_norm_portfolio) if p else "Unknown"
-
-    # Prefer completion/closed date columns; else fall back to created.
     date_candidates = [
         "completed date","date completed","completion date","completed_date","completed",
         "closed date","date closed","closed_date","closed",
@@ -303,28 +354,19 @@ def _cases_monthly(store: Dict[str, Any]) -> pd.DataFrame:
         "create date","created date","create_date","start date","report date","date"
     ]
     d = _find_col(df, date_candidates)
-    # Try to parse the found date; if missing or all NaT, try a secondary.
     def _parse_dates(series: pd.Series) -> pd.Series:
         s = pd.to_datetime(series, errors="coerce", dayfirst=True)
         if s.notna().sum() == 0:
-            # Try more liberal parsing for formats like '2025-08' / 'Aug-2025'
             s = pd.to_datetime(series.astype(str), errors="coerce", infer_datetime_format=True)
         return s
-
-    if d:
-        parsed = _parse_dates(df[d])
-    else:
-        parsed = pd.Series(pd.NaT, index=df.index)
-
+    parsed = _parse_dates(df[d]) if d else pd.Series(pd.NaT, index=df.index)
     if parsed.notna().sum() == 0:
-        # final fallback: look specifically for any of these and pick the first that parses
         for alt in ["create date","created date","report date","date"]:
             col = _find_col(df, [alt])
             if col:
                 parsed = _parse_dates(df[col])
                 if parsed.notna().sum() > 0:
                     break
-
     df["_month"] = parsed.dt.to_period("M")
     out = (df.dropna(subset=["_month"])
              .groupby(["Portfolio","_month"])
@@ -332,32 +374,26 @@ def _cases_monthly(store: Dict[str, Any]) -> pd.DataFrame:
              .reset_index())
     return out
 
-def _complaints_monthly(store: Dict[str, Any]) -> pd.DataFrame:
-    comp = store.get("complaints", pd.DataFrame())
+@st.cache_data(show_spinner=False)
+def _complaints_monthly_from_df(comp: pd.DataFrame) -> pd.DataFrame:
     if comp is None or comp.empty:
         return pd.DataFrame(columns=["Portfolio","_month","Total Complaints"])
     df = comp.copy()
     p = _find_col(df, ["portfolio"]); df["Portfolio"] = df[p].map(_norm_portfolio) if p else "Unknown"
-
-    # Detect a month-like field robustly
     month_candidates = [
         "month", "date complaint received - dd/mm/yy","date complaint received","complaint date",
         "received date","received_date","date","report date","created date","create date"
     ]
     d = _find_col(df, month_candidates)
-
     if d:
-        # Try robust date parsing for various formats (e.g., "2025-08", "Aug-2025", "01/08/2025")
         parsed = pd.to_datetime(df[d], errors="coerce", dayfirst=True)
         if parsed.isna().all():
             parsed = pd.to_datetime(df[d].astype(str), errors="coerce", infer_datetime_format=True)
         if parsed.isna().all() and d.lower() == "month":
-            # Fallback: if it's a plain month name, assume the current calendar year in the dataset (e.g., 2025)
             mm = df[d].astype(str).str[:3].str.title()
             parsed = pd.to_datetime(mm + " 2025", format="%b %Y", errors="coerce")
     else:
         parsed = pd.Series(pd.NaT, index=df.index)
-
     df["_month"] = parsed.dt.to_period("M")
     out = (df.dropna(subset=["_month"])
              .groupby(["Portfolio","_month"])
@@ -365,15 +401,60 @@ def _complaints_monthly(store: Dict[str, Any]) -> pd.DataFrame:
              .reset_index())
     return out
 
+# ======================
+# Combined view cache (depends on inputs + filters)
+# ======================
+@st.cache_data(show_spinner=False)
+def _build_combined_cached(
+    base: pd.DataFrame,
+    fpa_monthly: pd.DataFrame,
+    cases_monthly: pd.DataFrame,
+    comp_monthly: pd.DataFrame,
+    sent_m: pd.DataFrame,
+    sel_port: str,
+    start: Optional[pd.Period],
+    end: Optional[pd.Period],
+) -> pd.DataFrame:
+    combined = (base
+        .merge(fpa_monthly,   on=["Portfolio","_month"], how="outer")
+        .merge(cases_monthly, on=["Portfolio","_month"], how="outer")
+        .merge(comp_monthly,  on=["Portfolio","_month"], how="outer")
+        .merge(sent_m,        on=["Portfolio","_month"], how="left"))
+
+    # Robust rate: only compute when denominator > 0
+    num = pd.to_numeric(combined.get("Total Complaints"), errors="coerce")
+    den = pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
+    combined["Complaints/1000"] = np.where((den > 0) & pd.notna(num),
+                                           (num / den) * 1000.0,
+                                           np.nan)
+
+    combined["Detractors%"] = (
+        pd.to_numeric(combined.get("detractor"), errors="coerce") /
+        pd.to_numeric(combined.get("Total"), errors="coerce")
+    ) * 100.0
+
+    if sel_port != "(All)":
+        combined = combined[combined["Portfolio"] == sel_port]
+    if start is not None:
+        combined = combined[combined["_month"] >= start]
+    if end is not None:
+        combined = combined[combined["_month"] <= end]
+
+    view = combined.rename(columns={"_month":"Month"}).copy()
+    for c in ["NPS","FPA%","Complaints/1000","Detractors%","Pos%","Neg%","NetSent%"]:
+        if c in view.columns:
+            view[c] = pd.to_numeric(view[c], errors="coerce").round(1)
+    return view
+
 # ----------------- UI entry -----------------
 def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] = None):
     """Always returns ((title, subtitle), dataframe) and never raises to the host."""
     df_out = pd.DataFrame()
 
     try:
-        # Load surveys
+        # Load surveys (cached)
         surveys = store.get("surveys", pd.DataFrame())
-        s = _prep_surveys(surveys)
+        s = _prep_surveys_cached(surveys)
         if s.empty or s["_month"].isna().all():
             msg = pd.DataFrame([{"Message": "No usable surveys (check Month_received, NPS, Suggestions)."}])
             return ("NPS by Portfolio", "Surveys (Sheet 1)"), msg
@@ -387,8 +468,8 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             start = st.selectbox("From month", months, index=0) if months else None
             end = st.selectbox("To month", months, index=len(months)-1) if months else None
 
-        # NPS aggregates
-        nps = _aggregate_nps(s)
+        # NPS aggregates (cached)
+        nps = _aggregate_nps_cached(s)
         if sel_port != "(All)": nps = nps[nps["Portfolio"] == sel_port]
         if start is not None:  nps = nps[nps["_month"] >= start]
         if end   is not None:  nps = nps[nps["_month"] <= end]
@@ -401,13 +482,13 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             overall_nps = np.nan
         st.markdown(f"### Overall NPS (selected range): **{overall_nps:.1f}**")
 
-        # Pre-compute “combined” data so Insights and Correlation can reuse it
+        # Pre-compute inputs (all cached)
         base = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown","Total"]]\
                   .rename(columns={"NPS%":"NPS"}).copy()
-        fpa_monthly   = _load_fpa_from_store_or_disk(store)
-        cases_monthly = _cases_monthly(store)
-        comp_monthly  = _complaints_monthly(store)
-        sd_all        = _sentiments(s)
+        fpa_monthly   = _load_fpa_from_store_or_disk(store)           # cached combine like FPA
+        cases_monthly = _cases_monthly_from_df(store.get("cases", pd.DataFrame()))
+        comp_monthly  = _complaints_monthly_from_df(store.get("complaints", pd.DataFrame()))
+        sd_all        = _sentiments_cached(s)
 
         if not sd_all.empty:
             sent_m = (sd_all.groupby(["Portfolio","_month"])["sent_label"].value_counts()
@@ -423,40 +504,14 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         else:
             sent_m = pd.DataFrame(columns=["Portfolio","_month","Pos%","Neg%","NetSent%"])
 
-        combined = (base
-            .merge(fpa_monthly,   on=["Portfolio","_month"], how="outer")
-            .merge(cases_monthly, on=["Portfolio","_month"], how="outer")
-            .merge(comp_monthly,  on=["Portfolio","_month"], how="outer")
-            .merge(sent_m,        on=["Portfolio","_month"], how="left"))
-
-        # Robust rate: only compute when denominator > 0
-        num = pd.to_numeric(combined.get("Total Complaints"), errors="coerce")
-        den = pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
-        combined["Complaints/1000"] = np.where((den > 0) & pd.notna(num),
-                                               (num / den) * 1000.0,
-                                               np.nan)
-
-        combined["Detractors%"] = (
-            pd.to_numeric(combined.get("detractor"), errors="coerce") /
-            pd.to_numeric(combined.get("Total"), errors="coerce")
-        ) * 100.0
-
-        if sel_port != "(All)":
-            combined = combined[combined["Portfolio"] == sel_port]
-        if start is not None:
-            combined = combined[combined["_month"] >= start]
-        if end is not None:
-            combined = combined[combined["_month"] <= end]
-
-        view = combined.rename(columns={"_month":"Month"}).copy()
-        for c in ["NPS","FPA%","Complaints/1000","Detractors%","Pos%","Neg%","NetSent%"]:
-            if c in view.columns:
-                view[c] = pd.to_numeric(view[c], errors="coerce").round(1)
+        # Build the combined view (cached by inputs + filters)
+        view = _build_combined_cached(base, fpa_monthly, cases_monthly, comp_monthly, sent_m,
+                                      sel_port, start, end)
 
         # Tabs
         tab0, tab1, tab2, tab3 = st.tabs(["Insights", "Overview", "Sentiments", "NPS Correlation"])
 
-        # -------------------- Tab 0: INSIGHTS (AI) --------------------
+        # -------------------- Tab 0: INSIGHTS (heuristic/statistical) --------------------
         with tab0:
             st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:.25rem 0 1rem 0;'>What’s happening and why</h4>",
                         unsafe_allow_html=True)
@@ -513,7 +568,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
             neg_story_overall: list[str] = []
             neg_story_latest: list[str] = []
-            sd_all = _sentiments(s)
+            sd_all = _sentiments_cached(s)
             if not sd_all.empty:
                 sd_f = sd_all.copy()
                 if sel_port != "(All)": sd_f = sd_f[sd_f["Portfolio"] == sel_port]
@@ -610,7 +665,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
         # -------------------- Tab 2: SENTIMENTS --------------------
         with tab2:
-            sd = _sentiments(s)
+            sd = _sentiments_cached(s)
             if sel_port != "(All)": sd = sd[sd["Portfolio"] == sel_port]
             if start is not None:  sd = sd[sd["_month"] >= start]
             if end   is not None:  sd = sd[sd["_month"] <= end]
@@ -671,9 +726,9 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
 
-            # Localized Month filter (does NOT affect other tabs)
             month_opts = ["(All)"] + sorted(view["Month"].dropna().astype(str).unique().tolist())
-            sel_corr_month = st.selectbox("Month (local to this tab)", options=month_opts, index=len(month_opts)-1 if len(month_opts)>1 else 0, key="nps_corr_month")
+            sel_corr_month = st.selectbox("Month (local to this tab)", options=month_opts,
+                                          index=len(month_opts)-1 if len(month_opts)>1 else 0, key="nps_corr_month")
             if sel_corr_month != "(All)":
                 corr_df = view[view["Month"].astype(str) == sel_corr_month].copy()
             else:
