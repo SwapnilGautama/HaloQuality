@@ -124,6 +124,38 @@ def _add_total_row(df: pd.DataFrame, sum_cols: List[str], label_col: str, label=
 def _months_jan_to_aug_2025() -> List[str]:
     return [f"2025-{i:02d}" for i in range(1, 9)]
 
+# NEW: detect latest available month (by cases; robust to varied columns)
+@st.cache_data(show_spinner=False)
+def _latest_month_2025(cases: pd.DataFrame, comp: pd.DataFrame) -> Tuple[str | None, str]:
+    c_date = _find_first_col(
+        cases,
+        ["Create Date (cases)", "Create Date", "Create date", "Start Date", "StartDate", "Created On", "CreateDt"],
+    )
+    k_date = _find_first_col(
+        comp,
+        ["Date Complaint Received - DD/MM/YY", "Date Complaint Received", "Complaint Date", "Received Date", "Month"],
+    )
+    if c_date is None and k_date is None:
+        return None, "Latest"
+    latest = None
+    if c_date is not None:
+        cm = pd.to_datetime(cases[c_date], errors="coerce", dayfirst=True).dt.to_period("M")
+        cm = cm[cm.dt.year == 2025]
+        if not cm.dropna().empty:
+            latest = cm.max()
+    if latest is None and k_date is not None:
+        # fall back to complaints
+        if k_date.lower() == "month":
+            km = pd.to_datetime(comp[k_date].astype(str) + " 2025", errors="coerce").dt.to_period("M")
+        else:
+            km = pd.to_datetime(comp[k_date], errors="coerce", dayfirst=True).dt.to_period("M")
+        km = km[km.dt.year == 2025]
+        if not km.dropna().empty:
+            latest = km.max()
+    if latest is None:
+        return None, "Latest"
+    return str(latest), pd.Period(latest).to_timestamp().strftime("%b %Y")
+
 
 # -------------------------------
 # RCA rules + AI support
@@ -353,35 +385,28 @@ def _detect_complaints_fields(comp: pd.DataFrame):
 
 
 # -------------------------------
-# Core computations (overall) — CACHED
+# Core computations — CACHED
 # -------------------------------
 
+# NEW: generic month table (used for dynamic latest title)
 @st.cache_data(show_spinner=False)
-def _portfolio_table_for_june(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
+def _portfolio_table_for_month(cases: pd.DataFrame, comp: pd.DataFrame, month_str: str) -> pd.DataFrame:
     id_c, port_c, date_c = _detect_cases_fields(cases)
     _, port_k, date_k, _ = _detect_complaints_fields(comp)
-
-    missing = []
-    if port_c is None: missing.append("Portfolio (cases)")
-    if date_c is None: missing.append("Create Date (cases)")
-    if port_k is None: missing.append("Portfolio (complaints)")
-    if date_k is None: missing.append("Complaint date (complaints)")
-    if missing:
+    if any(x is None for x in [port_c, date_c, port_k, date_k]) or not month_str:
         return pd.DataFrame(columns=["portfolio", "cases", "complaints", "per_1000"])
 
-    cases = cases.copy()
-    comp = comp.copy()
-
+    cases = cases.copy(); comp = comp.copy()
     cases["_month"] = _build_month_column(cases, date_c)
     comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
 
-    cases_jun = cases.loc[cases["_month"] == "2025-06"].groupby(port_c, dropna=False, as_index=False).size()
-    cases_jun.rename(columns={"size": "cases", port_c: "portfolio"}, inplace=True)
+    cases_m = cases.loc[cases["_month"] == month_str].groupby(port_c, dropna=False, as_index=False).size()
+    cases_m.rename(columns={"size": "cases", port_c: "portfolio"}, inplace=True)
 
-    comp_jun = comp.loc[comp["_month"] == "2025-06"].groupby(port_k, dropna=False, as_index=False).size()
-    comp_jun.rename(columns={"size": "complaints", port_k: "portfolio"}, inplace=True)
+    comp_m = comp.loc[comp["_month"] == month_str].groupby(port_k, dropna=False, as_index=False).size()
+    comp_m.rename(columns={"size": "complaints", port_k: "portfolio"}, inplace=True)
 
-    out = pd.merge(cases_jun, comp_jun, how="left", on="portfolio")
+    out = pd.merge(cases_m, comp_m, how="left", on="portfolio")
     out["complaints"] = out["complaints"].fillna(0).astype(int)
     with np.errstate(divide="ignore", invalid="ignore"):
         out["per_1000"] = (out["complaints"] * 1000 / out["cases"]).replace([np.inf, -np.inf], np.nan)
@@ -458,7 +483,7 @@ def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame
 
     return r2, r1
 
-# NEW: RCA2 table by portfolio (for June) with optional filters — CACHED
+# RCA2 by portfolio for June (unchanged)
 @st.cache_data(show_spinner=False)
 def _rca2_table_by_portfolio_for_june(
     comp: pd.DataFrame,
@@ -748,7 +773,7 @@ def _fig_delay_split(df: pd.DataFrame):
     ax.legend(frameon=False, loc="upper right")
     ax.set_title("Delay split — External vs Aptia (Jan–Aug ’25)", color=_DARK_BLUE)
     for sp in ["left", "right", "top"]:
-        ax.spines[sp].set_visible(False)
+        ax.spines[sp].setVisible = False
     ax.spines["bottom"].set_color(_SOFT_GREY); ax.spines["bottom"].set_linewidth(1.25)
     ax.get_yaxis().set_visible(False)
     ax.set_xlabel(""); ax.set_ylabel(""); ax.grid(False)
@@ -875,7 +900,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         [data-testid="stSidebarNav"] {display: none !important;}
         [data-testid="stToolbar"] {display: none !important;}
         div[data-testid="stExpander"] {display: none !important;}
-        /* Hide all info/warning/alert boxes (removes the two blue bars at bottom) */
         div[role="alert"] { display: none !important; }
         section[data-testid="stMain"] {padding-left: 1rem; padding-right: 1rem;}
         </style>
@@ -887,17 +911,25 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     comp: pd.DataFrame = store.get("complaints", pd.DataFrame()).copy()
     use_ai = bool(os.getenv("OPENAI_API_KEY"))
 
+    # --- latest month (for dynamic title & table) ---
+    latest_month_str, latest_label = _latest_month_2025(cases, comp)
+
     portfolios = _portfolio_list(cases, comp)
     tabs = st.tabs(["Overall"] + portfolios)
 
     # ----------------- Overall tab -----------------
     with tabs[0]:
-        table = _portfolio_table_for_june(cases, comp)
+        # Build latest-month table; if not found, fallback to June logic
+        if latest_month_str:
+            table = _portfolio_table_for_month(cases, comp, latest_month_str)
+        else:
+            table = _portfolio_table_for_month(cases, comp, "2025-06")
+
         mom = _mom_series(cases, comp)
 
         c1, c2 = st.columns((1.2, 1.0), gap="large")
         with c1:
-            _header("Complaint analysis — Jun 2025 (by portfolio)")
+            _header(f"Complaint analysis — {latest_label} (by portfolio)")
             if table.empty:
                 st.info("No rows returned for the current filters.")
             else:
@@ -912,7 +944,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             if not mom.empty:
                 _plot_mom_line(mom)
 
-        # =========== ROW 2 (UNCHANGED UI; computations cached) ===========
+        # =========== ROW 2 (unchanged) ===========
         _, port_k, _, _ = _detect_complaints_fields(comp)
         rca1_options = _RCA1_ALLOWED
         ports_options = portfolios if portfolios else []
@@ -968,9 +1000,8 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                     use_container_width=True,
                 )
 
-        # PPT uses unfiltered overall tables (same as before)
+        # PPT uses unchanged content
         rca2_all, rca1_all = _rca_tables_for_june(comp, use_ai=use_ai)
-
         if _PPT_READY and not table.empty and not mom.empty and not rca1_all.empty and not rca2_all.empty:
             ppt_bytes = _build_ppt(table, mom, rca1_all, rca2_all)
             st.download_button(
@@ -983,7 +1014,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         elif not _PPT_READY:
             st.caption("Install `python-pptx` to enable PPT download.")
 
-    # ----------------- Portfolio tabs -----------------
+    # ----------------- Portfolio tabs (unchanged) -----------------
     for i, portfolio in enumerate(portfolios, start=1):
         with tabs[i]:
             st.markdown(f"<h2 style='color:{_DARK_BLUE};margin:.3rem 0 1rem 0;'>{portfolio} — complaints analysis</h2>", unsafe_allow_html=True)
