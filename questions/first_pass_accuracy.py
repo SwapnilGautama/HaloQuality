@@ -226,7 +226,7 @@ def _label_all_cached_for_2025(df_raw: pd.DataFrame) -> pd.DataFrame:
 def _label_all(df: pd.DataFrame) -> pd.DataFrame:
     return _label_all_cached_for_2025(df)
 
-def _label_all_latest(df: pd.DataFrame, fails_precomputed: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, pd.Period]:
+def _label_all_latest(df: pd.DataFrame, fails_precomputed: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     latest = df["_m"].max()
     if pd.isna(latest):
         return pd.DataFrame(columns=["reason", "count", "percent", "cum_percent"]), latest
@@ -276,12 +276,28 @@ def _heuristic_insights(mom: pd.DataFrame, df_raw: pd.DataFrame, fails_all: pd.D
     last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
     prev_val = overall_series.iloc[-2] if len(overall_series) >= 2 else np.nan
     delta = (last_val - prev_val) if not (np.isnan(last_val) or np.isnan(prev_val)) else np.nan
+
+    # trend slope (simple): positive/up, negative/down, flat
+    slope = 0.0
+    if len(overall_series) >= 3:
+        x = np.arange(len(overall_series))
+        slope = float(np.polyfit(x, overall_series, 1)[0])
+
+    # hit-rate (share of months above 90%)
+    hit_rate = float((overall_series >= 90).mean() * 100.0) if len(overall_series) else np.nan
+
     bullets: List[str] = []
     if not np.isnan(last_val):
         if not np.isnan(delta):
             bullets.append(f"**Month-on-Month Pass Rate**: {mom['month'].iloc[-1]} **{last_val:.0f}%** ({'+' if delta>=0 else ''}{delta:.0f} pp MoM).")
         else:
             bullets.append(f"**Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
+    if len(overall_series) >= 3:
+        dir_word = "upward" if slope > 0.2 else ("downward" if slope < -0.2 else "flat")
+        bullets.append(f"**Trend**: {dir_word} over the observed period (slope {slope:+.2f} pp/month).")
+    if not np.isnan(hit_rate):
+        bullets.append(f"**Quality target adherence**: {hit_rate:.0f}% of months at or above 90% pass.")
+
     return bullets[:4]
 
 def _fig_mom(df: pd.DataFrame, title: str):
@@ -457,8 +473,93 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     latest = df_raw["_m"].max()
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
-    # Build tabs (we'll compute fail-reasons lazily inside an expander)
-    tab_overview, tab_comparisons, tab_comp_acc = st.tabs(["Overview", "Comparisons", "Complaints and Accuracy"])
+    # Build tabs (Insights added; others preserved)
+    tab_insights, tab_overview, tab_comparisons, tab_comp_acc = st.tabs(
+        ["Insights", "Overview", "Comparisons", "Complaints and Accuracy"]
+    )
+
+    # ---------------- Insights (NEW) ----------------
+    with tab_insights:
+        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA Insights — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}</h4>", unsafe_allow_html=True)
+
+        # Narrative bullets (trend, momentum, target adherence)
+        with st.container():
+            bullets = _heuristic_insights(mom, df_raw, None)
+            for b in bullets:
+                st.markdown(f"- {b}")
+
+        c1, c2 = st.columns((1.05, 1.0), gap="large")
+        with c1:
+            st.pyplot(_fig_mom(mom, "Overall Pass % — Month on Month"))
+        with c2:
+            # Prominent fail reasons (latest month) — AI-labelled (cached)
+            with st.spinner("Analysing fail reasons…"):
+                fails_all = _label_all(df_raw)  # cached
+                reasons_latest, lastp = _label_all_latest(df_raw, fails_precomputed=fails_all)
+            st.markdown(
+                f"<h5 style='color:{_DARK_BLUE};margin:.25rem 0 .5rem 0;'>Prominent fail reasons — {pd.Period(lastp).to_timestamp().strftime('%b-%y') if not pd.isna(lastp) else ''}</h5>",
+                unsafe_allow_html=True,
+            )
+            if not reasons_latest.empty:
+                st.pyplot(_fig_pareto_full(reasons_latest))
+            else:
+                st.info("No fail reasons available for the latest month.")
+
+        st.divider()
+
+        # Outliers (latest) — portfolio / managers / individuals
+        st.markdown(f"<h5 style='color:{_DARK_BLUE};margin:.25rem 0 .5rem 0;'>Outliers — latest month pass %</h5>", unsafe_allow_html=True)
+
+        def _top_bottom(latest_tab: pd.DataFrame, k: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
+            if latest_tab.empty:
+                return pd.DataFrame(), pd.DataFrame()
+            best = latest_tab.head(k).copy()
+            worst = latest_tab.tail(k).copy().sort_values("pass_%")
+            return best, worst
+
+        # Portfolio
+        _, lt_port = _pass_mom_by_dim(df_raw, "portfolio") if "portfolio" in df_raw.columns else (pd.DataFrame(), pd.DataFrame())
+        b1, b2 = st.columns(2)
+        with b1:
+            if not lt_port.empty:
+                best, worst = _top_bottom(lt_port, 3)
+                st.markdown("**Portfolio — Top 3**")
+                st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        with b2:
+            if not lt_port.empty:
+                best, worst = _top_bottom(lt_port, 3)
+                st.markdown("**Portfolio — Bottom 3**")
+                st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+
+        # Managers
+        _, lt_mgr = _pass_mom_by_dim(df_raw, "team") if "team" in df_raw.columns else (pd.DataFrame(), pd.DataFrame())
+        c1, c2 = st.columns(2)
+        with c1:
+            if not lt_mgr.empty:
+                best, worst = _top_bottom(lt_mgr, 3)
+                st.markdown("**Managers — Top 3**")
+                st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        with c2:
+            if not lt_mgr.empty:
+                best, worst = _top_bottom(lt_mgr, 3)
+                st.markdown("**Managers — Bottom 3**")
+                st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+
+        # Individuals
+        _, lt_ind = _pass_mom_by_dim(df_raw, "individual") if "individual" in df_raw.columns else (pd.DataFrame(), pd.DataFrame())
+        d1, d2 = st.columns(2)
+        with d1:
+            if not lt_ind.empty:
+                best, worst = _top_bottom(lt_ind, 3)
+                st.markdown("**Individuals — Top 3**")
+                st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        with d2:
+            if not lt_ind.empty:
+                best, worst = _top_bottom(lt_ind, 3)
+                st.markdown("**Individuals — Bottom 3**")
+                st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+
+        st.caption("Notes: Outliers are based on latest-month pass %. Groups with zero cases are excluded automatically. Fail reasons use cached AI labelling to keep this tab snappy.")
 
     # ---------------- Overview ----------------
     with tab_overview:
