@@ -397,6 +397,38 @@ def _fig_complaints_accuracy(df: pd.DataFrame):
     return fig
 
 # ======================
+# (Overview helper) Pareto figure for reasons — used by ORIGINAL overview
+# ======================
+def _fig_pareto_full(df: pd.DataFrame):
+    fig, ax1 = plt.subplots(figsize=(8.6, 4.0))
+    x = np.arange(len(df))
+    colors = [_RCA1_BARS[i % len(_RCA1_BARS)] for i in range(len(df))]
+    bars = ax1.bar(x, df["count"], color=colors)
+    lift = (max(df["count"]) * 0.015) if len(df) else 1
+    for b in bars:
+        ax1.text(b.get_x() + b.get_width()/2, b.get_height() + lift,
+                 f"{int(b.get_height())}", ha="center", va="bottom",
+                 fontsize=9, color=_DARK_GREY)
+    ax2 = ax1.twinx()
+    x_dense = np.linspace(x.min(), x.max(), num=max(200, len(x) * 20)) if len(x) else np.array([0, 1])
+    y_dense = np.interp(x_dense, x if len(x) else np.array([0, 1]),
+                        df["cum_percent"].values if len(x) else np.array([0, 100]))
+    ax2.plot(x_dense, y_dense, linewidth=2.8, color=_RCA1_CUM_LINE)
+    for xi, cp in zip(x, df["cum_percent"]):
+        ax2.text(xi, cp + 2, f"{cp:.0f}%", ha="center", va="bottom",
+                 fontsize=8, color=_DARK_GREY)
+    ax1.set_xticks(x); ax1.set_xticklabels(df["reason"], rotation=90, ha="center", color=_DARK_GREY)
+    for sp in ["left", "right", "top"]:
+        ax1.spines[sp].set_visible(False)
+    ax1.spines["bottom"].set_color(_SOFT_GREY); ax1.spines["bottom"].set_linewidth(1.25)
+    ax1.get_yaxis().set_visible(False); ax2.get_yaxis().set_visible(False)
+    for sp in ["left", "right", "top", "bottom"]:
+        ax2.spines[sp].set_visible(False)
+    ax1.set_xlabel(""); ax1.set_ylabel(""); ax2.set_ylabel("")
+    ax1.grid(False); ax2.set_ylim(0, 100)
+    return fig
+
+# ======================
 # Streamlit entry
 # ======================
 def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFrame]:
@@ -418,19 +450,19 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     latest = df_raw["_m"].max()
     piv_portfolio_mom = _table_portfolio_mom(df_raw)
 
-    # Build tabs (Insights updated; others preserved)
+    # Build tabs (Insights, Overview, Comparisons, Complaints & Accuracy)
     tab_insights, tab_overview, tab_comparisons, tab_comp_acc = st.tabs(
         ["Insights", "Overview", "Comparisons", "Complaints and Accuracy"]
     )
 
-    # ---------------- Insights (Story + Outliers) ----------------
+    # ---------------- Insights (version 3 — story + outliers) ----------------
     with tab_insights:
         st.markdown(
             f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA Insights — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}</h4>",
             unsafe_allow_html=True,
         )
 
-        # High-level trend bullets
+        # high-level trend bullets
         def _heuristic_insights(mom_df: pd.DataFrame) -> List[str]:
             overall_series = mom_df["pass_pct"].astype(float)
             last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
@@ -487,7 +519,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
 
         st.divider()
 
-        # >>>>> Outliers (re-added, unchanged logic) <<<<<
+        # Outliers — latest month (v3)
         st.markdown(f"<h5 style='color:{_DARK_BLUE};margin:.25rem 0 .5rem 0;'>Outliers — latest month pass %</h5>", unsafe_allow_html=True)
 
         def _top_bottom(latest_tab: pd.DataFrame, k: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -502,12 +534,12 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         b1, b2 = st.columns(2)
         with b1:
             if not lt_port.empty:
-                best, worst = _top_bottom(lt_port, 3)
+                best, _ = _top_bottom(lt_port, 3)
                 st.markdown("**Portfolio — Top 3**")
                 st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         with b2:
             if not lt_port.empty:
-                best, worst = _top_bottom(lt_port, 3)
+                _, worst = _top_bottom(lt_port, 3)
                 st.markdown("**Portfolio — Bottom 3**")
                 st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
 
@@ -516,12 +548,12 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         c3, c4 = st.columns(2)
         with c3:
             if not lt_mgr.empty:
-                best, worst = _top_bottom(lt_mgr, 3)
+                best, _ = _top_bottom(lt_mgr, 3)
                 st.markdown("**Managers — Top 3**")
                 st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         with c4:
             if not lt_mgr.empty:
-                best, worst = _top_bottom(lt_mgr, 3)
+                _, worst = _top_bottom(lt_mgr, 3)
                 st.markdown("**Managers — Bottom 3**")
                 st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
 
@@ -530,44 +562,76 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         c5, c6 = st.columns(2)
         with c5:
             if not lt_ind.empty:
-                best, worst = _top_bottom(lt_ind, 3)
+                best, _ = _top_bottom(lt_ind, 3)
                 st.markdown("**Individuals — Top 3**")
                 st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
         with c6:
             if not lt_ind.empty:
-                best, worst = _top_bottom(lt_ind, 3)
+                _, worst = _top_bottom(lt_ind, 3)
                 st.markdown("**Individuals — Bottom 3**")
                 st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
 
         st.caption("Notes: Outliers are based on latest-month pass %. Groups with zero cases are excluded automatically. Fail reasons use cached AI labelling to keep this tab snappy.")
 
-    # ---------------- Overview (unchanged) ----------------
+    # ---------------- OVERVIEW (restored ORIGINAL tab) ----------------
     with tab_overview:
-        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}</h4>", unsafe_allow_html=True)
-        st.pyplot(_fig_mom(mom, "Overall Pass % — Month on Month"))
-        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>FPA % by Portfolio — Month on Month</h4>", unsafe_allow_html=True)
-        if not piv_portfolio_mom.empty:
-            st.dataframe(piv_portfolio_mom, use_container_width=True)
+        # original bullets (simple MoM headline)
+        overall_series = mom["pass_pct"].astype(float)
+        last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
+        prev_val = overall_series.iloc[-2] if len(overall_series) >= 2 else np.nan
+        delta = (last_val - prev_val) if not (np.isnan(last_val) or np.isnan(prev_val)) else np.nan
+        if not np.isnan(last_val):
+            if not np.isnan(delta):
+                st.markdown(f"- **Month-on-Month Pass Rate**: {mom['month'].iloc[-1]} **{last_val:.0f}%** ({'+' if delta>=0 else ''}{delta:.0f} pp MoM).")
+            else:
+                st.markdown(f"- **Month-on-Month Pass Rate**: Latest {mom['month'].iloc[-1]} **{last_val:.0f}%**.")
 
+        # layout: left line chart, right portfolio MoM table
+        c1, c2 = st.columns((1.1, 1.0), gap="large")
+        with c1:
+            st.pyplot(_fig_mom(mom, f"First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}"))
+        with c2:
+            st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA % by Portfolio — Month on Month</h4>", unsafe_allow_html=True)
+            if not piv_portfolio_mom.empty:
+                st.dataframe(piv_portfolio_mom, use_container_width=True)
+
+        # Lazy fail-reasons: Pareto + matrix with filters (exactly as original)
         with st.expander("Fail reasons (AI-labelled) — click to compute", expanded=False):
             with st.spinner("Labelling failures…"):
                 fails_all = _label_all(df_raw)  # cached
             reasons_latest, lastp = _label_all_latest(df_raw, fails_precomputed=fails_all)
             matrix_2025 = _pivot_fail_matrix(fails_all)
 
-            if not reasons_latest.empty:
-                st.markdown("**Latest-month leading reasons**")
-                st.dataframe(reasons_latest, use_container_width=True)
-            else:
-                st.info("No fail reasons available for the latest month.")
+            st.markdown(
+                f"<h4 style='color:{_DARK_BLUE};margin:1rem 0 .5rem 0;'>Reasons for Fail — {pd.Period(lastp).to_timestamp().strftime('%b-%y') if not pd.isna(lastp) else ''}</h4>",
+                unsafe_allow_html=True,
+            )
+            r1, r2 = st.columns((1.0, 1.2), gap="large")
+            with r1:
+                if not reasons_latest.empty:
+                    st.pyplot(_fig_pareto_full(reasons_latest))
+                else:
+                    st.info("No fail reasons available for the latest month.")
+            with r2:
+                if not matrix_2025.empty:
+                    st.markdown(
+                        f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>Fail Reasons × Portfolio — Month on Month (2025)</h4>",
+                        unsafe_allow_html=True,
+                    )
+                    reasons_opts = sorted(matrix_2025.index.get_level_values("reason").unique().tolist())
+                    port_opts = sorted(matrix_2025.index.get_level_values("portfolio").unique().tolist())
+                    sel_reasons = st.multiselect("Filter reasons", options=reasons_opts, default=reasons_opts, key="ov_rsn")
+                    sel_ports = st.multiselect("Filter portfolios", options=port_opts, default=port_opts, key="ov_port")
+                    mat_view = matrix_2025.copy()
+                    if sel_reasons:
+                        mat_view = mat_view.loc[mat_view.index.get_level_values("reason").isin(sel_reasons)]
+                    if sel_ports:
+                        mat_view = mat_view.loc[mat_view.index.get_level_values("portfolio").isin(sel_ports)]
+                    st.dataframe(mat_view, use_container_width=True)
+                else:
+                    st.info("No 2025 fail reason data available to populate the matrix.")
 
-            if not matrix_2025.empty:
-                st.markdown("**Fail Reasons × Portfolio — Month on Month (2025)**")
-                st.dataframe(matrix_2025, use_container_width=True)
-            else:
-                st.info("No 2025 fail reason data available to populate the matrix.")
-
-    # ---------------- Comparisons (unchanged) ----------------
+    # ---------------- Comparisons (v3) ----------------
     with tab_comparisons:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Comparison analysis — Accuracy (Pass %)</h4>", unsafe_allow_html=True)
 
@@ -619,7 +683,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                 st.caption("Portfolio column not found; showing all portfolios for Managers section.")
                 df_mgr = df_raw.copy()
 
-            piv_team, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
+            _, latest_tab_team = _pass_mom_by_dim(df_mgr, "team")
             overall_mgr = _overall_latest_pass_pct(df_mgr)
             if overall_mgr is not None and not latest_tab_team.empty:
                 latest_tab_team = latest_tab_team.copy(); latest_tab_team.loc["Overall"] = overall_mgr
@@ -724,9 +788,9 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         else:
             st.info("Portfolio column not present in data.")
 
-    # ---------------- Complaints & Accuracy (unchanged) ----------------
+    # ---------------- Complaints & Accuracy (v3) ----------------
     with tab_comp_acc:
-        st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 1rem 0;'>Complaints and Accuracy — Jan to latest 2025</h4>", unsafe_allow_html=True)
+        st.markdown(f"<h4 style='{''}color:{_DARK_BLUE};margin:0 0 1rem 0;'>Complaints and Accuracy — Jan to latest 2025</h4>", unsafe_allow_html=True)
         cases: pd.DataFrame = store.get("cases", pd.DataFrame())
         complaints: pd.DataFrame = store.get("complaints", pd.DataFrame())
         if cases is None or complaints is None or cases.empty or complaints.empty:
