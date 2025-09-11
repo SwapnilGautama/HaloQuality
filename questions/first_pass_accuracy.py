@@ -455,7 +455,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         ["Insights", "Overview", "Comparisons", "Complaints and Accuracy"]
     )
 
-    # ---------------- Insights (version 3 — story + outliers) ----------------
+    # ---------------- Insights (version 3 — story + outliers + predictions) ----------------
     with tab_insights:
         st.markdown(
             f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA Insights — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}</h4>",
@@ -572,6 +572,66 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                 st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
 
         st.caption("Notes: Outliers are based on latest-month pass %. Groups with zero cases are excluded automatically. Fail reasons use cached AI labelling to keep this tab snappy.")
+
+        # ---------------- Predicted fails — top Scheme × Individual combos ----------------
+        st.divider()
+        st.markdown(
+            f"<h5 style='color:{_DARK_BLUE};margin:.25rem 0 .5rem 0;'>Predicted fails — top Scheme × Individual combinations</h5>",
+            unsafe_allow_html=True,
+        )
+        if "scheme" in df_raw.columns and "individual" in df_raw.columns:
+            df_2025 = df_raw[df_raw["_m"] >= JAN_2025].copy()
+            if df_2025.empty:
+                st.info("No 2025 rows available to compute predictions.")
+            else:
+                # historical fail probability per Scheme × Individual
+                grp = (df_2025
+                       .groupby(["scheme", "individual"])
+                       .agg(total=("is_pass", "size"),
+                            fails=("is_pass", lambda x: (~x).sum()))
+                       .reset_index())
+                # filter tiny samples for stability
+                MIN_SAMPLES = 15
+                grp = grp[grp["total"] >= MIN_SAMPLES].copy()
+                if grp.empty:
+                    st.info("Not enough Scheme × Individual data to compute stable predictions (need at least 15 cases per combo).")
+                else:
+                    grp["fail_rate%"] = (grp["fails"] * 100.0 / grp["total"]).round(1)
+
+                    # add latest-month fail rate signal as a tie-breaker / recency check
+                    latest_month = df_2025["_m"].max()
+                    lt = (df_2025[df_2025["_m"] == latest_month]
+                          .groupby(["scheme", "individual"])
+                          .agg(lt_total=("is_pass", "size"),
+                               lt_fails=("is_pass", lambda x: (~x).sum()))
+                          .reset_index())
+                    lt["lt_fail_rate%"] = (lt["lt_fails"] * 100.0 / lt["lt_total"].replace(0, np.nan)).round(1)
+                    grp = grp.merge(lt, on=["scheme", "individual"], how="left")
+
+                    # rank by historical fail rate, then by #fails (desc), then by latest-month fail rate
+                    grp = grp.sort_values(
+                        by=["fail_rate%", "fails", "lt_fail_rate%"],
+                        ascending=[False, False, False]
+                    )
+
+                    top5 = grp.head(5)[
+                        ["scheme", "individual", "fail_rate%", "fails", "total", "lt_fail_rate%"]
+                    ].rename(columns={
+                        "scheme": "Scheme",
+                        "individual": "Individual",
+                        "fail_rate%": "Predicted fail prob (historical %)",
+                        "lt_fail_rate%": f"Latest month fail % ({pd.Period(latest_month).to_timestamp().strftime('%b-%y')})",
+                        "fails": "Fails (2025)",
+                        "total": "Total (2025)",
+                    })
+
+                    st.dataframe(top5, use_container_width=True)
+                    st.caption(
+                        "Predictions are historical probabilities from 2025 data for each Scheme × Individual combination; "
+                        "they are **not** ML model scores. Latest-month % provides a quick recency check."
+                    )
+        else:
+            st.info("Cannot compute Scheme × Individual predictions (missing one of those columns).")
 
     # ---------------- OVERVIEW (restored ORIGINAL tab) ----------------
     with tab_overview:
@@ -706,7 +766,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         if have_individual:
             if have_team:
                 mgr_opts = sorted(df_raw["team"].dropna().astype(str).unique().tolist())
-                # --- Modified default: prefer "Divya Dayanidhi" if available ---
+                # Default to Divya Dayanidhi if present (as before)
                 preferred_manager = "Divya Dayanidhi"
                 default_mgrs = [preferred_manager] if preferred_manager in mgr_opts else mgr_opts
                 sel_mgrs_for_ind = st.multiselect(
