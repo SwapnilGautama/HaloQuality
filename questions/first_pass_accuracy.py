@@ -233,37 +233,24 @@ def _pivot_fail_matrix(fails: pd.DataFrame) -> pd.DataFrame:
     return mat.sort_index()
 
 # ======================
-# Insights helpers (NEW story-style for fail reasons)
+# Insights helpers — story-style for fail reasons
 # ======================
 def _reason_trend_story(fails_all: pd.DataFrame, take_top: int = 3) -> List[str]:
-    """
-    Build a narrative summary of fail-reason trends:
-      - Top contributors overall this year
-      - What's rising/falling over the last ~4 months
-      - Latest-month spikes and where they show up
-    Returns a list of markdown bullet strings.
-    """
     if fails_all.empty:
         return ["No failure-reason signals are available for the selected range."]
 
-    # restrict to 2025 onwards
     df = fails_all[fails_all["_m"] >= JAN_2025].copy()
     if df.empty:
         return ["No 2025 failure-reason signals are available for the selected range."]
 
-    # overall mix (share)
     overall = df["reason"].value_counts().rename_axis("reason").reset_index(name="count")
     overall["share%"] = (overall["count"] * 100.0 / overall["count"].sum()).round(1)
     top_overall = overall.head(take_top)
 
-    # month-by-reason counts
-    ts = (df.groupby(["_m", "reason"]).size()
-            .rename("count").reset_index())
+    ts = (df.groupby(["_m", "reason"]).size().rename("count").reset_index())
     months = sorted(ts["_m"].unique())
-    # focus trend window: last 4 months if available
     window = months[-4:] if len(months) >= 4 else months
 
-    # compute slope (counts per month) within window for each reason
     slopes = []
     for r, sub in ts[ts["_m"].isin(window)].groupby("reason"):
         xs = np.arange(len(window))
@@ -277,7 +264,6 @@ def _reason_trend_story(fails_all: pd.DataFrame, take_top: int = 3) -> List[str]
     rising  = sl.sort_values("slope", ascending=False).head(take_top)
     falling = sl.sort_values("slope", ascending=True).head(take_top)
 
-    # latest-month mix and where a top reason concentrates
     latest = df["_m"].max()
     latest_df = df[df["_m"] == latest]
     latest_mix = latest_df["reason"].value_counts().rename_axis("reason").reset_index(name="count")
@@ -286,23 +272,15 @@ def _reason_trend_story(fails_all: pd.DataFrame, take_top: int = 3) -> List[str]
     top_latest = latest_mix.head(1) if not latest_mix.empty else pd.DataFrame(columns=["reason","count","share%"])
 
     bullets: List[str] = []
-
-    # Overall mix
     if not top_overall.empty:
         top_txt = ", ".join([f"**{r}** ({p:.1f}%)" for r, p in zip(top_overall["reason"], top_overall["share%"])])
         bullets.append(f"**Top fail drivers overall** (since Jan ’25): {top_txt}.")
-
-    # Rising / Falling
     if not rising.empty:
         r_txt = ", ".join([f"**{r}** (↗ ~{s:.1f}/mo)" for r, s in zip(rising["reason"], rising["slope"]) if s > 0])
-        if r_txt:
-            bullets.append(f"**Rising reasons (last {len(window)} months)**: {r_txt}.")
+        if r_txt: bullets.append(f"**Rising reasons (last {len(window)} months)**: {r_txt}.")
     if not falling.empty:
         f_txt = ", ".join([f"**{r}** (↘ ~{abs(s):.1f}/mo)" for r, s in zip(falling["reason"], falling["slope"]) if s < 0])
-        if f_txt:
-            bullets.append(f"**Falling reasons (last {len(window)} months)**: {f_txt}.")
-
-    # Latest-month spike + where
+        if f_txt: bullets.append(f"**Falling reasons (last {len(window)} months)**: {f_txt}.")
     if not top_latest.empty:
         reason0 = str(top_latest.iloc[0]["reason"])
         share0  = float(top_latest.iloc[0]["share%"])
@@ -310,7 +288,6 @@ def _reason_trend_story(fails_all: pd.DataFrame, take_top: int = 3) -> List[str]
                    .groupby("portfolio").size().sort_values(ascending=False).head(2))
         where = ", ".join(by_port.index.astype(str).tolist()) if not by_port.empty else "various portfolios"
         bullets.append(f"**Latest month**: **{reason0}** leads ({share0:.1f}% of fails), concentrated in {where}.")
-
     return bullets if bullets else ["No strong up/down movements detected in fail reasons."]
 
 # ======================
@@ -446,14 +423,14 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         ["Insights", "Overview", "Comparisons", "Complaints and Accuracy"]
     )
 
-    # ---------------- Insights (UPDATED) ----------------
+    # ---------------- Insights (Story + Outliers) ----------------
     with tab_insights:
         st.markdown(
             f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>FPA Insights — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}</h4>",
             unsafe_allow_html=True,
         )
 
-        # High-level trend bullets (unchanged logic)
+        # High-level trend bullets
         def _heuristic_insights(mom_df: pd.DataFrame) -> List[str]:
             overall_series = mom_df["pass_pct"].astype(float)
             last_val = overall_series.iloc[-1] if len(overall_series) else np.nan
@@ -481,11 +458,10 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         for b in _heuristic_insights(mom):
             st.markdown(f"- {b}")
 
-        # Left: MoM line | Right: Story-style fail-reason narrative (NO chart here)
+        # Left: MoM line | Right: fail-reason story (no chart)
         c1, c2 = st.columns((1.05, 1.0), gap="large")
         with c1:
             st.pyplot(_fig_mom(mom, "Overall Pass % — Month on Month"))
-
         with c2:
             with st.spinner("Analysing fail reasons…"):
                 fails_all = _label_all(df_raw)  # cached AI labelling
@@ -502,7 +478,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                 for ln in story_lines:
                     st.markdown(f"- {ln}")
 
-                # quick latest snapshot (text, not chart)
                 if not latest_reasons.empty:
                     lead = latest_reasons.iloc[0]
                     st.caption(
@@ -510,9 +485,63 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                         f"**{lead['reason']}** leads with **{int(lead['count'])}** cases ({lead['percent']:.1f}% of fails)."
                     )
 
-        st.caption("Notes: Fail reasons use cached AI labelling (same model as elsewhere). The story summarises the mix, momentum and latest spikes without plotting the full Pareto chart.")
+        st.divider()
 
-    # ---------------- Overview (unchanged visuals) ----------------
+        # >>>>> Outliers (re-added, unchanged logic) <<<<<
+        st.markdown(f"<h5 style='color:{_DARK_BLUE};margin:.25rem 0 .5rem 0;'>Outliers — latest month pass %</h5>", unsafe_allow_html=True)
+
+        def _top_bottom(latest_tab: pd.DataFrame, k: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
+            if latest_tab.empty:
+                return pd.DataFrame(), pd.DataFrame()
+            best = latest_tab.head(k).copy()
+            worst = latest_tab.tail(k).copy().sort_values("pass_%")
+            return best, worst
+
+        # Portfolio
+        _, lt_port = _pass_mom_by_dim(df_raw, "portfolio") if "portfolio" in df_raw.columns else (pd.DataFrame(), pd.DataFrame())
+        b1, b2 = st.columns(2)
+        with b1:
+            if not lt_port.empty:
+                best, worst = _top_bottom(lt_port, 3)
+                st.markdown("**Portfolio — Top 3**")
+                st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        with b2:
+            if not lt_port.empty:
+                best, worst = _top_bottom(lt_port, 3)
+                st.markdown("**Portfolio — Bottom 3**")
+                st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+
+        # Managers
+        _, lt_mgr = _pass_mom_by_dim(df_raw, "team") if "team" in df_raw.columns else (pd.DataFrame(), pd.DataFrame())
+        c3, c4 = st.columns(2)
+        with c3:
+            if not lt_mgr.empty:
+                best, worst = _top_bottom(lt_mgr, 3)
+                st.markdown("**Managers — Top 3**")
+                st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        with c4:
+            if not lt_mgr.empty:
+                best, worst = _top_bottom(lt_mgr, 3)
+                st.markdown("**Managers — Bottom 3**")
+                st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+
+        # Individuals
+        _, lt_ind = _pass_mom_by_dim(df_raw, "individual") if "individual" in df_raw.columns else (pd.DataFrame(), pd.DataFrame())
+        c5, c6 = st.columns(2)
+        with c5:
+            if not lt_ind.empty:
+                best, worst = _top_bottom(lt_ind, 3)
+                st.markdown("**Individuals — Top 3**")
+                st.dataframe(best.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+        with c6:
+            if not lt_ind.empty:
+                best, worst = _top_bottom(lt_ind, 3)
+                st.markdown("**Individuals — Bottom 3**")
+                st.dataframe(worst.rename(columns={"pass_%": "pass_%"}), use_container_width=True)
+
+        st.caption("Notes: Outliers are based on latest-month pass %. Groups with zero cases are excluded automatically. Fail reasons use cached AI labelling to keep this tab snappy.")
+
+    # ---------------- Overview (unchanged) ----------------
     with tab_overview:
         st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:0 0 .5rem 0;'>First-Pass Accuracy — Jan–{pd.Period(latest).to_timestamp().strftime('%b %y')}</h4>", unsafe_allow_html=True)
         st.pyplot(_fig_mom(mom, "Overall Pass % — Month on Month"))
@@ -526,7 +555,6 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             reasons_latest, lastp = _label_all_latest(df_raw, fails_precomputed=fails_all)
             matrix_2025 = _pivot_fail_matrix(fails_all)
 
-            # Small text summary + (kept) data tables, no change to your existing functionality
             if not reasons_latest.empty:
                 st.markdown("**Latest-month leading reasons**")
                 st.dataframe(reasons_latest, use_container_width=True)
