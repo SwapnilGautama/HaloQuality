@@ -107,7 +107,7 @@ def _build_month_column(df: pd.DataFrame, raw_col: str, assume_year: int | None 
         try:
             coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", format="%B %Y", errors="coerce")
         except Exception:
-            coerced = pd.to_datetime(s.astype[str] + f" {assume_year}", errors="coerce")
+            coerced = pd.to_datetime(s.astype(str) + f" {assume_year}", errors="coerce")
         return coerced.dt.to_period("M").astype(str)
     return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M").astype(str)
 
@@ -186,7 +186,7 @@ def _preclean(text: str) -> str:
         r"\bcof\b": " change of fund ",
     }
     for pat, repl in replacements.items():
-        t = re.sub(pat, repl)
+        t = re.sub(pat, repl, t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -261,7 +261,7 @@ def _rca2_keyword(text: str) -> str:
         "Pension set up": [r"\b(pension|record) set ?up\b", r"\bsetup\b"],
         "Postal delay": [r"\bpost(al)?\b", r"\bmail\b"],
         "AVC": [r"\bavc\b"],
-        "Case not created": [r"\bcase not created\b", r"\bnot raised\b"],
+        "Case not created": [r"\bcase not created\b", r"\bnot created\b", r"\bnot raised\b"],
         "2nd review / QA": [r"\b(second|2nd) review\b", r"\bqa\b"],
         "Trustee": [r"\btrustee\b"],
         "Death benefits payout": [r"\bdeath benefit", r"\bbeneficiar(y|ies)\b"],
@@ -385,6 +385,157 @@ def _detect_complaints_fields(comp: pd.DataFrame):
 
 
 # -------------------------------
+# Core computations — CACHED
+# -------------------------------
+
+# NEW: generic month table (used for dynamic latest title)
+@st.cache_data(show_spinner=False)
+def _portfolio_table_for_month(cases: pd.DataFrame, comp: pd.DataFrame, month_str: str) -> pd.DataFrame:
+    id_c, port_c, date_c = _detect_cases_fields(cases)
+    _, port_k, date_k, _ = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_c, date_c, port_k, date_k]) or not month_str:
+        return pd.DataFrame(columns=["portfolio", "cases", "complaints", "per_1000"])
+
+    cases = cases.copy(); comp = comp.copy()
+    cases["_month"] = _build_month_column(cases, date_c)
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+
+    cases_m = cases.loc[cases["_month"] == month_str].groupby(port_c, dropna=False, as_index=False).size()
+    cases_m.rename(columns={"size": "cases", port_c: "portfolio"}, inplace=True)
+
+    comp_m = comp.loc[comp["_month"] == month_str].groupby(port_k, dropna=False, as_index=False).size()
+    comp_m.rename(columns={"size": "complaints", port_k: "portfolio"}, inplace=True)
+
+    out = pd.merge(cases_m, comp_m, how="left", on="portfolio")
+    out["complaints"] = out["complaints"].fillna(0).astype(int)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["per_1000"] = (out["complaints"] * 1000 / out["cases"]).replace([np.inf, -np.inf], np.nan)
+    out["per_1000"] = out["per_1000"].round(1)
+
+    out = out.sort_values(["complaints", "portfolio"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    out = _add_total_row(out, sum_cols=["cases", "complaints"], label_col="portfolio", label="Total")
+    out["per_1000"] = out["per_1000"].round(1)
+    return out
+
+@st.cache_data(show_spinner=False)
+def _mom_series(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
+    _, _, date_c = _detect_cases_fields(cases)
+    _, _, date_k, _ = _detect_complaints_fields(comp)
+    if date_c is None or date_k is None:
+        return pd.DataFrame(columns=["month", "per_1000"])
+
+    cases = cases.copy(); comp = comp.copy()
+    cases["_month"] = _build_month_column(cases, date_c)
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+
+    want = _months_jan_to_aug_2025()
+    cases_m = cases.loc[cases["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
+    comp_m = comp.loc[comp["_month"].isin(want)].groupby("_month").size().reindex(want, fill_value=0)
+    per_1000 = (comp_m * 1000 / cases_m.replace(0, np.nan)).fillna(0.0).round(1)
+    pretty = [pd.Period(m).to_timestamp().strftime("%b-%y") for m in want]
+    return pd.DataFrame({"month": pretty, "per_1000": per_1000.values})
+
+def _repair_rca1_from_rca2(rca1: List[str], rca2: List[str]) -> List[str]:
+    out = []
+    for a, b in zip(rca1, rca2):
+        if a == "Other" and b in RCA2_TO_RCA1_MAP:
+            out.append(RCA2_TO_RCA1_MAP[b])
+        else:
+            out.append(a)
+    return out
+
+@st.cache_data(show_spinner=False)
+def _rca_tables_for_june(comp: pd.DataFrame, use_ai: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    _, _, date_k, desc_col = _detect_complaints_fields(comp)
+    if date_k is None or desc_col is None:
+        return pd.DataFrame(columns=["RCA2", "count", "percent", "cum_percent"]), pd.DataFrame(columns=["RCA1", "count"])
+
+    comp = comp.copy()
+    comp["_month"] = _build_month_column(comp, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+    june = comp.loc[comp["_month"] == "2025-06", [desc_col]].fillna("")
+    texts = june[desc_col].astype(str).tolist()
+
+    if use_ai and _OPENAI_READY and len(texts) > 0:
+        r1_labels, r2_labels = [], []
+        batch = 80
+        for i in range(0, len(texts), batch):
+            chunk = texts[i:i+batch]
+            pairs = _ai_label_batch(chunk)
+            r1_labels.extend([p[0] for p in pairs])
+            r2_labels.extend([p[1] for p in pairs])
+    else:
+        r1_labels = [_rca1_keyword(t) for t in texts]
+        r2_labels = [_rca2_keyword(t) for t in texts]
+
+    r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
+
+    r1 = pd.Series(r1_labels).value_counts(dropna=False).rename_axis("RCA1").reset_index(name="count")
+
+    r2_counts = pd.Series(r2_labels).value_counts(dropna=False).rename_axis("RCA2").reset_index(name="count")
+    r2_counts["order"] = np.where(r2_counts["RCA2"].eq("Other"), 1, 0)
+    r2_counts = r2_counts.sort_values(["order", "count"], ascending=[True, False]).drop(columns="order").reset_index(drop=True)
+    total = max(1, r2_counts["count"].sum())
+    r2_counts["percent"] = (r2_counts["count"] * 100 / total)
+    r2_counts["cum_percent"] = r2_counts["percent"].cumsum()
+    r2_counts["percent"] = r2_counts["percent"].round(1)
+    r2_counts["cum_percent"] = r2_counts["cum_percent"].round(1)
+    r2 = r2_counts.loc[r2_counts["cum_percent"] <= 80.0].reset_index(drop=True)
+
+    return r2, r1
+
+# RCA2 by portfolio for June (unchanged)
+@st.cache_data(show_spinner=False)
+def _rca2_table_by_portfolio_for_june(
+    comp: pd.DataFrame,
+    use_ai: bool,
+    portfolios: List[str] | None = None,
+    rca1_keep: List[str] | None = None,
+) -> pd.DataFrame:
+    id_k, port_k, date_k, desc_col = _detect_complaints_fields(comp)
+    if any(x is None for x in [port_k, date_k, desc_col]):
+        return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+
+    df = comp.copy()
+    df["_month"] = _build_month_column(df, date_k, assume_year=2025 if date_k.lower() == "month" else None)
+
+    df = df.loc[df["_month"] == "2025-06", [port_k, desc_col]].dropna(subset=[desc_col])
+    if df.empty:
+        return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+
+    if portfolios and len(portfolios) > 0:
+        df = df.loc[df[port_k].astype(str).isin([str(p) for p in portfolios])]
+        if df.empty:
+            return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+
+    texts = df[desc_col].astype(str).tolist()
+    if use_ai and _OPENAI_READY and len(texts) > 0:
+        pairs = []
+        batch = 80
+        for i in range(0, len(texts), batch):
+            pairs.extend(_ai_label_batch(texts[i:i+batch]))
+        r1_labels = [p[0] for p in pairs]
+        r2_labels = [p[1] for p in pairs]
+    else:
+        r1_labels = [_rca1_keyword(t) for t in texts]
+        r2_labels = [_rca2_keyword(t) for t in texts]
+    r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
+
+    if rca1_keep and len(rca1_keep) > 0:
+        mask = [r in set(rca1_keep) for r in r1_labels]
+        if not any(mask):
+            return pd.DataFrame(columns=["Portfolio", "RCA2", "count"])
+        df = df.loc[mask].copy()
+        r2_labels = [r2 for r2, keep in zip(r2_labels, mask) if keep]
+
+    df["RCA2"] = r2_labels
+    df["Portfolio"] = df[port_k].astype(str).fillna("")
+
+    tab = df.groupby(["Portfolio", "RCA2"], dropna=False, as_index=False).size().rename(columns={"size": "count"})
+    tab = tab.sort_values(["count", "Portfolio", "RCA2"], ascending=[False, True, True], kind="stable").reset_index(drop=True)
+    return tab
+
+
+# -------------------------------
 # Plotting (overall)
 # -------------------------------
 
@@ -444,7 +595,7 @@ def _pareto_fig(df: pd.DataFrame):
     plt.setp(ax.get_xticklabels(), rotation=90, ha="center")
 
     for sp in ["top", "right", "left", "bottom"]:
-        ax2.spines[sp].setVisible = False
+        ax2.spines[sp].set_visible(False)
     ax2.set_ylim(0, 100)
     ax2.set_ylabel("")
     ax2.tick_params(axis="y", length=0)
@@ -525,7 +676,7 @@ def _rca_labels_for_subset(df: pd.DataFrame, use_ai: bool) -> Tuple[List[str], L
     else:
         r1_labels = [_rca1_keyword(t) for t in texts]
         r2_labels = [_rca2_keyword(t) for t in texts]
-    r1_labels = [RCA2_TO_RCA1_MAP.get(b, a) if a == "Other" else a for a, b in zip(r1_labels, r2_labels)]
+    r1_labels = _repair_rca1_from_rca2(r1_labels, r2_labels)
     return r1_labels, r2_labels
 
 @st.cache_data(show_spinner=False)
@@ -730,106 +881,6 @@ def _build_ppt(table_df: pd.DataFrame, mom_df: pd.DataFrame, rca1_df: pd.DataFra
     return out.read()
 
 
-# ===============================
-# Insights helpers (added)
-# ===============================
-
-@st.cache_data(show_spinner=False)
-def _overall_year_rollup(cases: pd.DataFrame, comp: pd.DataFrame) -> pd.DataFrame:
-    r"""
-    Returns Portfolio × Month (Jan–Aug 2025) with Cases, Complaints, Per1000.
-    r"""
-    _, port_c, date_c = _detect_cases_fields(cases)
-    _, port_k, date_k, _ = _detect_complaints_fields(comp)
-    if any(x is None for x in [port_c, date_c, port_k, date_k]):
-        return pd.DataFrame(columns=["Portfolio","Month","Cases","Complaints","Per1000"])
-    months = _months_jan_to_aug_2025()
-    cs = cases.copy(); cp = comp.copy()
-    cs["_month"] = _build_month_column(cs, date_c)
-    cp["_month"] = _build_month_column(cp, date_k, assume_year=2025 if date_k.lower()=="month" else None)
-    cs = (cs[cs["_month"].isin(months)].groupby([port_c,"_month"]).size().rename("Cases").reset_index())
-    cp = (cp[cp["_month"].isin(months)].groupby([port_k,"_month"]).size().rename("Complaints").reset_index())
-    m = pd.merge(cs, cp, left_on=[port_c,"_month"], right_on=[port_k,"_month"], how="left")
-    m.rename(columns={port_c:"Portfolio","_month":"Month"}, inplace=True)
-    m["Complaints"] = m["Complaints"].fillna(0).astype(int)
-    m["Per1000"] = (m["Complaints"] * 1000 / m["Cases"].replace(0,np.nan)).astype(float)
-    return m
-
-def _slope_pp_per_month(series: pd.Series) -> float | None:
-    y = pd.to_numeric(series, errors="coerce").dropna()
-    if len(y) < 3:
-        return None
-    x = np.arange(len(y), dtype=float)
-    try:
-        b1, _ = np.polyfit(x, y.values, 1)
-        return float(b1)
-    except Exception:
-        return None
-
-@st.cache_data(show_spinner=False)
-def _rca_year_counts(comp: pd.DataFrame, use_ai: bool) -> pd.DataFrame:
-    r"""Month × RCA1 × RCA2 counts for Jan–Aug 2025."""
-    _, _, date_k, desc_col = _detect_complaints_fields(comp)
-    if any(x is None for x in [date_k, desc_col]):
-        return pd.DataFrame(columns=["Month","RCA1","RCA2","count"])
-    df = comp.copy()
-    df["_month"] = _build_month_column(df, date_k, assume_year=2025 if date_k.lower()=="month" else None)
-    df = df[df["_month"].isin(_months_jan_to_aug_2025())]
-    if df.empty:
-        return pd.DataFrame(columns=["Month","RCA1","RCA2","count"])
-    r1, r2 = _rca_labels_for_subset(df[desc_col], use_ai=use_ai)
-    out = pd.DataFrame({"Month": df["_month"].values, "RCA1": r1, "RCA2": r2})
-    out["count"] = 1
-    return out.groupby(["Month","RCA1","RCA2"], as_index=False)["count"].sum()
-
-@st.cache_data(show_spinner=False)
-def _delay_attribution_share(comp: pd.DataFrame, use_ai: bool) -> tuple[float,float]:
-    r"""Return (External %, Aptia %) within Delay for Jan–Aug 2025."""
-    _, _, date_k, desc_col = _detect_complaints_fields(comp)
-    if any(x is None for x in [date_k, desc_col]):
-        return (np.nan, np.nan)
-    df = comp.copy()
-    df["_month"] = _build_month_column(df, date_k, assume_year=2025 if date_k.lower()=="month" else None)
-    df = df[df["_month"].isin(_months_jan_to_aug_2025())]
-    if df.empty:
-        return (np.nan, np.nan)
-    r1, r2 = _rca_labels_for_subset(df[desc_col], use_ai=use_ai)
-    mask = [a == "Delay" or b in DELAY_RCA2 for a,b in zip(r1,r2)]
-    if not any(mask):
-        return (0.0, 0.0)
-    r2_delay = [r2[i] for i, keep in enumerate(mask) if keep]
-    total = len(r2_delay)
-    ext = sum(1 for v in r2_delay if v in DELAY_EXTERNAL)
-    apt = sum(1 for v in r2_delay if v in DELAY_APTIA)
-    return round(100*ext/total,1), round(100*apt/total,1)
-
-@st.cache_data(show_spinner=False)
-def _combo_predictions(comp: pd.DataFrame, cases: pd.DataFrame, use_ai: bool) -> pd.DataFrame:
-    r"""Top 5 Portfolio×RCA2 by complaints in 2025 (Jan–Aug), with each portfolio's avg Per1000."""
-    roll = _overall_year_rollup(cases, comp)
-    bench = (roll.groupby("Portfolio")["Per1000"]
-             .mean(skipna=True).rename("Per1000_portfolio").reset_index())
-    _, port_k, date_k, desc_col = _detect_complaints_fields(comp)
-    if any(x is None for x in [port_k, date_k, desc_col]) or roll.empty:
-        return pd.DataFrame(columns=["Portfolio","RCA2","Complaints_2025","Per1000_portfolio"])
-    df = comp.copy()
-    df["_month"] = _build_month_column(df, date_k, assume_year=2025 if date_k.lower()=="month" else None)
-    df = df[df["_month"].isin(_months_jan_to_aug_2025())]
-    if df.empty:
-        return pd.DataFrame(columns=["Portfolio","RCA2","Complaints_2025","Per1000_portfolio"])
-    _, r2 = _rca_labels_for_subset(df[desc_col], use_ai=use_ai)
-    tab = (pd.DataFrame({"Portfolio": df[port_k].astype(str).values, "RCA2": r2})
-           .assign(count=1)
-           .groupby(["Portfolio","RCA2"], as_index=False)["count"].sum()
-           .rename(columns={"count":"Complaints_2025"}))
-    out = tab.merge(bench, on="Portfolio", how="left").sort_values(
-        ["Complaints_2025","Per1000_portfolio","Portfolio","RCA2"],
-        ascending=[False, False, True, True],
-        kind="stable"
-    )
-    return out.head(5)
-
-
 # -------------------------------
 # Streamlit entrypoint
 # -------------------------------
@@ -852,8 +903,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
         div[role="alert"] { display: none !important; }
         section[data-testid="stMain"] {padding-left: 1rem; padding-right: 1rem;}
         </style>
-        """
-        ,
+        """,
         unsafe_allow_html=True,
     )
 
@@ -865,64 +915,10 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     latest_month_str, latest_label = _latest_month_2025(cases, comp)
 
     portfolios = _portfolio_list(cases, comp)
-    tabs = st.tabs(["Insights", "Overall"] + portfolios)
-
-    # ----------------- Insights tab (NEW) -----------------
-    with tabs[0]:
-        st.markdown(f"<h2 style='color:{_DARK_BLUE};margin:.3rem 0 1rem 0;'>What’s happening and why</h2>", unsafe_allow_html=True)
-        overall_roll = _overall_year_rollup(cases, comp)
-        if overall_roll.empty:
-            st.info("Not enough data to compute insights.")
-        else:
-            nat = overall_roll.groupby("Month")[["Cases","Complaints"]].sum().reset_index().sort_values("Month")
-            nat["Per1000"] = (nat["Complaints"] * 1000 / nat["Cases"].replace(0,np.nan)).astype(float)
-            slope = _slope_pp_per_month(nat["Per1000"])
-            slope_txt = "n/a" if slope is None else f"{slope:+.2f} per 1,000 per month"
-            latest_month = nat["Month"].max()
-            latest_p1000 = float(nat.loc[nat["Month"]==latest_month,"Per1000"].values[0])
-            bench = (overall_roll.groupby("Portfolio")["Per1000"].mean(skipna=True).rename("Avg Per1000"))
-            latest = (overall_roll.sort_values("Month").groupby("Portfolio").tail(1).set_index("Portfolio")["Per1000"].rename("Latest Per1000"))
-            hot = pd.concat([bench, latest], axis=1).reset_index()
-            hot["Δ latest vs avg"] = (hot["Latest Per1000"] - hot["Avg Per1000"]).round(1)
-            hotspots = hot.sort_values(["Avg Per1000","Latest Per1000"], ascending=False, kind="stable").head(5)
-            rca_year = _rca_year_counts(comp, use_ai=use_ai)
-            story_rca = ""
-            if not rca_year.empty:
-                rca_m = (rca_year.groupby(["Month","RCA1"])["count"].sum().groupby(level=0).apply(lambda s: s/s.sum()*100).reset_index(name="pct"))
-                early = rca_m[rca_m["Month"].isin([f"2025-{i:02d}" for i in range(1,5)])]
-                late  = rca_m[rca_m["Month"].isin([f"2025-{i:02d}" for i in range(5,9)])]
-                r_early = early.groupby("RCA1")["pct"].mean(); r_late = late.groupby("RCA1")["pct"].mean()
-                diff = (r_late - r_early).dropna().sort_values(ascending=False)
-                rising = ", ".join([f"{k} (+{v:.1f}pp)" for k,v in diff.head(3).items()]) if not diff.empty else "—"
-                falling = ", ".join([f"{k} ({v:.1f}pp)" for k,v in diff.tail(3).items()]) if len(diff)>=3 else "—"
-                story_rca = f"**Rising reasons**: {rising}  \n**Falling reasons**: {falling}"
-            ext_pct, apt_pct = _delay_attribution_share(comp, use_ai=use_ai)
-            top_rca2 = (rca_year.groupby("RCA2")["count"].sum().sort_values(ascending=False).head(6) if not rca_year.empty else pd.Series(dtype=float))
-            top_rca2_df = ((top_rca2 / top_rca2.sum() * 100).round(1).rename("Share %").reset_index()) if not top_rca2.empty else pd.DataFrame(columns=["RCA2","Share %"])
-            combos = _combo_predictions(comp, cases, use_ai=use_ai)
-            nat_avg = float(bench.mean(skipna=True)) if not bench.empty else float("nan")
-            bench_flag = (bench.reset_index().rename(columns={"Per1000":"Avg Per1000"}).assign(Benchmark=lambda d: d["Avg Per1000"].apply(lambda v: "Above" if pd.notna(nat_avg) and v>nat_avg else "Below")))
-            colA, colB = st.columns((1.15, 1.0))
-            with colA:
-                st.markdown("#### At a glance")
-                trend_txt = ("flat" if (slope is None or abs(slope) < 0.1) else ("upward" if slope>0 else "downward"))
-                st.markdown(f"- **Latest month:** `{latest_month}` • **National complaints/1,000:** **{latest_p1000:.1f}**\n- **Trend:** {trend_txt} *(slope {slope_txt})*\n- **Delay attribution (Jan–Aug ’25):** External **{ext_pct:.1f}%**, Aptia **{apt_pct:.1f}%**\n- **RCA movement:** {story_rca if story_rca else \"—\"}")
-                st.markdown("#### Complaint intensity hotspots — top 5 portfolios")
-                st.dataframe(_style_table(hotspots[["Portfolio","Avg Per1000","Latest Per1000","Δ latest vs avg"]].round(1), formats={"Avg Per1000":"{:.1f}","Latest Per1000":"{:.1f}","Δ latest vs avg":"{:+.1f}"}), use_container_width=True)
-                st.markdown("#### Predicted high-risk combinations — Portfolio × RCA2 (by volume)")
-                if combos.empty:
-                    st.info("No combinations to highlight for Jan–Aug ’25.")
-                else:
-                    st.dataframe(_style_table(combos.rename(columns={"Complaints_2025":"Complaints (’25)","Per1000_portfolio":"Per1000 (portfolio avg)"}), formats={"Complaints (’25)":"{:,.0f}","Per1000 (portfolio avg)":"{:.1f}"}), use_container_width=True)
-            with colB:
-                st.markdown("#### Key issue themes — RCA2 (Jan–Aug ’25)")
-                st.dataframe(_style_table(top_rca2_df, formats={"Share %":"{:.1f}%"}), use_container_width=True)
-                st.markdown("#### Above/below benchmark portfolios")
-                st.dataframe(_style_table(bench_flag.rename(columns={"Avg Per1000":"Avg Per1000 (’25)"}), formats={"Avg Per1000 (’25)":"{:.1f}"}), use_container_width=True)
-            st.caption("Notes: Per-1,000 rates use cases as denominator. Trends use Jan–Aug ’25. RCA labels use rules with optional AI assist; themes are directional rather than exact.")
+    tabs = st.tabs(["Overall"] + portfolios)
 
     # ----------------- Overall tab -----------------
-    with tabs[1]:
+    with tabs[0]:
         # Build latest-month table; if not found, fallback to June logic
         if latest_month_str:
             table = _portfolio_table_for_month(cases, comp, latest_month_str)
@@ -1019,7 +1015,7 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
             st.caption("Install `python-pptx` to enable PPT download.")
 
     # ----------------- Portfolio tabs (unchanged) -----------------
-    for i, portfolio in enumerate(portfolios, start=2):
+    for i, portfolio in enumerate(portfolios, start=1):
         with tabs[i]:
             st.markdown(f"<h2 style='color:{_DARK_BLUE};margin:.3rem 0 1rem 0;'>{portfolio} — complaints analysis</h2>", unsafe_allow_html=True)
 
