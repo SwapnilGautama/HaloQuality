@@ -91,7 +91,7 @@ if "q" not in st.session_state:
     st.session_state["q"] = "fpa"   # one-time default on first load only
 
 q = st.text_input(
-    "Type your question (e.g., 'comp', 'complaint','NPS' or 'fpa'; say 'with filters' to open the filter pane)",
+    "Type your question (e.g., 'comp', 'complaint', 'nps' or 'fpa')",
     key="q",   # <- binds state; no 'value=' so it won't be reset on reruns
 )
 
