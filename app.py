@@ -5,19 +5,16 @@ import traceback
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime
 import io
-import smtplib
+import base64
+import requests
 
 import pandas as pd
 import streamlit as st
 
-# PPTX + email helpers (self-contained; no extra files required)
+# PPTX helpers (self-contained; no extra files required)
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email import encoders
 
 # =============== Small import helper (keeps Q1 & Q2 isolated) ===============
 def _imp(mod: str, attr: str | None = None):
@@ -227,40 +224,78 @@ def _get_snapshot_content(slug: str, store: Dict[str, Any], params: Dict[str, An
         tables.append(("Info", pd.DataFrame({"note": ["No snapshot function; add build_snapshot() to module."]})))
     return {"title": title, "subtitle": subtitle, "figs": [], "tables": tables}
 
-def _send_via_outlook(to_addrs: List[str], subject: str, html_body: str,
-                      attachment_name: str, attachment_bytes: bytes):
-    cfg = st.secrets.get("email", {})
-    smtp_host = cfg.get("smtp_host", "smtp.office365.com")
-    smtp_port = int(cfg.get("smtp_port", 587))
-    username  = cfg.get("username")
-    password  = cfg.get("password")
-    sender    = cfg.get("sender", username)
+# ---------- NEW: Graph-based mail sender (client credentials) ----------
+def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """
+    Request an access token using client credentials (app-only).
+    Returns access_token (string) or raises RuntimeError.
+    """
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    payload = {
+        "client_id": client_id,
+        "scope": "https://graph.microsoft.com/.default",
+        "client_secret": client_secret,
+        "grant_type": "client_credentials",
+    }
+    resp = requests.post(token_url, data=payload, timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Token request failed: {resp.status_code} {resp.text}")
+    data = resp.json()
+    return data.get("access_token")
 
-    if not all([smtp_host, smtp_port, username, password, sender]):
-        raise RuntimeError("Email configuration missing in secrets.toml under [email].")
+def _send_via_graph(to_addrs: List[str], subject: str, html_body: str,
+                    attachment_name: str, attachment_bytes: bytes):
+    """
+    Send mail as the mailbox user defined in secrets.toml [graph].mailbox
+    using Microsoft Graph app-only sendMail (requires Mail.Send application permission + admin consent).
+    """
+    cfg = st.secrets.get("graph", {})
+    tenant_id = cfg.get("tenant_id")
+    client_id = cfg.get("client_id")
+    client_secret = cfg.get("client_secret")
+    mailbox = cfg.get("mailbox")
 
-    msg = MIMEMultipart()
-    msg["From"] = sender
-    msg["To"] = ", ".join(to_addrs)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(html_body, "html"))
+    if not all([tenant_id, client_id, client_secret, mailbox]):
+        raise RuntimeError("Missing Graph configuration in secrets.toml under [graph].")
 
-    part = MIMEBase("application", "vnd.openxmlformats-officedocument.presentationml.presentation")
-    part.set_payload(attachment_bytes)
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
-    msg.attach(part)
+    token = _get_graph_token(tenant_id, client_id, client_secret)
+    url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/sendMail"
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(username, password)
-        server.sendmail(sender, to_addrs, msg.as_string())
+    # Build attachments per Graph fileAttachment schema (base64-encoded bytes)
+    attachment_b64 = base64.b64encode(attachment_bytes).decode("ascii")
+    attachments = [
+        {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": attachment_name,
+            "contentType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "contentBytes": attachment_b64,
+        }
+    ]
+
+    message = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html_body,
+            },
+            "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_addrs],
+            "attachments": attachments,
+        },
+        "saveToSentItems": "true",
+    }
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.post(url, json=message, headers=headers, timeout=15)
+    if resp.status_code not in (200, 202):
+        raise RuntimeError(f"Graph sendMail failed: {resp.status_code} {resp.text}")
+    return True
 
 # ============================== Share / Email snapshot UI ===============================
 with st.expander("✉️  Share / Email snapshot"):
     # Pre-populated recipients (dropdown multi-select)
-    default_recipients = st.secrets.get("email", {}).get("recipients", [])
-    selected = st.multiselect("Choose recipient(s)", options=default_recipients, default=default_recipients[:1])
+    default_recipients = st.secrets.get("graph", {}).get("recipients", []) or st.secrets.get("graph", {}).get("recipients", []) or st.secrets.get("email", {}).get("recipients", [])
+    selected = st.multiselect("Choose recipient(s)", options=default_recipients, default=default_recipients[:1] if default_recipients else [])
     custom = st.text_input("Or add another recipient (optional)", placeholder="name@company.com")
 
     col_a, col_b = st.columns([1, 1])
@@ -285,7 +320,8 @@ with st.expander("✉️  Share / Email snapshot"):
                 tables = snap.get("tables") if include_tables else []
                 ppt_bytes = _build_one_pager(title, subtitle, figs=figs, tables=tables)
 
-                _send_via_outlook(
+                # Send using Graph
+                _send_via_graph(
                     to_addrs=to_list,
                     subject=title,
                     html_body=f"<p>Hi,</p><p>Attached is the snapshot from <b>Halo Quality</b> ({slug}).</p>",
