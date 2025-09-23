@@ -2,10 +2,22 @@
 from __future__ import annotations
 import importlib
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
+from datetime import datetime
+import io
+import smtplib
 
 import pandas as pd
 import streamlit as st
+
+# PPTX + email helpers (self-contained; no extra files required)
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email import encoders
 
 # =============== Small import helper (keeps Q1 & Q2 isolated) ===============
 def _imp(mod: str, attr: str | None = None):
@@ -122,6 +134,167 @@ if not SHOW_SIDEBAR:
         """,
         unsafe_allow_html=True,
     )
+
+# ============================== EMAIL SNAPSHOT HELPERS ===============================
+def _import_question_module(slug: str):
+    last_exc = None
+    for prefix in QUESTION_MODULE_PREFIXES:
+        try:
+            return importlib.import_module(f"{prefix}.{slug}")
+        except Exception as e:
+            last_exc = e
+            continue
+    return None
+
+def _ppt_add_title(slide, title: str, subtitle: str | None):
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.9)).text_frame
+    tb.text = title
+    p = tb.paragraphs[0]
+    p.font.size = Pt(26)
+    p.font.bold = True
+    p.font.color.rgb = RGBColor(11, 61, 145)
+
+    sb = slide.shapes.add_textbox(Inches(0.5), Inches(1.05), Inches(9), Inches(0.5)).text_frame
+    stamp = datetime.now().strftime("%d %b %Y %H:%M")
+    sb.text = (subtitle or "").strip() + (("  •  " + stamp) if subtitle else stamp)
+    sb.paragraphs[0].font.size = Pt(12)
+    sb.paragraphs[0].font.color.rgb = RGBColor(90, 90, 90)
+
+def _ppt_add_fig(slide, fig, caption: str, x: float, y: float, w: float) -> float:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
+    buf.seek(0)
+    slide.shapes.add_picture(buf, Inches(x), Inches(y), width=Inches(w))
+    cap = slide.shapes.add_textbox(Inches(x), Inches(y + 2.9), Inches(w), Inches(0.3)).text_frame
+    cap.text = caption
+    cap.paragraphs[0].font.size = Pt(10)
+    cap.paragraphs[0].font.color.rgb = RGBColor(90, 90, 90)
+    return y + 3.2
+
+def _ppt_add_table_text(slide, df: pd.DataFrame, caption: str, x: float, y: float, w: float) -> float:
+    txt = df.head(10).to_string(index=False)
+    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(1.6)).text_frame
+    box.text = caption
+    box.paragraphs[0].font.size = Pt(12)
+    box.paragraphs[0].font.bold = True
+    p = box.add_paragraph()
+    p.text = txt
+    p.font.size = Pt(10)
+    return y + 1.8
+
+def _build_one_pager(title: str, subtitle: str | None,
+                     figs: List[Tuple[str, "matplotlib.figure.Figure"]] | None = None,
+                     tables: List[Tuple[str, pd.DataFrame]] | None = None) -> bytes:
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _ppt_add_title(slide, title, subtitle)
+    x, y, w = 0.5, 1.6, 9.2
+    if figs:
+        for cap, fig in figs:
+            y = _ppt_add_fig(slide, fig, cap, x, y, w)
+    if tables:
+        for cap, df in tables:
+            y = _ppt_add_table_text(slide, df, cap, x, y, w)
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return out.read()
+
+def _get_snapshot_content(slug: str, store: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If the question module exposes build_snapshot(store, params) -> dict
+    with keys: title, subtitle, figs=[(cap, fig)], tables=[(cap, df)],
+    we use it. Otherwise, create a simple, useful fallback.
+    """
+    mod = _import_question_module(slug)
+    if mod and hasattr(mod, "build_snapshot"):
+        try:
+            snap = mod.build_snapshot(store, params)
+            if isinstance(snap, dict):
+                return snap
+        except Exception:
+            pass
+
+    # Fallback (generic preview from store)
+    title = f"Halo Quality — {slug.replace('_',' ').title()} Snapshot"
+    subtitle = "Auto summary"
+    tables: List[Tuple[str, pd.DataFrame]] = []
+    for key in ("fpa", "nps", "complaints"):
+        obj = store.get(key)
+        if isinstance(obj, pd.DataFrame) and not obj.empty:
+            tables.append((f"{key.upper()} (preview)", obj.head(8)))
+    if not tables:
+        tables.append(("Info", pd.DataFrame({"note": ["No snapshot function; add build_snapshot() to module."]})))
+    return {"title": title, "subtitle": subtitle, "figs": [], "tables": tables}
+
+def _send_via_outlook(to_addrs: List[str], subject: str, html_body: str,
+                      attachment_name: str, attachment_bytes: bytes):
+    cfg = st.secrets.get("email", {})
+    smtp_host = cfg.get("smtp_host", "smtp.office365.com")
+    smtp_port = int(cfg.get("smtp_port", 587))
+    username  = cfg.get("username")
+    password  = cfg.get("password")
+    sender    = cfg.get("sender", username)
+
+    if not all([smtp_host, smtp_port, username, password, sender]):
+        raise RuntimeError("Email configuration missing in secrets.toml under [email].")
+
+    msg = MIMEMultipart()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to_addrs)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+
+    part = MIMEBase("application", "vnd.openxmlformats-officedocument.presentationml.presentation")
+    part.set_payload(attachment_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
+    msg.attach(part)
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.starttls()
+        server.login(username, password)
+        server.sendmail(sender, to_addrs, msg.as_string())
+
+# ============================== Share / Email snapshot UI ===============================
+with st.expander("✉️  Share / Email snapshot"):
+    # Pre-populated recipients (dropdown multi-select)
+    default_recipients = st.secrets.get("email", {}).get("recipients", [])
+    selected = st.multiselect("Choose recipient(s)", options=default_recipients, default=default_recipients[:1])
+    custom = st.text_input("Or add another recipient (optional)", placeholder="name@company.com")
+
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        fmt = st.selectbox("Format", ["PPTX (one page)"], index=0)
+    with col_b:
+        include_tables = st.checkbox("Include small summary tables", value=True)
+
+    if st.button("Send snapshot"):
+        to_list = list(selected)
+        if custom and "@" in custom:
+            to_list.append(custom)
+
+        if not to_list:
+            st.error("Pick or enter at least one email address.")
+        else:
+            try:
+                snap = _get_snapshot_content(slug, store, params)
+                title = snap.get("title") or f"Halo Quality — {slug}"
+                subtitle = snap.get("subtitle") or ""
+                figs = snap.get("figs") or []
+                tables = snap.get("tables") if include_tables else []
+                ppt_bytes = _build_one_pager(title, subtitle, figs=figs, tables=tables)
+
+                _send_via_outlook(
+                    to_addrs=to_list,
+                    subject=title,
+                    html_body=f"<p>Hi,</p><p>Attached is the snapshot from <b>Halo Quality</b> ({slug}).</p>",
+                    attachment_name=f"{slug}_snapshot.pptx",
+                    attachment_bytes=ppt_bytes,
+                )
+                st.success(f"Snapshot sent to: {', '.join(to_list)} ✅")
+            except Exception as e:
+                st.error(f"Could not send email: {e}")
 
 # ============================== Run question ===============================
 try:
