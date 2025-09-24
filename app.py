@@ -132,97 +132,151 @@ if not SHOW_SIDEBAR:
         unsafe_allow_html=True,
     )
 
-# ============================== EMAIL SNAPSHOT HELPERS ===============================
-def _import_question_module(slug: str):
-    last_exc = None
-    for prefix in QUESTION_MODULE_PREFIXES:
-        try:
-            return importlib.import_module(f"{prefix}.{slug}")
-        except Exception as e:
-            last_exc = e
-            continue
-    return None
+# ---------- Improved PPTX snapshot builder (two-column, real tables) ----------
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+import io
+from datetime import datetime
+import base64
 
-def _ppt_add_title(slide, title: str, subtitle: str | None):
-    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.9)).text_frame
+def _load_logo_bytes() -> bytes | None:
+    """
+    Optional: add a small logo to top-right.
+    Put a base64 png into secrets: 
+      [branding]
+      logo_b64 = "<base64>"
+    Leave unset if you don't want a logo.
+    """
+    b64 = st.secrets.get("branding", {}).get("logo_b64")
+    if not b64:
+        return None
+    try:
+        return base64.b64decode(b64)
+    except Exception:
+        return None
+
+def _ppt_add_title(slide, title: str, subtitle: str | None, logo_bytes: bytes | None = None):
+    # Title
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(8.5), Inches(0.9)).text_frame
     tb.text = title
-    p = tb.paragraphs[0]
-    p.font.size = Pt(26)
-    p.font.bold = True
-    p.font.color.rgb = RGBColor(11, 61, 145)
+    p = tb.paragraphs[0]; p.font.size = Pt(26); p.font.bold = True; p.font.color.rgb = RGBColor(11, 61, 145)
 
-    sb = slide.shapes.add_textbox(Inches(0.5), Inches(1.05), Inches(9), Inches(0.5)).text_frame
+    # Subtitle + timestamp
+    sb = slide.shapes.add_textbox(Inches(0.5), Inches(1.05), Inches(8.5), Inches(0.5)).text_frame
     stamp = datetime.now().strftime("%d %b %Y %H:%M")
-    sb.text = (subtitle or "").strip() + (("  •  " + stamp) if subtitle else stamp)
-    sb.paragraphs[0].font.size = Pt(12)
-    sb.paragraphs[0].font.color.rgb = RGBColor(90, 90, 90)
+    sb.text = (subtitle or "Auto summary") + f"  •  {stamp}"
+    sp = sb.paragraphs[0]; sp.font.size = Pt(12); sp.font.color.rgb = RGBColor(90,90,90)
 
-def _ppt_add_fig(slide, fig, caption: str, x: float, y: float, w: float) -> float:
+    # Optional logo
+    if logo_bytes:
+        bio = io.BytesIO(logo_bytes); bio.seek(0)
+        slide.shapes.add_picture(bio, Inches(9.2), Inches(0.25), height=Inches(0.7))
+
+def _add_caption(slide, text: str, left_in, top_in, width_in):
+    cap = slide.shapes.add_textbox(Inches(left_in), Inches(top_in), Inches(width_in), Inches(0.3)).text_frame
+    cap.text = text
+    cap.paragraphs[0].font.size = Pt(11)
+    cap.paragraphs[0].font.color.rgb = RGBColor(90, 90, 90)
+
+def _ppt_add_fig(slide, fig, left_in, top_in, width_in, caption=""):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
     buf.seek(0)
-    slide.shapes.add_picture(buf, Inches(x), Inches(y), width=Inches(w))
-    cap = slide.shapes.add_textbox(Inches(x), Inches(y + 2.9), Inches(w), Inches(0.3)).text_frame
-    cap.text = caption
-    cap.paragraphs[0].font.size = Pt(10)
-    cap.paragraphs[0].font.color.rgb = RGBColor(90, 90, 90)
-    return y + 3.2
+    slide.shapes.add_picture(buf, Inches(left_in), Inches(top_in), width=Inches(width_in))
+    if caption:
+        _add_caption(slide, caption, left_in, top_in + 2.85, width_in)
+    return top_in + 3.15
 
-def _ppt_add_table_text(slide, df: pd.DataFrame, caption: str, x: float, y: float, w: float) -> float:
-    txt = df.head(10).to_string(index=False)
-    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(1.6)).text_frame
-    box.text = caption
-    box.paragraphs[0].font.size = Pt(12)
-    box.paragraphs[0].font.bold = True
-    p = box.add_paragraph()
-    p.text = txt
-    p.font.size = Pt(10)
-    return y + 1.8
+def _df_to_table(slide, df: pd.DataFrame, left_in, top_in, width_in, max_rows=8, caption=""):
+    """Render a compact, readable PPT table from a DataFrame (first max_rows)."""
+    df = df.head(max_rows)
+    rows, cols = len(df.index) + 1, len(df.columns)
+
+    shape = slide.shapes.add_table(rows, cols, Inches(left_in), Inches(top_in), Inches(width_in), Inches(1.0))
+    table = shape.table
+
+    # Header
+    for j, col in enumerate(df.columns):
+        cell = table.cell(0, j)
+        cell.text = str(col)
+        run = cell.text_frame.paragraphs[0].runs[0]
+        run.font.bold = True
+        run.font.size = Pt(10)
+        run.font.color.rgb = RGBColor(11,61,145)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = RGBColor(240, 245, 255)
+
+    # Body
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        for j, val in enumerate(row):
+            cell = table.cell(i, j)
+            cell.text = "" if pd.isna(val) else str(val)
+            p = cell.text_frame.paragraphs[0]
+            p.font.size = Pt(9)
+        # zebra banding
+        if i % 2 == 0:
+            for j in range(cols):
+                c = table.cell(i, j); c.fill.solid(); c.fill.fore_color.rgb = RGBColor(250,250,250)
+
+    # Column widths: simple even split
+    for j in range(cols):
+        table.columns[j].width = Inches(width_in / cols)
+
+    # Caption (above)
+    if caption:
+        _add_caption(slide, caption, left_in, top_in - 0.28, width_in)
+
+    return top_in + 1.25
 
 def _build_one_pager(title: str, subtitle: str | None,
-                     figs: List[Tuple[str, "matplotlib.figure.Figure"]] | None = None,
-                     tables: List[Tuple[str, pd.DataFrame]] | None = None) -> bytes:
+                     figs: list[tuple[str, "matplotlib.figure.Figure"]] | None = None,
+                     tables: list[tuple[str, pd.DataFrame]] | None = None,
+                     two_column: bool = True) -> bytes:
+    """
+    Produces a balanced one-pager:
+      • Two columns by default
+      • Crisp figures
+      • Real PowerPoint tables (headers, banding)
+    """
     prs = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _ppt_add_title(slide, title, subtitle)
-    x, y, w = 0.5, 1.6, 9.2
-    if figs:
-        for cap, fig in figs:
-            y = _ppt_add_fig(slide, fig, cap, x, y, w)
-    if tables:
-        for cap, df in tables:
-            y = _ppt_add_table_text(slide, df, cap, x, y, w)
-    out = io.BytesIO()
-    prs.save(out)
-    out.seek(0)
+
+    _ppt_add_title(slide, title, subtitle, logo_bytes=_load_logo_bytes())
+
+    # Layout grid
+    left_col, right_col = 0.5, 5.2
+    col_w = 4.4
+    y_left = y_right = 1.6
+
+    def place_block(which: str, caption: str, payload):
+        nonlocal y_left, y_right
+        # pick column with lower Y
+        left = (y_left <= y_right) or not two_column
+        x = left_col if left or not two_column else right_col
+        y = y_left if left or not two_column else y_right
+
+        if which == "fig":
+            new_y = _ppt_add_fig(slide, payload, x, y, col_w, caption=caption)
+        else:
+            new_y = _df_to_table(slide, payload, x, y + 0.25, col_w, caption=caption)
+
+        if two_column:
+            if left:
+                y_left = new_y + 0.15
+            else:
+                y_right = new_y + 0.15
+        else:
+            y_left = new_y + 0.15
+
+    for cap, fig in (figs or []):
+        place_block("fig", cap, fig)
+    for cap, df in (tables or []):
+        place_block("tbl", cap, df)
+
+    out = io.BytesIO(); prs.save(out); out.seek(0)
     return out.read()
-
-def _get_snapshot_content(slug: str, store: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    If the question module exposes build_snapshot(store, params) -> dict
-    with keys: title, subtitle, figs=[(cap, fig)], tables=[(cap, df)],
-    we use it. Otherwise, create a simple, useful fallback.
-    """
-    mod = _import_question_module(slug)
-    if mod and hasattr(mod, "build_snapshot"):
-        try:
-            snap = mod.build_snapshot(store, params)
-            if isinstance(snap, dict):
-                return snap
-        except Exception:
-            pass
-
-    # Fallback (generic preview from store)
-    title = f"Halo Quality — {slug.replace('_',' ').title()} Snapshot"
-    subtitle = "Auto summary"
-    tables: List[Tuple[str, pd.DataFrame]] = []
-    for key in ("fpa", "nps", "complaints"):
-        obj = store.get(key)
-        if isinstance(obj, pd.DataFrame) and not obj.empty:
-            tables.append((f"{key.upper()} (preview)", obj.head(8)))
-    if not tables:
-        tables.append(("Info", pd.DataFrame({"note": ["No snapshot function; add build_snapshot() to module."]})))
-    return {"title": title, "subtitle": subtitle, "figs": [], "tables": tables}
 
 # ---------- NEW: Graph-based mail sender (client credentials) ----------
 def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -> str:
