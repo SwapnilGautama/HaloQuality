@@ -321,10 +321,7 @@ def _prep_surveys_cached(df_raw: pd.DataFrame) -> pd.DataFrame:
 def _aggregate_nps_cached(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return pd.DataFrame()
     df = df[df["_month"].notna()].copy()
-    g = df.groupby(["Portfolio","_month"])["nps_bucket"].valueCounts().unstack(fill_value=0)  # type: ignore
-    # compatibility for older pandas without .valueCounts()
-    if not isinstance(g, pd.DataFrame) or g.empty:
-        g = df.groupby(["Portfolio","_month"])["nps_bucket"].value_counts().unstack(fill_value=0)
+    g = df.groupby(["Portfolio","_month"])["nps_bucket"].value_counts().unstack(fill_value=0)
     for c in ["promoter","passive","detractor","unknown"]:
         if c not in g.columns: g[c] = 0
     g["Total"] = g[["promoter","passive","detractor","unknown"]].sum(axis=1).replace(0, np.nan)
@@ -629,8 +626,9 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 chips2 = " • ".join([f"`{t}`" for t in neg_story_latest[:4]])
                 st.markdown(f"**Latest month negatives:** {chips2}")
 
-            # Detractor sentiment & key issues
-            st.markdown("#### Detractor sentiment & key issues")
+            # -------------------- NEW: Detractor sentiment & issues --------------------
+            # Focus only on detractors' suggestions within current selection and summarise their sentiment + key issues.
+            det_comment = ""
             try:
                 sel = s.copy()
                 if sel_port != "(All)": sel = sel[sel["Portfolio"] == sel_port]
@@ -639,6 +637,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
                 det = sel[(sel["nps_bucket"] == "detractor") & (sel["Suggestions"].notna())].copy()
                 if not det.empty:
+                    # Sentiment for detractors
                     det["sent_score"] = det["Suggestions"].map(_lex_sentiment)
                     det["sent_label"] = np.where(det["sent_score"] >= 0.05, "positive",
                                           np.where(det["sent_score"] <= -0.05, "negative", "neutral"))
@@ -646,6 +645,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     neg_share = (det["sent_label"].eq("negative").mean() * 100.0) if total_det else 0.0
                     pos_share = (det["sent_label"].eq("positive").mean() * 100.0) if total_det else 0.0
 
+                    # Key issues from detractor suggestions
                     det_overall_phr = _top_phrases(det["Suggestions"].tolist(), k=6)
                     latest_m = det["_month"].max()
                     det_latest_phr = []
@@ -657,6 +657,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     det_chips = " • ".join([f"`{t}`" for t in det_overall_phr]) if det_overall_phr else "—"
                     lat_chips = " • ".join([f"`{t}`" for t in det_latest_phr]) if det_latest_phr else "—"
 
+                    st.markdown("#### Detractor sentiment & key issues")
                     st.markdown(
                         f"- **Detractor comments analysed:** {total_det}  "
                         f"- **Negative share:** {neg_share:.1f}%  • **Positive share:** {pos_share:.1f}%"
@@ -665,8 +666,11 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     if pd.notna(latest_m):
                         st.markdown(f"- **Latest month detractor issues ({str(latest_m)}):** {lat_chips}")
                 else:
+                    st.markdown("#### Detractor sentiment & key issues")
                     st.info("No detractor suggestions available in the selected range.")
             except Exception:
+                # Keep insights resilient even if text parsing fails
+                st.markdown("#### Detractor sentiment & key issues")
                 st.info("Could not compute detractor sentiment due to missing or malformed data.")
 
             how_lines = [
@@ -714,4 +718,211 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             else:
                 s_left, s_right = st.columns([1,1])
                 with s_left:
-                   
+                    pv = sd.pivot_table(index="Portfolio", columns="sent_label", values="Suggestions",
+                                        aggfunc="count", fill_value=0)
+                    order = [c for c in ["negative","neutral","positive"] if c in pv.columns]
+                    pv = pv[order]
+                    fig2, ax2 = plt.subplots()
+                    x = np.arange(len(pv.index)); bottom = np.zeros(len(x))
+                    color_map = {"negative": _SENT_NEG, "neutral": _SENT_NEU, "positive": _SENT_POS}
+                    for col in pv.columns:
+                        ax2.bar(x, pv[col].values, bottom=bottom, label=col.capitalize(), color=color_map.get(col, _SENT_NEU))
+                        bottom += pv[col].values
+                    ax2.set_xticks(x); 
+                    ax2.set_xticklabels(pv.index, rotation=90, color=_DARK_GREY)
+                    for sp in ["top","right","left"]: ax2.spines[sp].set_visible(False)
+                    ax2.spines["bottom"].set_color("#D3D3D3")
+                    ax2.get_yaxis().set_visible(False); ax2.grid(False)
+                    ax2.set_title("Suggestions Sentiment by Portfolio", fontsize=12, color=_DARK_BLUE)
+                    leg = ax2.legend(loc="best", fontsize=8, frameon=False)
+                    for t in leg.get_texts(): t.set_color(_DARK_GREY)
+                    st.pyplot(fig2, use_container_width=True)
+                with s_right:
+                    cat = (sd.groupby("Portfolio")["sent_label"].value_counts()
+                             .unstack(fill_value=0)
+                             .reindex(columns=[c for c in ["positive","neutral","negative"]
+                                               if c in sd["sent_label"].unique()], fill_value=0))
+                    cat["Sugg"]     = cat.sum(axis=1)
+                    cat["Pos%"]     = (cat.get("positive",0)/cat["Sugg"]*100).round(1)
+                    cat["Neg%"]     = (cat.get("negative",0)/cat["Sugg"]*100).round(1)
+                    cat["NetSent%"] = (cat["Pos%"] - cat["Neg%"]).round(1)
+
+                    if not nps.empty:
+                        npstab = (nps.groupby("Portfolio")[["promoter","detractor","passive","unknown"]]
+                                    .sum(min_count=1))
+                        npstab["Total"] = npstab[["promoter","detractor","passive","unknown"]].sum(axis=1)
+                        npstab["NPS"] = ((npstab["promoter"] - npstab["detractor"]) /
+                                         npstab["Total"].replace(0, np.nan) * 100).round(1)
+                        npstab = npstab.rename(columns={"promoter":"Promoters","detractor":"Detractors"})
+                        cat = cat.join(npstab[["NPS","Promoters","Detractors"]], how="left")
+
+                    ordered_cols = [c for c in ["Sugg","Pos%","Neg%","NetSent%","NPS","Promoters","Detractors"]
+                                    if c in cat.columns]
+                    st.markdown("#### Sentiment Summary (filtered range)")
+                    st.dataframe(cat[ordered_cols], use_container_width=True)
+
+            fig_mom = _fig_mom_nps_pos(nps, sd if 'sd' in locals() else pd.DataFrame())
+            if fig_mom is not None:
+                st.pyplot(fig_mom, use_container_width=True)
+
+        # -------------------- Tab 3: NPS CORRELATION (with local Month filter) --------------------
+        with tab3:
+            st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
+
+            month_opts = ["(All)"] + sorted(view["Month"].dropna().astype(str).unique().tolist())
+            sel_corr_month = st.selectbox("Month (local to this tab)", options=month_opts,
+                                          index=len(month_opts)-1 if len(month_opts)>1 else 0, key="nps_corr_month")
+            if sel_corr_month != "(All)":
+                corr_df = view[view["Month"].astype(str) == sel_corr_month].copy()
+            else:
+                corr_df = view.copy()
+
+            left, right = st.columns([1,1])
+
+            with left:
+                plot_df = corr_df.dropna(subset=["NPS","Complaints/1000"]).copy()
+                if not plot_df.empty:
+                    size = (plot_df.get("FPA%", pd.Series(index=plot_df.index, dtype=float)).fillna(0.0)
+                            .clip(lower=0, upper=100))
+                    s_px = (size / 100.0) * 1800.0 + 80.0
+
+                    fig_sc, ax_sc = plt.subplots(figsize=(6.6, 4.4))
+                    ax_sc.scatter(
+                        plot_df["NPS"], plot_df["Complaints/1000"],
+                        s=s_px, color=_BUBBLE_FILL, edgecolor=_BUBBLE_EDGE, alpha=0.85
+                    )
+                    for _, r in plot_df.iterrows():
+                        lab = f"{r.get('Portfolio','')}"
+                        try:
+                            ax_sc.text(float(r["NPS"]), float(r["Complaints/1000"]),
+                                       lab, fontsize=8, color=_DARK_GREY, ha="center", va="bottom")
+                        except Exception:
+                            pass
+                    ax_sc.set_xlabel("NPS %", color=_DARK_GREY)
+                    ax_sc.set_ylabel("Complaints per 1000", color=_DARK_GREY)
+                    _style_axes(ax_sc)
+                    ttl_month = sel_corr_month if sel_corr_month != "(All)" else ""
+                    ax_sc.set_title(f"NPS vs Complaints/1000 {f'({ttl_month})' if ttl_month else ''}", color=_DARK_BLUE, pad=6)
+                    st.pyplot(fig_sc, use_container_width=True)
+                    st.caption("Bubble size ∝ FPA% (larger = higher FPA).")
+                else:
+                    st.info("No rows available for the selected month.")
+
+            with right:
+                cols = [c for c in ["Portfolio","Month","Complaints/1000","FPA%","NPS","Detractors%","Pos%","Neg%","NetSent%"]
+                        if c in corr_df.columns]
+                st.dataframe(corr_df[cols].sort_values(["Portfolio","Month"]), use_container_width=True)
+
+            st.markdown("#### Correlation snapshot (selected range)")
+            corr_cols = st.columns(5)
+
+            def _corr_pair(df: pd.DataFrame, x: str, y: str) -> str:
+                if x not in df or y not in df: return "n/a"
+                d = df[[x,y]].dropna()
+                if len(d) < 3: return "n/a"
+                r = d[x].corr(d[y])
+                if pd.isna(r): return "n/a"
+                return f"r = {r:+.2f}"
+
+            with corr_cols[0]:
+                st.metric("FPA% vs Complaints/1000", _corr_pair(corr_df, "FPA%", "Complaints/1000"))
+            with corr_cols[1]:
+                st.metric("FPA% vs NPS", _corr_pair(corr_df, "FPA%", "NPS"))
+            with corr_cols[2]:
+                st.metric("Detractors% vs NPS", _corr_pair(corr_df, "Detractors%", "NPS"))
+            with corr_cols[3]:
+                st.metric("NetSent% vs NPS", _corr_pair(corr_df, "NetSent%","NPS"))
+            with corr_cols[4]:
+                st.metric("NPS vs Complaints/1000", _corr_pair(corr_df, "NPS","Complaints/1000"))
+
+            st.markdown("#### MoM Δ (latest vs previous)")
+            if "Month" in view.columns and not view.empty:
+                def _delta_last_two(g: pd.DataFrame, col: str):
+                    g = g.sort_values("Month")
+                    v = pd.to_numeric(g[col], errors="coerce").dropna()
+                    if len(v) >= 2: return v.iloc[-1] - v.iloc[-2]
+                    return np.nan
+                momo = (view.groupby("Portfolio")
+                            .apply(lambda g: pd.Series({
+                                "ΔNPS": _delta_last_two(g, "NPS"),
+                                "ΔFPA%": _delta_last_two(g, "FPA%"),
+                                "ΔComplaints/1000": _delta_last_two(g, "Complaints/1000"),
+                                "ΔNetSent%": _delta_last_two(g, "NetSent%"),
+                            }))
+                            .reset_index())
+                for c in ["ΔNPS","ΔFPA%","ΔComplaints/1000","ΔNetSent%"]:
+                    momo[c] = momo[c].round(1)
+                st.dataframe(momo.sort_values("Portfolio"), use_container_width=True)
+            else:
+                st.caption("Not enough month data for MoM deltas in the current selection.")
+
+            st.caption("Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation")
+            df_out = view
+
+    except Exception as e:
+        st.error(f"Unexpected error in NPS module: {e}")
+        df_out = pd.DataFrame([{"error": str(e)}])
+
+    return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
+
+# ---------------------------
+# ... keep all your existing imports, caching, tabs, and run() exactly as-is ...
+
+# ---------------------------
+# Snapshot builder for NPS (used by app.py email/snapshot)
+# ---------------------------
+def build_snapshot(store, params):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    nps_df_raw = store.get("nps", pd.DataFrame())
+    sug_df_raw = store.get("nps_suggestions", pd.DataFrame())
+
+    # Use your cached helpers when data is present
+    df_surv = _prep_surveys_cached(nps_df_raw) if isinstance(nps_df_raw, pd.DataFrame) else pd.DataFrame()
+    nps_month = _aggregate_nps_cached(df_surv) if not df_surv.empty else pd.DataFrame()
+    sent_df = _sentiments_cached(df_surv) if not df_surv.empty else pd.DataFrame()
+
+    figs, tables = [], []
+
+    # Figure: NPS vs Positive sentiment MoM (if either series exists)
+    if not nps_month.empty or not sent_df.empty:
+        try:
+            fig = _fig_mom_nps_pos(nps_month, sent_df)
+            figs.append(("NPS % vs Positive sentiment % — MoM", fig))
+        except Exception:
+            pass
+
+    # Tiny table: key themes from latest month suggestions (detractors preferred)
+    try:
+        latest_month = None
+        if not sent_df.empty and "_month" in sent_df.columns:
+            latest_month = sent_df["_month"].max()
+            texts = sent_df.loc[sent_df["_month"] == latest_month, "Suggestions"].dropna().astype(str).tolist()
+        else:
+            texts = []
+        themes = _top_phrases(texts, k=8) if texts else []
+        if themes:
+            tables.append((f"Key themes — {latest_month.strftime('%b %Y') if latest_month else 'latest'}", 
+                           pd.DataFrame({"theme": themes})))
+    except Exception:
+        pass
+
+    # Fail-safe: if still empty, provide a latest-month KPI row so slide isn’t blank
+    if not figs and not tables:
+        latest = None
+        if not nps_month.empty and "month" in nps_month.columns:
+            latest = nps_month["month"].max()
+            kpi = nps_month.loc[nps_month["month"] == latest].copy()
+            # common column fallbacks
+            cols = [c for c in kpi.columns if c.lower() in ("nps","nps%","score","overall_nps")]
+            if cols:
+                kpi = kpi.rename(columns={cols[0]: "NPS"})
+                tables.append((f"Latest month snapshot — {latest.strftime('%b %Y')}", 
+                               kpi[["month","NPS"]].reset_index(drop=True)))
+        if not tables:
+            tables.append(("Info", pd.DataFrame({"note": ["No NPS snapshot content available."]})))
+
+    title = "Halo Quality — NPS Snapshot"
+    subtitle = params.get("period_label", "") or "Auto summary"
+    return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
