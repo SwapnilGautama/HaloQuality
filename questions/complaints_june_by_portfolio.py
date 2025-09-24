@@ -1175,37 +1175,32 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     return ("", pd.DataFrame())
 
 # ---------------------------
-# --- Snapshot export (used by app.py for one-page PPTX) ---
+# --- Snapshot export (for app.py one-pager) ---
 def build_snapshot(store, params):
     """
     Returns {title, subtitle, figs, tables} for one-page PPT.
-    Uses the same computations as the Overview/Insights tab.
+    Uses the same computations as the Complaints Overview/Insights tab.
     """
     import pandas as pd
 
-    cases = store.get("cases") or store.get("cases_df")
-    comp  = store.get("complaints") or store.get("complaints_df")
-
     title = "Halo Quality — Complaints Snapshot"
-    subtitle = "Jan–Aug ’25"
+    subtitle = "Jan–Aug 2025"
 
-    # 1) MoM figure
-    figs = []
+    figs, tables = [], []
+
     try:
-        mom = _mom_series(cases, comp)   # -> DataFrame with month, per_1000
-        fig = _mom_line_fig(mom)
-        figs.append(("Complaints per 1,000 — Month on Month", fig))
+        mom = _mom_series(store["cases"], store["complaints"])  # <- replace with your helper
+        fig = _mom_line_fig(mom)  # <- replace with your plotting helper
+        figs.append(("Complaints per 1,000 — MoM", fig))
     except Exception:
         pass
 
-    # 2) RCA2 focus table and 3) RCA1 Pareto top (June ’25)
-    tables = []
     try:
-        rca2_focus, rca1_pareto = _rca_tables_for_june(comp, use_ai=False)
+        rca2_focus, rca1_pareto = _rca_tables_for_june(store["complaints"], use_ai=False)  # <- replace with your helper
         if isinstance(rca2_focus, pd.DataFrame) and not rca2_focus.empty:
-            tables.append(("Top fail reasons — Jun 2025 (RCA2 focus ~80%)", rca2_focus))
+            tables.append(("Top Fail Reasons (RCA2)", rca2_focus))
         if isinstance(rca1_pareto, pd.DataFrame) and not rca1_pareto.empty:
-            tables.append(("RCA1 — Jun 2025 (Pareto)", rca1_pareto))
+            tables.append(("RCA1 Pareto", rca1_pareto))
     except Exception:
         pass
 
