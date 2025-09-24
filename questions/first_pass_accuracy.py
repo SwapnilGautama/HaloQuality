@@ -940,3 +940,46 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
                     st.info("No data to display in the table for the selected portfolio(s).")
 
     return ("", pd.DataFrame())
+
+# ---------------------------
+# Snapshot builder for FPA (used by app.py email/snapshot)
+# ---------------------------
+def build_snapshot(store, params):
+    """
+    Returns curated content for a one-pager:
+      - title, subtitle
+      - figs: [(caption, matplotlib_figure)]
+      - tables: [(caption, pandas_dataframe)]
+    """
+    # MoM overall pass% figure (reuse your existing helper)
+    try:
+        df_all, _ = _load_fpa()
+        mom = _series_mom(df_all)
+        fig_mom = _fig_mom(mom, "Overall Pass % — Month on Month")
+    except Exception:
+        fig_mom = None
+
+    # Fail-reason story mini-table (latest month)
+    try:
+        df_all, _ = _load_fpa()
+        fails_all = _label_all(df_all)
+        latest_tbl, latest_period = _label_all_latest(df_all, fails_precomputed=fails_all)
+    except Exception:
+        latest_tbl, latest_period = pd.DataFrame(), None
+
+    figs = []
+    if fig_mom:
+        figs.append(("Overall Pass % — Month on Month", fig_mom))
+
+    tables = []
+    if not latest_tbl.empty:
+        pretty_month = pd.Period(latest_period).strftime("%b %Y") if latest_period is not None else "Latest"
+        tables.append((f"Top fail reasons — {pretty_month}", latest_tbl))
+
+    title = "Halo Quality — First Pass Accuracy Snapshot"
+    subtitle = params.get("period_label", "Jan–Aug ’25")
+    return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
+
+
+
+
