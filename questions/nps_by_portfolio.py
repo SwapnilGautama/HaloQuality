@@ -866,43 +866,63 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
 
 # ---------------------------
-# --- Snapshot export (for app.py one-pager) ---
-def build_snapshot(store, params):
-    """
-    Returns {title, subtitle, figs, tables} for one-page PPT.
-    Uses same logic as the NPS Overview tab.
-    """
-    import matplotlib.pyplot as plt
-    import pandas as pd
+# ... keep all your existing imports, caching, tabs, and run() exactly as-is ...
 
-    title = "Halo Quality — NPS Snapshot"
-    subtitle = ""
+# ---------------------------
+# Snapshot builder for NPS (used by app.py email/snapshot)
+# ---------------------------
+def build_snapshot(store, params):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    nps_df_raw = store.get("nps", pd.DataFrame())
+    sug_df_raw = store.get("nps_suggestions", pd.DataFrame())
+
+    # Use your cached helpers when data is present
+    df_surv = _prep_surveys_cached(nps_df_raw) if isinstance(nps_df_raw, pd.DataFrame) else pd.DataFrame()
+    nps_month = _aggregate_nps_cached(df_surv) if not df_surv.empty else pd.DataFrame()
+    sent_df = _sentiments_cached(df_surv) if not df_surv.empty else pd.DataFrame()
 
     figs, tables = [], []
 
+    # Figure: NPS vs Positive sentiment MoM (if either series exists)
+    if not nps_month.empty or not sent_df.empty:
+        try:
+            fig = _fig_mom_nps_pos(nps_month, sent_df)
+            figs.append(("NPS % vs Positive sentiment % — MoM", fig))
+        except Exception:
+            pass
+
+    # Tiny table: key themes from latest month suggestions (detractors preferred)
     try:
-        # Example: reuse your existing helper for MoM NPS
-        df_mom = _nps_mom_overall_2025(store)   # <- replace with your existing function
-        if isinstance(df_mom, pd.DataFrame) and not df_mom.empty:
-            fig, ax = plt.subplots(figsize=(6,3))
-            ax.plot(df_mom["month"], df_mom["nps"], marker="o")
-            ax.set_title("Overall NPS — MoM (2025)")
-            figs.append(("Overall NPS — MoM", fig))
+        latest_month = None
+        if not sent_df.empty and "_month" in sent_df.columns:
+            latest_month = sent_df["_month"].max()
+            texts = sent_df.loc[sent_df["_month"] == latest_month, "Suggestions"].dropna().astype(str).tolist()
+        else:
+            texts = []
+        themes = _top_phrases(texts, k=8) if texts else []
+        if themes:
+            tables.append((f"Key themes — {latest_month.strftime('%b %Y') if latest_month else 'latest'}", 
+                           pd.DataFrame({"theme": themes})))
     except Exception:
         pass
 
-    try:
-        latest_tbl = _latest_month_snapshot_table(store)   # <- replace with your helper
-        if isinstance(latest_tbl, pd.DataFrame) and not latest_tbl.empty:
-            tables.append(("Latest Month Snapshot", latest_tbl))
-    except Exception:
-        pass
+    # Fail-safe: if still empty, provide a latest-month KPI row so slide isn’t blank
+    if not figs and not tables:
+        latest = None
+        if not nps_month.empty and "month" in nps_month.columns:
+            latest = nps_month["month"].max()
+            kpi = nps_month.loc[nps_month["month"] == latest].copy()
+            # common column fallbacks
+            cols = [c for c in kpi.columns if c.lower() in ("nps","nps%","score","overall_nps")]
+            if cols:
+                kpi = kpi.rename(columns={cols[0]: "NPS"})
+                tables.append((f"Latest month snapshot — {latest.strftime('%b %Y')}", 
+                               kpi[["month","NPS"]].reset_index(drop=True)))
+        if not tables:
+            tables.append(("Info", pd.DataFrame({"note": ["No NPS snapshot content available."]})))
 
-    try:
-        drivers_tbl = _nps_driver_correlations_table(store)  # <- replace with your helper
-        if isinstance(drivers_tbl, pd.DataFrame) and not drivers_tbl.empty:
-            tables.append(("Key Drivers", drivers_tbl))
-    except Exception:
-        pass
-
+    title = "Halo Quality — NPS Snapshot"
+    subtitle = params.get("period_label", "") or "Auto summary"
     return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
