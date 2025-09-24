@@ -864,3 +864,42 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         df_out = pd.DataFrame([{"error": str(e)}])
 
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
+
+# ---------------------------
+# Snapshot builder for NPS (used by app.py email/snapshot)
+# ---------------------------
+def build_snapshot(store, params):
+    nps_df_raw = store.get("nps", pd.DataFrame())
+    sug_df_raw = store.get("nps_suggestions", pd.DataFrame())
+
+    df_surv = _prep_surveys_cached(nps_df_raw) if isinstance(nps_df_raw, pd.DataFrame) else pd.DataFrame()
+    nps_month = _aggregate_nps_cached(df_surv) if not df_surv.empty else pd.DataFrame()
+    sent_df = _sentiments_cached(df_surv) if not df_surv.empty else pd.DataFrame()
+
+    # Figure: NPS vs Positive sentiment MoM
+    fig_trend = None
+    if not nps_month.empty or not sent_df.empty:
+        fig_trend = _fig_mom_nps_pos(nps_month, sent_df)
+
+    # Table: key themes from detractor (or all) suggestions, latest month
+    themes = []
+    if not sent_df.empty:
+        latest = sent_df["_month"].max()
+        latest_texts = sent_df.loc[sent_df["_month"] == latest, "Suggestions"].dropna().astype(str).tolist()
+        if latest_texts:
+            themes = _top_phrases(latest_texts, k=10)
+    df_themes = pd.DataFrame({"Key themes (latest)": themes}) if themes else pd.DataFrame()
+
+    figs = []
+    if fig_trend:
+        figs.append(("NPS % vs Positive sentiment % — MoM", fig_trend))
+    tables = []
+    if not df_themes.empty:
+        tables.append(("Key themes (detractor/all suggestions)", df_themes))
+
+    title = "Halo Quality — NPS Snapshot"
+    subtitle = params.get("period_label", "")
+    return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
+
+
+
