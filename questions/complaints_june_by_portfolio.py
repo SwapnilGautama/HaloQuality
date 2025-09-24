@@ -1175,45 +1175,38 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     return ("", pd.DataFrame())
 
 # ---------------------------
-# Snapshot builder for Complaints (used by app.py email/snapshot)
-# ---------------------------
+# --- Snapshot export (used by app.py for one-page PPTX) ---
 def build_snapshot(store, params):
-    cases = store.get("cases", pd.DataFrame())
-    comp  = store.get("complaints", pd.DataFrame())
+    """
+    Returns {title, subtitle, figs, tables} for one-page PPT.
+    Uses the same computations as the Overview/Insights tab.
+    """
+    import pandas as pd
 
-    # Figure 1: Complaints per 1,000 — MoM (Jan–Aug ’25 window)
-    fig_mom = None
-    try:
-        mom_df = _mom_series(cases, comp)
-        if not mom_df.empty:
-            # small inline figure
-            fig, ax = plt.subplots(figsize=(8.4, 3.2))
-            ax.plot(mom_df["month"], mom_df["per_1000"], linewidth=3.0, color=_PASTEL_LINE)
-            for x, y in zip(mom_df["month"], mom_df["per_1000"]):
-                ax.text(x, y + 0.3, f"{y:.1f}", ha="center", va="bottom", fontsize=9, color=_DARK_GREY)
-            for sp in ("left","right","top"): ax.spines[sp].set_visible(False)
-            ax.spines["bottom"].set_color(_SOFT_GREY); ax.spines["bottom"].set_linewidth(1.25)
-            ax.get_yaxis().set_visible(False); ax.set_xlabel(""); ax.set_title("Complaints per 1,000 — MoM", color=_DARK_BLUE, pad=8)
-            fig_mom = fig
-    except Exception:
-        pass
-
-    # Table: Watchlist (latest month per-1k)
-    tables = []
-    try:
-        latest_str, latest_pretty = _latest_month_2025(cases, comp)
-        if latest_str:
-            tab = _portfolio_table_for_month(cases, comp, latest_str)
-            if not tab.empty:
-                tables.append((f"Watchlist — highest per-1k in {latest_pretty}", tab[["portfolio","per_1000","complaints","cases"]]))
-    except Exception:
-        pass
-
-    figs = []
-    if fig_mom:
-        figs.append(("Complaints per 1,000 — MoM", fig_mom))
+    cases = store.get("cases") or store.get("cases_df")
+    comp  = store.get("complaints") or store.get("complaints_df")
 
     title = "Halo Quality — Complaints Snapshot"
-    subtitle = params.get("period_label", "")
-    return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
+    subtitle = "Jan–Aug ’25"
 
+    # 1) MoM figure
+    figs = []
+    try:
+        mom = _mom_series(cases, comp)   # -> DataFrame with month, per_1000
+        fig = _mom_line_fig(mom)
+        figs.append(("Complaints per 1,000 — Month on Month", fig))
+    except Exception:
+        pass
+
+    # 2) RCA2 focus table and 3) RCA1 Pareto top (June ’25)
+    tables = []
+    try:
+        rca2_focus, rca1_pareto = _rca_tables_for_june(comp, use_ai=False)
+        if isinstance(rca2_focus, pd.DataFrame) and not rca2_focus.empty:
+            tables.append(("Top fail reasons — Jun 2025 (RCA2 focus ~80%)", rca2_focus))
+        if isinstance(rca1_pareto, pd.DataFrame) and not rca1_pareto.empty:
+            tables.append(("RCA1 — Jun 2025 (Pareto)", rca1_pareto))
+    except Exception:
+        pass
+
+    return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
