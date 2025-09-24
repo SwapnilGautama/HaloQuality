@@ -866,40 +866,51 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
 
 # ---------------------------
-# Snapshot builder for NPS (used by app.py email/snapshot)
-# ---------------------------
+# --- Snapshot export (used by app.py for one-page PPTX) ---
 def build_snapshot(store, params):
-    nps_df_raw = store.get("nps", pd.DataFrame())
-    sug_df_raw = store.get("nps_suggestions", pd.DataFrame())
-
-    df_surv = _prep_surveys_cached(nps_df_raw) if isinstance(nps_df_raw, pd.DataFrame) else pd.DataFrame()
-    nps_month = _aggregate_nps_cached(df_surv) if not df_surv.empty else pd.DataFrame()
-    sent_df = _sentiments_cached(df_surv) if not df_surv.empty else pd.DataFrame()
-
-    # Figure: NPS vs Positive sentiment MoM
-    fig_trend = None
-    if not nps_month.empty or not sent_df.empty:
-        fig_trend = _fig_mom_nps_pos(nps_month, sent_df)
-
-    # Table: key themes from detractor (or all) suggestions, latest month
-    themes = []
-    if not sent_df.empty:
-        latest = sent_df["_month"].max()
-        latest_texts = sent_df.loc[sent_df["_month"] == latest, "Suggestions"].dropna().astype(str).tolist()
-        if latest_texts:
-            themes = _top_phrases(latest_texts, k=10)
-    df_themes = pd.DataFrame({"Key themes (latest)": themes}) if themes else pd.DataFrame()
-
-    figs = []
-    if fig_trend:
-        figs.append(("NPS % vs Positive sentiment % — MoM", fig_trend))
-    tables = []
-    if not df_themes.empty:
-        tables.append(("Key themes (detractor/all suggestions)", df_themes))
+    """
+    Return {title, subtitle, figs, tables} for one-page PPT.
+    - figs: list of (caption, matplotlib_figure)
+    - tables: list of (caption, pandas.DataFrame)
+    """
+    import matplotlib.pyplot as plt
+    import pandas as pd
 
     title = "Halo Quality — NPS Snapshot"
-    subtitle = params.get("period_label", "")
+    subtitle = ""
+
+    # Reuse your existing helpers from this module
+    # These names should already exist in this file from the live UI code.
+    # If your helper names differ, just map them accordingly.
+    try:
+        # 1) MoM figure (Jan–Aug ’25)
+        mom_df = _nps_mom_overall_2025(store)        # expects DataFrame: month, nps
+        fig, ax = plt.subplots(figsize=(6.0, 3.2))
+        ax.plot(mom_df["month"], mom_df["nps"], marker="o", linewidth=2.4, color="#9ecae1")
+        for x, y in zip(mom_df["month"], mom_df["nps"]):
+            ax.text(x, y + 0.2, f"{y:.1f}", ha="center", va="bottom", fontsize=9, color="#333333")
+        ax.set_ylim(bottom=min(0, mom_df["nps"].min() - 2))
+        ax.spines["left"].set_visible(False); ax.spines["right"].set_visible(False); ax.spines["top"].set_visible(False)
+        ax.tick_params(axis="x", colors="#555555"); ax.get_yaxis().set_visible(False)
+        ax.set_title("Overall NPS — MoM (Jan–Aug ’25)", color="#0b3d91", pad=8)
+        fig.tight_layout()
+        figs = [("Overall NPS — Month on Month", fig)]
+    except Exception:
+        figs = []
+
+    # 2) Latest month snapshot table + 3) Driver correlations table
+    tables = []
+    try:
+        latest_tbl = _latest_month_snapshot_table(store)   # expects a tidy small DF
+        if isinstance(latest_tbl, pd.DataFrame) and not latest_tbl.empty:
+            tables.append(("Latest month snapshot", latest_tbl))
+    except Exception:
+        pass
+    try:
+        drivers_tbl = _nps_driver_correlations_table(store)  # tidy DF with drivers and r
+        if isinstance(drivers_tbl, pd.DataFrame) and not drivers_tbl.empty:
+            tables.append(("Key drivers (correlation)", drivers_tbl))
+    except Exception:
+        pass
+
     return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
-
-
-
