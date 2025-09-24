@@ -872,57 +872,228 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 # Snapshot builder for NPS (used by app.py email/snapshot)
 # ---------------------------
 def build_snapshot(store, params):
-    import pandas as pd
-    import matplotlib.pyplot as plt
+    """
+    NPS one-pager builder (self-contained).
+    Returns dict with:
+      - title, subtitle
+      - figs: list of (caption, matplotlib_figure)
+      - tables: list of (title, pandas_dataframe)
+    """
+    import re, numpy as np, pandas as pd, matplotlib.pyplot as plt
+    from datetime import datetime
 
-    nps_df_raw = store.get("nps", pd.DataFrame())
-    sug_df_raw = store.get("nps_suggestions", pd.DataFrame())
+    # --------------- tiny in-function helpers (no external deps) ----------------
+    def _find(df, names):
+        if df is None or df.empty: return None
+        m = {str(c).strip().lower(): c for c in df.columns}
+        # exact
+        for n in names:
+            if n.lower() in m: return m[n.lower()]
+        # contains
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            for n in names:
+                if n.lower() in cl: return c
+        return None
 
-    # Use your cached helpers when data is present
-    df_surv = _prep_surveys_cached(nps_df_raw) if isinstance(nps_df_raw, pd.DataFrame) else pd.DataFrame()
-    nps_month = _aggregate_nps_cached(df_surv) if not df_surv.empty else pd.DataFrame()
-    sent_df = _sentiments_cached(df_surv) if not df_surv.empty else pd.DataFrame()
+    def _norm_portfolio(x):
+        if not isinstance(x, str): return "Unknown"
+        t = x.strip().title()
+        t = t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
+        return t
 
-    figs, tables = [], []
+    POS = {"good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
+           "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"}
+    NEG = {"bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
+           "rude","unhelpful","expensive","issue","problem","bug","error","crash","difficult","worst"}
 
-    # Figure: NPS vs Positive sentiment MoM (if either series exists)
-    if not nps_month.empty or not sent_df.empty:
-        try:
-            fig = _fig_mom_nps_pos(nps_month, sent_df)
-            figs.append(("NPS % vs Positive sentiment % — MoM", fig))
-        except Exception:
-            pass
+    def _lex_sentiment(text: str) -> float:
+        if not isinstance(text, str) or not text.strip():
+            return 0.0
+        toks = re.findall(r"\b\w+\b", text.lower())
+        if not toks:
+            return 0.0
+        score = sum(1 for t in toks if t in POS) - sum(1 for t in toks if t in NEG)
+        # mild normalisation to [-1,1]
+        return max(-1.0, min(1.0, score / max(len(toks), 4)))
 
-    # Tiny table: key themes from latest month suggestions (detractors preferred)
-    try:
-        latest_month = None
-        if not sent_df.empty and "_month" in sent_df.columns:
-            latest_month = sent_df["_month"].max()
-            texts = sent_df.loc[sent_df["_month"] == latest_month, "Suggestions"].dropna().astype(str).tolist()
-        else:
-            texts = []
-        themes = _top_phrases(texts, k=8) if texts else []
-        if themes:
-            tables.append((f"Key themes — {latest_month.strftime('%b %Y') if latest_month else 'latest'}", 
-                           pd.DataFrame({"theme": themes})))
-    except Exception:
-        pass
+    STOP = {
+        "the","a","an","and","or","for","to","of","in","on","at","by","with","from","as","is","are",
+        "was","were","be","been","it","this","that","these","those","we","you","they","i","he","she",
+        "them","our","your","their","us","but","so","if","than","then","too","very","can","could",
+        "would","should","may","might","will","just","also","not","no","yes","all","any","each","every",
+        "more","most","some","such","into","within","about","over","under","per","etc","na","none","null"
+    }
 
-    # Fail-safe: if still empty, provide a latest-month KPI row so slide isn’t blank
-    if not figs and not tables:
-        latest = None
-        if not nps_month.empty and "month" in nps_month.columns:
-            latest = nps_month["month"].max()
-            kpi = nps_month.loc[nps_month["month"] == latest].copy()
-            # common column fallbacks
-            cols = [c for c in kpi.columns if c.lower() in ("nps","nps%","score","overall_nps")]
-            if cols:
-                kpi = kpi.rename(columns={cols[0]: "NPS"})
-                tables.append((f"Latest month snapshot — {latest.strftime('%b %Y')}", 
-                               kpi[["month","NPS"]].reset_index(drop=True)))
-        if not tables:
-            tables.append(("Info", pd.DataFrame({"note": ["No NPS snapshot content available."]})))
+    def _clean_tokens(text: str):
+        toks = re.findall(r"\b[a-zA-Z][a-zA-Z\-']+\b", str(text).lower())
+        out = []
+        for t in toks:
+            t = t.strip("-'")
+            if len(t) < 3:  # drop very short
+                continue
+            if t in STOP:
+                continue
+            out.append(t)
+        return out
+
+    def _top_phrases(texts, k=6):
+        from collections import Counter
+        uni = Counter(); bi = Counter()
+        for t in texts:
+            toks = _clean_tokens(t)
+            uni.update(toks)
+            bi.update([" ".join(p) for p in zip(toks, toks[1:]) if p[0] != p[1]])
+        top = [w for w,_ in bi.most_common(k)]
+        if len(top) < k:
+            need = k - len(top)
+            top += [w for w,_ in uni.most_common(need)]
+        return top[:k]
+
+    def _monthify(series):
+        # parse months robustly; accept dates or strings like "Aug-25" / "2025-08"
+        dt = pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
+        if dt.notna().sum() == 0:
+            s = series.astype(str)
+            # try "Aug 2025" or "Aug-25"
+            try_alt = pd.to_datetime(s.str[:3].str.title() + " 1 2025", errors="coerce", format="%b %d %Y")
+            dt = try_alt
+        return dt.dt.to_period("M")
+
+    # --------------- 1) get surveys from store (several possible keys) ----------
+    surveys = None
+    for key in ("surveys", "nps", "nps_df"):
+        obj = store.get(key)
+        if isinstance(obj, pd.DataFrame) and not obj.empty:
+            surveys = obj
+            break
 
     title = "Halo Quality — NPS Snapshot"
     subtitle = params.get("period_label", "") or "Auto summary"
+
+    if surveys is None or surveys.empty:
+        return {"title": title, "subtitle": subtitle, "figs": [],
+                "tables": [("Info", pd.DataFrame({"note":["No NPS snapshot content available."]}))]}
+
+    df = surveys.copy()
+
+    # --------------- 2) standardise columns we need -----------------------------
+    pcol = _find(df, ["portfolio"])
+    df["Portfolio"] = df[pcol].map(_norm_portfolio) if pcol else "Unknown"
+
+    mcol = _find(df, ["month_received","month received","month","date","created date","report date"])
+    if mcol:
+        df["_month"] = _monthify(df[mcol])
+    else:
+        df["_month"] = pd.NaT
+
+    scol = _find(df, ["nps","nps score","nps_score","nps (0-10)","score","rating"])
+    score = pd.to_numeric(df[scol], errors="coerce") if scol else pd.Series([np.nan]*len(df))
+    bucket = np.where(score >= 9, "promoter", np.where(score >= 7, "passive", np.where(score >= 0, "detractor","unknown")))
+    df["nps_bucket"] = bucket
+
+    comcol = _find(df, ["suggestions","suggestion","comments","comment","feedback"])
+    if comcol:
+        df["Suggestions"] = df[comcol].astype(str).str.strip()
+        df.loc[df["Suggestions"].str.lower().isin(["","nan","none","null"]), "Suggestions"] = np.nan
+    else:
+        df["Suggestions"] = np.nan
+
+    # keep only rows with month
+    df = df[df["_month"].notna()].copy()
+    if df.empty:
+        return {"title": title, "subtitle": subtitle, "figs": [],
+                "tables": [("Info", pd.DataFrame({"note":["No usable Month information in surveys."]}))]}
+
+    # --------------- 3) aggregate NPS by Portfolio × Month ----------------------
+    g = df.groupby(["Portfolio","_month"])["nps_bucket"].value_counts().unstack(fill_value=0)
+    for c in ["promoter","passive","detractor","unknown"]:
+        if c not in g.columns: g[c] = 0
+    g["Total"] = g[["promoter","passive","detractor","unknown"]].sum(axis=1).replace(0, np.nan)
+    g["NPS"]   = ((g["promoter"] - g["detractor"]) / g["Total"] * 100.0)
+    nps_m = g.reset_index()
+
+    # --------------- 4) sentiments from Suggestions ----------------------------
+    sug = df[df["Suggestions"].notna()].copy()
+    if not sug.empty:
+        sc = sug["Suggestions"].map(_lex_sentiment)
+        lab = np.where(sc >= 0.05, "positive", np.where(sc <= -0.05, "negative", "neutral"))
+        sug["sent_label"] = lab
+    else:
+        sug = pd.DataFrame(columns=["Portfolio","_month","Suggestions","sent_label"])
+
+    # --------------- 5) figs and tables ----------------------------------------
+    figs, tables = [], []
+
+    # A) MoM overall NPS% and Positive% (across all portfolios)
+    #    compute overall per month (weighted by counts)
+    def _overall_month(series_df):
+        m = series_df.groupby("_month")[["promoter","passive","detractor","unknown"]].sum(min_count=1)
+        m["Total"] = m.sum(axis=1)
+        out = pd.DataFrame({
+            "_month": m.index.astype("period[M]"),
+            "NPS%": ((m["promoter"] - m["detractor"]) / m["Total"].replace(0,np.nan) * 100.0)
+        }).dropna()
+        return out
+
+    overall = _overall_month(nps_m)
+
+    pos_m = pd.DataFrame(columns=["_month","Pos%"])
+    if not sug.empty:
+        sm = (sug.groupby("_month")["sent_label"].value_counts().unstack(fill_value=0))
+        sm["tot"] = sm.sum(axis=1)
+        pos_m = pd.DataFrame({
+            "_month": sm.index.astype("period[M]"),
+            "Pos%": sm.get("positive",0) / sm["tot"].replace(0,np.nan) * 100.0
+        })
+
+    if not overall.empty or not pos_m.empty:
+        mm = pd.merge(overall, pos_m, on="_month", how="outer").sort_values("_month")
+        x = np.arange(len(mm))
+        fig, ax = plt.subplots(figsize=(8.8, 3.6))
+        if "NPS%" in mm: ax.plot(x, mm["NPS%"], linewidth=2.6, label="NPS %")
+        if "Pos%" in mm: ax.plot(x, mm["Pos%"], linewidth=2.6, label="Positive %")
+        ax.set_xticks(x); ax.set_xticklabels(mm["_month"].astype(str).tolist(), rotation=0)
+        for sp in ("top","right","left"): ax.spines[sp].set_visible(False)
+        ax.spines["bottom"].set_color("#D3D3D3")
+        ax.get_yaxis().set_visible(False); ax.grid(False); ax.set_xlabel("")
+        ax.set_title("MoM Trend — NPS % & Positive Sentiment %")
+        ax.legend(frameon=False, loc="upper right")
+        figs.append(("NPS % vs Positive sentiment % — MoM", fig))
+
+    # B) Latest month snapshot table
+    if not nps_m.empty:
+        latest_m = nps_m["_month"].max()
+        snap = nps_m[nps_m["_month"] == latest_m].copy()
+
+        # attach sentiment rates (by portfolio, latest)
+        if not sug.empty:
+            sm = (sug[sug["_month"] == latest_m]
+                    .groupby("Portfolio")["sent_label"].value_counts().unstack(fill_value=0))
+            sm["S_Tot"] = sm.sum(axis=1)
+            sm["Pos%"]  = sm.get("positive",0) / sm["S_Tot"].replace(0,np.nan) * 100.0
+            sm["Neg%"]  = sm.get("negative",0) / sm["S_Tot"].replace(0,np.nan) * 100.0
+            sm["NetSent%"] = sm["Pos%"] - sm["Neg%"]
+            snap = snap.merge(sm[["Pos%","Neg%","NetSent%"]], on="Portfolio", how="left")
+
+        snap["Detractors%"] = (snap["detractor"] / snap["Total"].replace(0,np.nan) * 100.0)
+        keep = [c for c in ["Portfolio","NPS","Detractors%","Pos%","Neg%","NetSent%"] if c in snap.columns]
+        if keep:
+            out = snap[keep].round(1).sort_values("NPS", ascending=False).reset_index(drop=True)
+            tables.append((f"Latest month snapshot — {str(latest_m)}", out))
+
+    # C) Key themes for latest month (prefer detractors first)
+    if not sug.empty:
+        lm = sug["_month"].max()
+        det_latest = sug[(sug["_month"] == lm) & (sug["sent_label"] == "negative")]
+        texts = det_latest["Suggestions"].dropna().astype(str).tolist()
+        if not texts:
+            texts = sug[sug["_month"] == lm]["Suggestions"].dropna().astype(str).tolist()
+        themes = _top_phrases(texts, k=8) if texts else []
+        if themes:
+            tables.append((f"Key themes — {str(lm)}", pd.DataFrame({"theme": themes})))
+
+    if not figs and not tables:
+        tables.append(("Info", pd.DataFrame({"note":["No NPS snapshot content available."]})))
+
     return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
