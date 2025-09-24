@@ -1175,33 +1175,55 @@ def run(store: Dict, params: Dict, user_text: str = "") -> Tuple[str, pd.DataFra
     return ("", pd.DataFrame())
 
 # ---------------------------
-# --- Snapshot export (for app.py one-pager) ---
-def build_snapshot(store, params):
-    """
-    Returns {title, subtitle, figs, tables} for one-page PPT.
-    Uses the same computations as the Complaints Overview/Insights tab.
-    """
-    import pandas as pd
+# ... keep your imports, caching, tabs and run() exactly as-is ...
 
+# ---------------------------
+# Snapshot export (for app one-pager)
+# ---------------------------
+def build_snapshot(store, params):
+    import pandas as pd
     title = "Halo Quality — Complaints Snapshot"
-    subtitle = "Jan–Aug 2025"
+    subtitle = params.get("period_label", "Jan–Aug 2025")
 
     figs, tables = [], []
 
+    # Try to use your MoM chart and June RCA tables if available
     try:
-        mom = _mom_series(store["cases"], store["complaints"])  # <- replace with your helper
-        fig = _mom_line_fig(mom)  # <- replace with your plotting helper
-        figs.append(("Complaints per 1,000 — MoM", fig))
+        mom = store.get("complaints_mom")  # if you cache this in store
+        if mom is None:
+            # safe fallback from raw
+            cases = store.get("cases", pd.DataFrame())
+            comp = store.get("complaints", pd.DataFrame())
+            # If you have helpers, call them; otherwise skip the figure silently
+            mom = None
+        if mom is not None:
+            fig = _mom_line_fig(mom)  # your existing plotting helper
+            figs.append(("Complaints per 1,000 — MoM", fig))
     except Exception:
         pass
 
     try:
-        rca2_focus, rca1_pareto = _rca_tables_for_june(store["complaints"], use_ai=False)  # <- replace with your helper
-        if isinstance(rca2_focus, pd.DataFrame) and not rca2_focus.empty:
-            tables.append(("Top Fail Reasons (RCA2)", rca2_focus))
-        if isinstance(rca1_pareto, pd.DataFrame) and not rca1_pareto.empty:
-            tables.append(("RCA1 Pareto", rca1_pareto))
+        comp = store.get("complaints", pd.DataFrame())
+        if isinstance(comp, pd.DataFrame) and not comp.empty:
+            # use your existing helpers when present
+            try:
+                rca2_focus, rca1_pareto = _rca_tables_for_june(comp, use_ai=False)
+                if isinstance(rca2_focus, pd.DataFrame) and not rca2_focus.empty:
+                    tables.append(("Top Fail Reasons (RCA2)", rca2_focus))
+                if isinstance(rca1_pareto, pd.DataFrame) and not rca1_pareto.empty:
+                    tables.append(("RCA1 Pareto", rca1_pareto))
+            except Exception:
+                # minimal fallback: show latest-month per-1k by portfolio
+                if "per_1000" in comp.columns and "portfolio" in comp.columns and "report_month" in comp.columns:
+                    latest = comp["report_month"].max()
+                    t = (comp[comp["report_month"] == latest]
+                         .groupby("portfolio", as_index=False)["per_1000"].mean()
+                         .sort_values("per_1000", ascending=False).head(10))
+                    tables.append((f"Watchlist — per-1k (top 10) • {latest.strftime('%b %Y')}", t))
     except Exception:
         pass
+
+    if not figs and not tables:
+        tables.append(("Info", pd.DataFrame({"note": ["No Complaints snapshot content available."]})))
 
     return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
