@@ -14,8 +14,6 @@ import streamlit as st
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-
 
 # =============== Import helpers ===============
 def _imp(mod: str, attr: str | None = None):
@@ -301,7 +299,6 @@ def _coerce_pairs(obj, expect_df: bool = False) -> List[Tuple[str, Any]]:
             if isinstance(payload, pd.DataFrame):
                 out.append((str(cap), payload))
         else:
-            # fig: we can't validate fully; check for savefig attribute
             if hasattr(payload, "savefig"):
                 out.append((str(cap), payload))
 
@@ -324,6 +321,10 @@ def _get_snapshot_content(slug: str, store, params: Dict[str, Any]) -> Dict[str,
                 subtitle = raw.get("subtitle") or ""
                 figs = _coerce_pairs(raw.get("figs"), expect_df=False)
                 tables = _coerce_pairs(raw.get("tables"), expect_df=True)
+                # ---- SAFETY: guarantee something is returned ----
+                if not figs and not tables:
+                    info = pd.DataFrame({"note": [f"No snapshot content found for '{slug}'."]})
+                    tables = [("Info", info)]
                 return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
 
             # Fallback: run() and use its DataFrame
@@ -334,14 +335,18 @@ def _get_snapshot_content(slug: str, store, params: Dict[str, Any]) -> Dict[str,
                          f"Halo Quality — {slug.replace('_', ' ').title()}")
                 subtitle = (result[1] if isinstance(result, tuple) and len(result) > 1 else "")
                 tables = _coerce_pairs([("Data", df)] if isinstance(df, pd.DataFrame) and not df.empty else [], expect_df=True)
+                if not tables:
+                    info = pd.DataFrame({"note": ["No data returned by run(); snapshot preview only."]})
+                    tables = [("Info", info)]
                 return {"title": title, "subtitle": subtitle, "figs": [], "tables": tables}
         except ModuleNotFoundError:
             continue
         except Exception as e:
             st.error(f"Snapshot content error in {slug}: {e}")
 
-    # Final safe default
-    return {"title": f"Halo Quality — {slug.replace('_', ' ').title()}", "subtitle": "Auto summary", "figs": [], "tables": []}
+    # Final safe default (kept)
+    return {"title": f"Halo Quality — {slug.replace('_', ' ').title()}",
+            "subtitle": "Auto summary", "figs": [], "tables": []}
 
 
 # ============================== Graph-based mail sender ===============================
@@ -427,11 +432,12 @@ with st.expander("✉️  Share / Email snapshot"):
                 subtitle = snap.get("subtitle") or ""
                 figs = snap.get("figs") or []
                 tables = snap.get("tables") if include_tables else []
+                # ---- SAFETY: if both empty, inject a tiny info table so slide is never blank ----
+                if not figs and not tables:
+                    tables = [("Info", pd.DataFrame({"note":[f"No snapshot content found for '{slug}'."]}))]
 
-                # Build the PPT
                 ppt_bytes = _build_one_pager(title, subtitle, figs=figs, tables=tables)
 
-                # Send
                 _send_via_graph(
                     to_addrs=to_list,
                     subject=title,
