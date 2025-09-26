@@ -219,22 +219,50 @@ def _df_to_table(slide, df: pd.DataFrame, left_in, top_in, width_in, max_rows=8,
     return top_in + 1.25
 
 
+# -------- NEW: small helper to render the sender's note on the slide ----------
+def _ppt_add_note(slide, text: Optional[str]):
+    if not text or not text.strip():
+        return
+    # Soft info box under title
+    left, top, width, height = Inches(0.5), Inches(1.35), Inches(9.0), Inches(1.0)
+    shp = slide.shapes.add_textbox(left, top, width, height)
+    tf = shp.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = f"Note from sender: {text.strip()}"
+    run.font.name = "Segoe UI"
+    run.font.size = Pt(12)
+    run.font.color.rgb = RGBColor(17, 24, 39)  # #111827
+    # soft background
+    fill = shp.fill
+    fill.solid()
+    fill.fore_color.rgb = RGBColor(246, 248, 250)  # #f6f8fa
+    shp.line.color.rgb = RGBColor(229, 231, 235)   # #e5e7eb
+
+
 def _build_one_pager(
     title: str,
     subtitle: str | None,
     figs: List[Tuple[str, Any]] | None = None,
     tables: List[Tuple[str, pd.DataFrame]] | None = None,
     two_column: bool = True,
+    note_message: Optional[str] = None,   # <-- NEW
 ) -> bytes:
     prs = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
     _ppt_add_title(slide, title, subtitle, logo_bytes=_load_logo_bytes())
 
+    # NEW: add sender note (if any)
+    _ppt_add_note(slide, note_message)
+
     # Layout grid
     left_col, right_col = 0.5, 5.2
     col_w = 4.4
-    y_left = y_right = 1.6
+    # push content down slightly if note exists
+    base_y = 1.6 if not (note_message and note_message.strip()) else 2.55
+    y_left = y_right = base_y
 
     def place_block(which: str, caption: str, payload):
         nonlocal y_left, y_right
@@ -364,8 +392,13 @@ def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     return resp.json().get("access_token")
 
 
-def _send_via_graph(to_addrs: List[str], subject: str, html_body: str,
-                    attachment_name: str, attachment_bytes: bytes):
+def _send_via_graph(
+    to_addrs: List[str],
+    subject: str,
+    html_body: str,
+    attachment_name: str,
+    attachment_bytes: bytes,
+):
     cfg = st.secrets.get("graph", {})
     tenant_id, client_id, client_secret, mailbox = (
         cfg.get("tenant_id"),
@@ -412,6 +445,14 @@ with st.expander("✉️  Share / Email snapshot"):
     selected = st.multiselect("Choose recipient(s)", options=default_recipients, default=default_recipients[:1] if default_recipients else [])
     custom = st.text_input("Or add another recipient (optional)", placeholder="name@company.com")
 
+    # NEW: allow users to add a short message to recipients
+    user_message = st.text_area(
+        "Add a short message (optional)",
+        placeholder="Hi team — here’s the latest one-pager from Halo Quality.",
+        height=100,
+        key=f"snapshot_message_{slug}",
+    )
+
     col_a, col_b = st.columns([1, 1])
     with col_a:
         fmt = st.selectbox("Format", ["PPTX (one page)"], index=0)
@@ -436,12 +477,33 @@ with st.expander("✉️  Share / Email snapshot"):
                 if not figs and not tables:
                     tables = [("Info", pd.DataFrame({"note":[f"No snapshot content found for '{slug}'."]}))]
 
-                ppt_bytes = _build_one_pager(title, subtitle, figs=figs, tables=tables)
+                # Build PPTX, embedding user's message as a panel on the slide
+                ppt_bytes = _build_one_pager(
+                    title, subtitle,
+                    figs=figs, tables=tables,
+                    note_message=user_message  # <-- NEW
+                )
+
+                # Build email body with the same user message (safely escaped)
+                import html
+                safe_msg = html.escape(user_message.strip()).replace("\n", "<br>") if user_message and user_message.strip() else ""
+                msg_block = (
+                    "<div style='background:#f6f8fa;border:1px solid #e5e7eb;"
+                    "border-radius:8px;padding:12px 14px;margin:10px 0 18px 0;'>"
+                    f"<strong style='color:#111;'>Note from sender</strong><br>{safe_msg}</div>"
+                ) if safe_msg else ""
+                timestamp = datetime.now().strftime("%d %b %Y %H:%M")
+                html_body = (
+                    f"<h3 style='font:600 18px/1.2 system-ui,Segoe UI,Arial;margin:0 0 6px 0;'>{title}</h3>"
+                    f"<p style='margin:0 0 12px 0;color:#555;'>Auto summary • {timestamp}</p>"
+                    f"{msg_block}"
+                    "<p style='margin:0;color:#444;'>The snapshot is attached.</p>"
+                )
 
                 _send_via_graph(
                     to_addrs=to_list,
                     subject=title,
-                    html_body=f"<p>Hi,</p><p>Attached is the snapshot from <b>Halo Quality</b> ({slug}).</p>",
+                    html_body=html_body,  # <-- uses message block if present
                     attachment_name=f"{slug}_snapshot.pptx",
                     attachment_bytes=ppt_bytes,
                 )
