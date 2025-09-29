@@ -8,37 +8,119 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-# --- NPS snapshot helpers -----------------------------------------------------
-import io
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-import pandas as pd
 
-def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-    """
-    Ensure there is exactly one month column we can use safely, returned as `month_col`.
-    If _month exists both as an index level and a column, we reset_index and keep a single one.
-    """
+# ----------------- helpers -----------------
+def _find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    m = {str(c).strip().lower(): c for c in df.columns}
+    for c in candidates:
+        lc = c.strip().lower()
+        if lc in m:
+            return m[lc]
+    # loose fallback: partial match
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        for n in candidates:
+            if n.strip().lower() in cl:
+                return c
+    return None
+
+def _soft_pastels(n: int) -> list:
+    base = ["#A3C4F3","#CDE7BE","#F6C1C1","#FFD6A5","#BDB2FF","#FFAFCC","#BEE1E6","#E2ECE9"]
+    return [base[i % len(base)] for i in range(n)]
+
+def _norm_portfolio(x: str) -> str:
+    if not isinstance(x, str): return "Unknown"
+    t = x.strip().title()
+    t = t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
+    return t
+
+# simple offline lexical sentiment
+_POS = {"good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
+        "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"}
+_NEG = {"bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
+        "rude","unhelpful","expensive","issue","problem","bug","error","crash","difficult","worst"}
+
+def _lex_sentiment(text: str) -> float:
+    if not isinstance(text, str) or not text.strip():
+        return 0.0
+    toks = re.findall(r"\b\w+\b", text.lower())
+    if not toks:
+        return 0.0
+    score = sum(1 for t in toks if t in _POS) - sum(1 for t in toks if t in _NEG)
+    return max(-1.0, min(1.0, score / max(len(toks), 4)))
+
+# ----------------- AI key-theme extraction + effect-size helpers -----------------
+_STOP = {
+    "the","a","an","and","or","for","to","of","in","on","at","by","with","from","as","is","are",
+    "was","were","be","been","it","this","that","these","those","we","you","they","i","he","she",
+    "them","our","your","their","us","but","so","if","than","then","too","very","can","could",
+    "would","should","may","might","will","just","also","not","no","yes","all","any","each","every",
+    "more","most","some","such","into","within","about","over","under","per","etc","na","none","null"
+}
+
+def _clean_tokens(text: str):
+    toks = re.findall(r"\b[a-zA-Z][a-zA-Z\-']+\b", str(text).lower())
+    out = []
+    for t in toks:
+        t = t.strip("-'")
+        if len(t) < 3:
+            continue
+        if t in _STOP:
+            continue
+        out.append(t)
+    return out
+
+def _top_phrases(texts, k: int = 6):
+    from collections import Counter
+    uni = Counter(); bi = Counter()
+    for t in texts:
+        toks = _clean_tokens(t)
+        uni.update(toks)
+        bi.update([" ".join(pair) for pair in zip(toks, toks[1:]) if pair[0] != pair[1]])
+    top_bi = [w for w,_ in bi.most_common(k)]
+    if len(top_bi) < k:
+        need = k - len(top_bi)
+        top_uni = [w for w,_ in uni.most_common(need)]
+        return [*top_bi, *top_uni]
+    return top_bi[:k]
+
+def _pearson(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
+    if x not in df or y not in df: return np.nan
+    d = df[[x,y]].dropna()
+    if len(d) < 3: return np.nan
+    r = d[x].corr(d[y])
+    return float(r) if pd.notna(r) else np.nan
+
+def _slope(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
+    if x not in df or y not in df: return np.nan
+    d = df[[x,y]].dropna()
+    if len(d) < 3: return np.nan
+    try:
+        b1, _ = np.polyfit(d[x].astype(float), d[y].astype(float), 1)  # y = b1*x + b0
+        return float(b1)
+    except Exception:
+        return np.nan
+
+
+# --- add: robust month normaliser & top-k table for snapshots ---
+def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, Optional[str]]:
     if df is None or len(df) == 0:
         return df, None
-
-    # If the month is part of the index, hoist it out first
     if isinstance(df.index, pd.MultiIndex):
         if '_month' in df.index.names:
             df = df.reset_index('_month')
         elif 'month' in df.index.names:
             df = df.reset_index('month')
         else:
-            df = df.reset_index()  # make sure we only have columns
+            df = df.reset_index()
     else:
-        # Single index with a name
         if df.index.name in ('_month', 'month'):
             df = df.reset_index()
 
-    # Prefer a real column and make sure there is only one
-    candidate_cols = [c for c in df.columns if c in ('_month', 'month', 'Month')]
+    candidate_cols = [c for c in df.columns if c in ('_month','month','Month')]
     if not candidate_cols:
-        # Try to detect period/datetime column automatically
         maybe_time = [c for c in df.columns
                       if pd.api.types.is_period_dtype(df[c]) or pd.api.types.is_datetime64_any_dtype(df[c])]
         if maybe_time:
@@ -48,11 +130,8 @@ def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     else:
         month_col = candidate_cols[0]
 
-    # If the same name appears twice (after reset_index) make the second unique
     if list(df.columns).count(month_col) > 1:
-        # rename the rightmost duplicate
-        cols = []
-        seen = 0
+        cols, seen = [], 0
         for c in df.columns:
             if c == month_col:
                 seen += 1
@@ -60,10 +139,7 @@ def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
             else:
                 cols.append(c)
         df.columns = cols
-        # use the first occurrence
-        month_col = month_col
 
-    # Coerce to period month string for consistent plotting/grouping
     ser = df[month_col]
     if pd.api.types.is_period_dtype(ser):
         df['_month_str'] = ser.astype(str)
@@ -72,28 +148,10 @@ def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         df['_month_str'] = pd.to_datetime(ser).dt.to_period('M').astype(str)
         month_col = '_month_str'
     else:
-        # ensure string
         df[month_col] = df[month_col].astype(str)
-
     return df, month_col
 
-
-def _fig_mom(series: pd.Series, title: str):
-    """Return a small MoM matplotlib figure for the slide."""
-    fig, ax = plt.subplots(figsize=(6.5, 1.6), dpi=150)
-    series = series.sort_index()
-    ax.plot(series.index, series.values, marker='o', linewidth=2)
-    ax.set_title(title, fontsize=10, pad=8)
-    ax.set_ylim(min(series.min() * 0.95, -100), max(series.max() * 1.05, 100))
-    ax.yaxis.set_major_formatter(mtick.PercentFormatter(decimals=0))
-    ax.tick_params(axis='x', rotation=0, labelsize=8)
-    ax.grid(True, axis='y', linestyle=':', alpha=.4)
-    fig.tight_layout()
-    return fig
-
-
 def _table_latest(df: pd.DataFrame, month_col: str, value_col: str, group_col: str, k: int = 8) -> pd.DataFrame:
-    """Top-k table for the latest month."""
     if df is None or df.empty or month_col is None:
         return pd.DataFrame()
     latest = df[month_col].max()
@@ -101,13 +159,8 @@ def _table_latest(df: pd.DataFrame, month_col: str, value_col: str, group_col: s
     if value_col not in tmp.columns or group_col not in tmp.columns:
         return pd.DataFrame()
     out = (tmp.groupby(group_col, as_index=False)[value_col]
-           .mean()
-           .sort_values(value_col, ascending=False)
-           .head(k))
+           .mean().sort_values(value_col, ascending=False).head(k))
     return out
-# ----------------------------------------------------------------------------- 
-
-
 # ----------------- palette & styling -----------------
 _DARK_BLUE = "#0b3d91"   # titles
 _DARK_GREY = "#333333"   # all chart fonts
@@ -871,341 +924,152 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
 
 # ---------------------------
+# ... keep all your existing imports, caching, tabs, and run() exactly as-is ...
+
+# ---------------------------
 # Snapshot builder for NPS (used by app.py email/snapshot)
 # ---------------------------
+
+# ============================== NPS SNAPSHOT BUILDERS ================================
 def build_snapshot(store, params):
-    """
-    NPS one-pager builder (self-contained).
-    Returns dict with:
-      - title, subtitle
-      - figs: list of (caption, matplotlib_figure)
-      - tables: list of (title, pandas_dataframe)
-    """
-    import re, numpy as np, pandas as pd, matplotlib.pyplot as plt
-    from datetime import datetime
+    """Return NPS one‑pager payload dict (title, subtitle, charts, tables, notes)."""
+    notes = []
+    charts = []
+    tables = []
 
-    # --------------- tiny in-function helpers (no external deps) ----------------
-    def _find(df, names):
-        if df is None or df.empty: return None
-        m = {str(c).strip().lower(): c for c in df.columns}
-        # exact
-        for n in names:
-            if n.lower() in m: return m[n.lower()]
-        # contains
-        for c in df.columns:
-            cl = str(c).strip().lower()
-            for n in names:
-                if n.lower() in cl: return c
-        return None
-
-    def _norm_portfolio(x):
-        if not isinstance(x, str): return "Unknown"
-        t = x.strip().title()
-        t = t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
-        return t
-
-    POS = {"good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
-           "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"}
-    NEG = {"bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
-           "rude","unhelpful","expensive","issue","problem","bug","error","crash","difficult","worst"}
-
-    def _lex_sentiment(text: str) -> float:
-        if not isinstance(text, str) or not text.strip():
-            return 0.0
-        toks = re.findall(r"\b\w+\b", text.lower())
-        if not toks:
-            return 0.0
-        score = sum(1 for t in toks if t in POS) - sum(1 for t in toks if t in NEG)
-        # mild normalisation to [-1,1]
-        return max(-1.0, min(1.0, score / max(len(toks), 4)))
-
-    STOP = {
-        "the","a","an","and","or","for","to","of","in","on","at","by","with","from","as","is","are",
-        "was","were","be","been","it","this","that","these","those","we","you","they","i","he","she",
-        "them","our","your","their","us","but","so","if","than","then","too","very","can","could",
-        "would","should","may","might","will","just","also","not","no","yes","all","any","each","every",
-        "more","most","some","such","into","within","about","over","under","per","etc","na","none","null"
-    }
-
-    def _clean_tokens(text: str):
-        toks = re.findall(r"\b[a-zA-Z][a-zA-Z\-']+\b", str(text).lower())
-        out = []
-        for t in toks:
-            t = t.strip("-'")
-            if len(t) < 3:  # drop very short
-                continue
-            if t in STOP:
-                continue
-            out.append(t)
-        return out
-
-    def _top_phrases(texts, k=6):
-        from collections import Counter
-        uni = Counter(); bi = Counter()
-        for t in texts:
-            toks = _clean_tokens(t)
-            uni.update(toks)
-            bi.update([" ".join(p) for p in zip(toks, toks[1:]) if p[0] != p[1]])
-        top = [w for w,_ in bi.most_common(k)]
-        if len(top) < k:
-            need = k - len(top)
-            top += [w for w,_ in uni.most_common(need)]
-        return top[:k]
-
-    def _monthify(series):
-        # parse months robustly; accept dates or strings like "Aug-25" / "2025-08"
-        dt = pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
-        if dt.notna().sum() == 0:
-            s = series.astype(str)
-            # try "Aug 2025" or "Aug-25"
-            try_alt = pd.to_datetime(s.str[:3].str.title() + " 1 2025", errors="coerce", format="%b %d %Y")
-            dt = try_alt
-        return dt.dt.to_period("M")
-
-    # --------------- 1) get surveys from store (several possible keys) ----------
+    # raw surveys
     surveys = None
-    for key in ("surveys", "nps", "nps_df"):
-        obj = store.get(key)
-        if isinstance(obj, pd.DataFrame) and not obj.empty:
-            surveys = obj
+    for key in ("surveys","nps_surveys","df_surveys","df_nps"):
+        surveys = store.get(key)
+        if isinstance(surveys, pd.DataFrame) and not surveys.empty:
             break
 
-    title = "Halo Quality — NPS Snapshot"
-    subtitle = params.get("period_label", "") or "Auto summary"
-
-    if surveys is None or surveys.empty:
-        return {"title": title, "subtitle": subtitle, "figs": [],
-                "tables": [("Info", pd.DataFrame({"note":["No NPS snapshot content available."]}))]}
+    if not isinstance(surveys, pd.DataFrame) or surveys.empty:
+        return {
+            "title": "Halo Quality — NPS Snapshot",
+            "subtitle": "Auto summary",
+            "charts": charts,
+            "tables": [("note", pd.DataFrame({"note":["No NPS survey data available."]}))],
+            "notes": ["No NPS survey data available in store."]
+        }
 
     df = surveys.copy()
 
-    # --------------- 2) standardise columns we need -----------------------------
-    pcol = _find(df, ["portfolio"])
+    # portfolio
+    pcol = _find_col(df, ["portfolio"])
     df["Portfolio"] = df[pcol].map(_norm_portfolio) if pcol else "Unknown"
 
-    mcol = _find(df, ["month_received","month received","month","date","created date","report date"])
+    # month
+    mcol = _find_col(df, ["month_received","month received","_month","month","date"])
     if mcol:
-        df["_month"] = _monthify(df[mcol])
+        m = pd.to_datetime(df[mcol], errors="coerce", dayfirst=True, infer_datetime_format=True)
+        if m.isna().all():
+            m = pd.to_datetime(df[mcol].astype(str), errors="coerce", infer_datetime_format=True)
+        df["_month"] = m.dt.to_period("M")
     else:
         df["_month"] = pd.NaT
 
-    scol = _find(df, ["nps","nps score","nps_score","nps (0-10)","score","rating"])
-    score = pd.to_numeric(df[scol], errors="coerce") if scol else pd.Series([np.nan]*len(df))
-    bucket = np.where(score >= 9, "promoter", np.where(score >= 7, "passive", np.where(score >= 0, "detractor","unknown")))
+    # score/bucket
+    scol = _find_col(df, ["nps","nps score","nps_score","nps (0-10)","score","rating"])
+    s = pd.to_numeric(df[scol], errors="coerce") if scol else pd.Series([np.nan]*len(df))
+    bucket = np.where(s >= 9, "promoter", np.where(s >= 7, "passive", np.where(s >= 0, "detractor","unknown")))
     df["nps_bucket"] = bucket
 
-    comcol = _find(df, ["suggestions","suggestion","comments","comment","feedback"])
-    if comcol:
-        df["Suggestions"] = df[comcol].astype(str).str.strip()
+    # suggestions for themes
+    sugcol = _find_col(df, ["suggestions","suggestion","comments","comment","feedback"])
+    if sugcol:
+        df["Suggestions"] = df[sugcol].astype(str).str.strip()
         df.loc[df["Suggestions"].str.lower().isin(["","nan","none","null"]), "Suggestions"] = np.nan
     else:
         df["Suggestions"] = np.nan
 
-    # keep only rows with month
     df = df[df["_month"].notna()].copy()
     if df.empty:
-        return {"title": title, "subtitle": subtitle, "figs": [],
-                "tables": [("Info", pd.DataFrame({"note":["No usable Month information in surveys."]}))]}
+        return {
+            "title": "Halo Quality — NPS Snapshot",
+            "subtitle": "Auto summary",
+            "charts": charts,
+            "tables": [("note", pd.DataFrame({"note":["No valid month info in surveys."]}))],
+            "notes": ["No valid month info in surveys."]
+        }
 
-    # --------------- 3) aggregate NPS by Portfolio × Month ----------------------
     g = df.groupby(["Portfolio","_month"])["nps_bucket"].value_counts().unstack(fill_value=0)
     for c in ["promoter","passive","detractor","unknown"]:
         if c not in g.columns: g[c] = 0
     g["Total"] = g[["promoter","passive","detractor","unknown"]].sum(axis=1).replace(0, np.nan)
-    g["NPS"]   = ((g["promoter"] - g["detractor"]) / g["Total"] * 100.0)
-    nps_m = g.reset_index()
+    g["NPS%"] = ((g["promoter"]-g["detractor"]) / g["Total"]) * 100.0
+    base = g.reset_index().rename(columns={"_month":"Month"})
 
-    # --------------- 4) sentiments from Suggestions ----------------------------
-    sug = df[df["Suggestions"].notna()].copy()
-    if not sug.empty:
-        sc = sug["Suggestions"].map(_lex_sentiment)
-        lab = np.where(sc >= 0.05, "positive", np.where(sc <= -0.05, "negative", "neutral"))
-        sug["sent_label"] = lab
+    bm, month_col = _normalise_month_column(base.rename(columns={"Month":"_month"}))
+    if month_col is None:
+        month_col = "_month"
+        notes.append("Month column could not be fully normalised; using fallback.")
+
+    # MoM chart
+    overall = (bm.groupby(month_col)[["promoter","passive","detractor","unknown"]].sum(min_count=1))
+    if not overall.empty:
+        overall["Total"] = overall.sum(axis=1)
+        overall["NPS%"] = (overall["promoter"]-overall["detractor"]) / overall["Total"] * 100.0
+        fig = _fig_mom(overall["NPS%"], "Overall NPS — Month on Month")
+        charts.append(("Overall NPS — Month on Month", fig))
     else:
-        sug = pd.DataFrame(columns=["Portfolio","_month","Suggestions","sent_label"])
+        notes.append("No MoM series available.")
 
-    # --------------- 5) figs and tables ----------------------------------------
-    figs, tables = [], []
+    # Latest month table
+    latest_tbl = _table_latest(bm, month_col, "NPS%", "Portfolio", k=8)
+    if not latest_tbl.empty:
+        tables.append(("Latest month — Top portfolios by NPS", latest_tbl))
+    else:
+        notes.append("Could not build latest-month table (NPS)." )
 
-    # A) MoM overall NPS% and Positive% (across all portfolios)
-    #    compute overall per month (weighted by counts)
-    def _overall_month(series_df):
-        m = series_df.groupby("_month")[["promoter","passive","detractor","unknown"]].sum(min_count=1)
-        m["Total"] = m.sum(axis=1)
-        out = pd.DataFrame({
-            "_month": m.index.astype("period[M]"),
-            "NPS%": ((m["promoter"] - m["detractor"]) / m["Total"].replace(0,np.nan) * 100.0)
-        }).dropna()
-        return out
+    # detractor key words (simple)
+    detractor_tbl = pd.DataFrame()
+    if sugcol and df["Suggestions"].notna().any():
+        s2 = df[["_month","Suggestions"]].dropna().copy()
+        s2, mcol2 = _normalise_month_column(s2.rename(columns={"_month":"Month"}))
+        mcol2 = mcol2 or "Month"
+        latest = s2[mcol2].max()
+        det = s2[s2[mcol2]==latest]["Suggestions"].dropna()
+        if not det.empty:
+            toks = (det.str.lower().str.replace(r"[^a-z0-9\s]+"," ", regex=True).str.split())
+            freq = {}
+            for row in toks:
+                for t in row:
+                    if len(t) < 4: continue
+                    freq[t] = freq.get(t,0)+1
+            top = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]
+            if top:
+                detractor_tbl = pd.DataFrame(top, columns=["term","count"])
+                tables.append((f"Detractor key terms — {str(latest)}", detractor_tbl))
+        else:
+            notes.append("No suggestions present for latest month.")
+    else:
+        notes.append("No suggestions column found for themes.")
 
-    overall = _overall_month(nps_m)
+    return {
+        "title": "Halo Quality — NPS Snapshot",
+        "subtitle": params.get("period_label", "") or "Auto summary",
+        "charts": charts,
+        "tables": tables if tables else [("note", pd.DataFrame({"note":["No snapshot content found for NPS."]}))],
+        "notes": notes
+    }
 
-    pos_m = pd.DataFrame(columns=["_month","Pos%"])
-    if not sug.empty:
-        sm = (sug.groupby("_month")["sent_label"].value_counts().unstack(fill_value=0))
-        sm["tot"] = sm.sum(axis=1)
-        pos_m = pd.DataFrame({
-            "_month": sm.index.astype("period[M]"),
-            "Pos%": sm.get("positive",0) / sm["tot"].replace(0,np.nan) * 100.0
-        })
-
-    if not overall.empty or not pos_m.empty:
-        mm = pd.merge(overall, pos_m, on="_month", how="outer").sort_values("_month")
-        x = np.arange(len(mm))
-        fig, ax = plt.subplots(figsize=(8.8, 3.6))
-        if "NPS%" in mm: ax.plot(x, mm["NPS%"], linewidth=2.6, label="NPS %")
-        if "Pos%" in mm: ax.plot(x, mm["Pos%"], linewidth=2.6, label="Positive %")
-        ax.set_xticks(x); ax.set_xticklabels(mm["_month"].astype(str).tolist(), rotation=0)
-        for sp in ("top","right","left"): ax.spines[sp].set_visible(False)
-        ax.spines["bottom"].set_color("#D3D3D3")
-        ax.get_yaxis().set_visible(False); ax.grid(False); ax.set_xlabel("")
-        ax.set_title("MoM Trend — NPS % & Positive Sentiment %")
-        ax.legend(frameon=False, loc="upper right")
-        figs.append(("NPS % vs Positive sentiment % — MoM", fig))
-
-    # B) Latest month snapshot table
-    if not nps_m.empty:
-        latest_m = nps_m["_month"].max()
-        snap = nps_m[nps_m["_month"] == latest_m].copy()
-
-        # attach sentiment rates (by portfolio, latest)
-        if not sug.empty:
-            sm = (sug[sug["_month"] == latest_m]
-                    .groupby("Portfolio")["sent_label"].value_counts().unstack(fill_value=0))
-            sm["S_Tot"] = sm.sum(axis=1)
-            sm["Pos%"]  = sm.get("positive",0) / sm["S_Tot"].replace(0,np.nan) * 100.0
-            sm["Neg%"]  = sm.get("negative",0) / sm["S_Tot"].replace(0,np.nan) * 100.0
-            sm["NetSent%"] = sm["Pos%"] - sm["Neg%"]
-            snap = snap.merge(sm[["Pos%","Neg%","NetSent%"]], on="Portfolio", how="left")
-
-        snap["Detractors%"] = (snap["detractor"] / snap["Total"].replace(0,np.nan) * 100.0)
-        keep = [c for c in ["Portfolio","NPS","Detractors%","Pos%","Neg%","NetSent%"] if c in snap.columns]
-        if keep:
-            out = snap[keep].round(1).sort_values("NPS", ascending=False).reset_index(drop=True)
-            tables.append((f"Latest month snapshot — {str(latest_m)}", out))
-
-    # C) Key themes for latest month (prefer detractors first)
-    if not sug.empty:
-        lm = sug["_month"].max()
-        det_latest = sug[(sug["_month"] == lm) & (sug["sent_label"] == "negative")]
-        texts = det_latest["Suggestions"].dropna().astype(str).tolist()
-        if not texts:
-            texts = sug[sug["_month"] == lm]["Suggestions"].dropna().astype(str).tolist()
-        themes = _top_phrases(texts, k=8) if texts else []
-        if themes:
-            tables.append((f"Key themes — {str(lm)}", pd.DataFrame({"theme": themes})))
-
-    if not figs and not tables:
-        tables.append(("Info", pd.DataFrame({"note":["No NPS snapshot content available."]})))
-
-    return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
-
-def get_snapshot_content(state, include_small_tables: bool = True):
-    """
-    Build the one-page snapshot payload for the app's PPT generator.
-    Returns a dict with keys: title, charts=[(caption, fig)], tables=[(caption, df)], notes=[str].
-    This MUST NOT raise; if anything goes wrong we return a small 'notes' panel so slides aren't blank.
-    """
+def get_snapshot_content(state, include_small_tables: bool = True) -> dict:
     try:
-        # ---- 1) Get your working NPS dataframe --------------------------------
-        # Prefer an already-filtered dataframe from state if you have one,
-        # else call your existing loader/transform (keep your current logic here).
-        # Examples that commonly exist in your codebase:
-        #   df = state.nps_df.copy()
-        #   df = load_nps_for_selection(state.filters)  # etc.
-        df = None
-        for cand in ('nps_df', 'nps_data', 'df_nps', 'df'):
-            if hasattr(state, cand):
-                maybe = getattr(state, cand)
-                if isinstance(maybe, pd.DataFrame) and len(maybe):
-                    df = maybe.copy()
-                    break
-        if df is None or df.empty:
-            return {
-                "title": "Halo Quality — NPS Snapshot",
-                "charts": [],
-                "tables": [],
-                "notes": ["No snapshot content found for 'nps_by_portfolio'."]
-            }
-
-        # ---- 2) Normalise month safely ------------------------------------------
-        df, month_col = _normalise_month_column(df)
-        if month_col is None:
-            return {
-                "title": "Halo Quality — NPS Snapshot",
-                "charts": [],
-                "tables": [],
-                "notes": ["No usable month column found for NPS snapshot."]
-            }
-
-        # ---- 3) Ensure we have an NPS numeric column ----------------------------
-        # your code sometimes names it 'NPS', 'nps', or 'nps_score'
-        nps_col = None
-        for c in ('NPS', 'nps', 'nps_score', 'nps_pp'):
-            if c in df.columns:
-                nps_col = c
-                break
-        if nps_col is None:
-            return {
-                "title": "Halo Quality — NPS Snapshot",
-                "charts": [],
-                "tables": [],
-                "notes": ["No NPS column found in dataframe."]
-            }
-        df[nps_col] = pd.to_numeric(df[nps_col], errors='coerce')
-
-        # ---- 4) Overall MoM series ---------------------------------------------
-        mom = (df.groupby(month_col)[nps_col]
-                 .mean()
-                 .sort_index()
-                 .pipe(lambda s: s.rename('NPS')))
-        # express as percentage points if your NPS is already in -100..100,
-        # otherwise convert to % if needed; here we show absolute pp
-        fig_mom = _fig_mom(mom, "Overall NPS — Month on Month")
-
-        charts = [("Overall NPS — Month on Month", fig_mom)]
-
-        # ---- 5) Latest month - top portfolios ----------------------------------
-        group_col = None
-        for c in ('portfolio', 'Portfolio', 'site', 'region'):
-            if c in df.columns:
-                group_col = c
-                break
-        tables = []
-        if group_col:
-            tbl = _table_latest(df, month_col, nps_col, group_col, k=8)
-            if not tbl.empty:
-                latest_label = df[month_col].max()
-                # prettify / round
-                tbl[nps_col] = tbl[nps_col].round(1)
-                tbl.columns = [group_col.capitalize(), 'NPS']
-                tables.append((f"Top {group_col.capitalize()} — {latest_label}", tbl))
-
-        # ---- 6) Optional: detractor drivers table if available ------------------
-        # If you have a detractor/suggestions column already aggregated per month, add it here.
-        for det_col in ('neg_suggestions', 'Negative suggestions', 'detractors_pct', 'Detractors%'):
-            if det_col in df.columns:
-                tmp = (df.groupby(det_col, as_index=False)[nps_col]
-                         .mean()
-                         .sort_values(nps_col)
-                         .head(8))
-                if not tmp.empty:
-                    tmp[nps_col] = tmp[nps_col].round(1)
-                    tables.append(("Low-scoring themes (avg NPS)", tmp.rename(columns={det_col: "theme", nps_col: "avg_nps"})))
-                break
-
-        return {
-            "title": "Halo Quality — NPS Snapshot",
-            "charts": charts,
-            "tables": tables if include_small_tables else [],
-            "notes": []
-        }
-
-    except Exception as e:
-        # Hard guard so the slide is never blank
+        payload = build_snapshot(state, {})
+    except Exception as ex:
         return {
             "title": "Halo Quality — NPS Snapshot",
             "charts": [],
-            "tables": [],
-            "notes": [f"Snapshot assembly failed: {type(e).__name__}: {e}"]
+            "tables": [("note", pd.DataFrame({"note":[f"Error generating NPS snapshot: {ex}"]}))],
+            "notes": [str(ex)]
         }
+    if not include_small_tables and payload.get("tables"):
+        small = []
+        for cap, df in payload["tables"]:
+            if len(df) <= 15 and df.shape[1] <= 8:
+                small.append((cap, df))
+        payload["tables"] = small or payload["tables"]
+    return payload
+# ============================ /NPS SNAPSHOT BUILDERS =================================
+
