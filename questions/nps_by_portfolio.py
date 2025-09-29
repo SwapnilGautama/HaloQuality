@@ -8,100 +8,105 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+# --- NPS snapshot helpers -----------------------------------------------------
+import io
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import pandas as pd
 
-# ----------------- helpers -----------------
-def _find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    if df is None or df.empty:
-        return None
-    m = {str(c).strip().lower(): c for c in df.columns}
-    for c in candidates:
-        lc = c.strip().lower()
-        if lc in m:
-            return m[lc]
-    # loose fallback: partial match
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        for n in candidates:
-            if n.strip().lower() in cl:
-                return c
-    return None
+def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """
+    Ensure there is exactly one month column we can use safely, returned as `month_col`.
+    If _month exists both as an index level and a column, we reset_index and keep a single one.
+    """
+    if df is None or len(df) == 0:
+        return df, None
 
-def _soft_pastels(n: int) -> list:
-    base = ["#A3C4F3","#CDE7BE","#F6C1C1","#FFD6A5","#BDB2FF","#FFAFCC","#BEE1E6","#E2ECE9"]
-    return [base[i % len(base)] for i in range(n)]
+    # If the month is part of the index, hoist it out first
+    if isinstance(df.index, pd.MultiIndex):
+        if '_month' in df.index.names:
+            df = df.reset_index('_month')
+        elif 'month' in df.index.names:
+            df = df.reset_index('month')
+        else:
+            df = df.reset_index()  # make sure we only have columns
+    else:
+        # Single index with a name
+        if df.index.name in ('_month', 'month'):
+            df = df.reset_index()
 
-def _norm_portfolio(x: str) -> str:
-    if not isinstance(x, str): return "Unknown"
-    t = x.strip().title()
-    t = t.replace("Baes-Leatherhead", "Leatherhead - Baes").replace("Leatherhead  - Baes", "Leatherhead - Baes")
-    return t
+    # Prefer a real column and make sure there is only one
+    candidate_cols = [c for c in df.columns if c in ('_month', 'month', 'Month')]
+    if not candidate_cols:
+        # Try to detect period/datetime column automatically
+        maybe_time = [c for c in df.columns
+                      if pd.api.types.is_period_dtype(df[c]) or pd.api.types.is_datetime64_any_dtype(df[c])]
+        if maybe_time:
+            month_col = maybe_time[0]
+        else:
+            return df, None
+    else:
+        month_col = candidate_cols[0]
 
-# simple offline lexical sentiment
-_POS = {"good","great","excellent","amazing","helpful","fast","quick","responsive","easy","clear",
-        "friendly","polite","supportive","smooth","love","efficient","prompt","awesome","happy"}
-_NEG = {"bad","poor","terrible","slow","delay","delayed","waiting","confusing","unclear","hard",
-        "rude","unhelpful","expensive","issue","problem","bug","error","crash","difficult","worst"}
+    # If the same name appears twice (after reset_index) make the second unique
+    if list(df.columns).count(month_col) > 1:
+        # rename the rightmost duplicate
+        cols = []
+        seen = 0
+        for c in df.columns:
+            if c == month_col:
+                seen += 1
+                cols.append(c if seen == 1 else f"{c}_col")
+            else:
+                cols.append(c)
+        df.columns = cols
+        # use the first occurrence
+        month_col = month_col
 
-def _lex_sentiment(text: str) -> float:
-    if not isinstance(text, str) or not text.strip():
-        return 0.0
-    toks = re.findall(r"\b\w+\b", text.lower())
-    if not toks:
-        return 0.0
-    score = sum(1 for t in toks if t in _POS) - sum(1 for t in toks if t in _NEG)
-    return max(-1.0, min(1.0, score / max(len(toks), 4)))
+    # Coerce to period month string for consistent plotting/grouping
+    ser = df[month_col]
+    if pd.api.types.is_period_dtype(ser):
+        df['_month_str'] = ser.astype(str)
+        month_col = '_month_str'
+    elif pd.api.types.is_datetime64_any_dtype(ser):
+        df['_month_str'] = pd.to_datetime(ser).dt.to_period('M').astype(str)
+        month_col = '_month_str'
+    else:
+        # ensure string
+        df[month_col] = df[month_col].astype(str)
 
-# ----------------- AI key-theme extraction + effect-size helpers -----------------
-_STOP = {
-    "the","a","an","and","or","for","to","of","in","on","at","by","with","from","as","is","are",
-    "was","were","be","been","it","this","that","these","those","we","you","they","i","he","she",
-    "them","our","your","their","us","but","so","if","than","then","too","very","can","could",
-    "would","should","may","might","will","just","also","not","no","yes","all","any","each","every",
-    "more","most","some","such","into","within","about","over","under","per","etc","na","none","null"
-}
+    return df, month_col
 
-def _clean_tokens(text: str):
-    toks = re.findall(r"\b[a-zA-Z][a-zA-Z\-']+\b", str(text).lower())
-    out = []
-    for t in toks:
-        t = t.strip("-'")
-        if len(t) < 3:
-            continue
-        if t in _STOP:
-            continue
-        out.append(t)
+
+def _fig_mom(series: pd.Series, title: str):
+    """Return a small MoM matplotlib figure for the slide."""
+    fig, ax = plt.subplots(figsize=(6.5, 1.6), dpi=150)
+    series = series.sort_index()
+    ax.plot(series.index, series.values, marker='o', linewidth=2)
+    ax.set_title(title, fontsize=10, pad=8)
+    ax.set_ylim(min(series.min() * 0.95, -100), max(series.max() * 1.05, 100))
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(decimals=0))
+    ax.tick_params(axis='x', rotation=0, labelsize=8)
+    ax.grid(True, axis='y', linestyle=':', alpha=.4)
+    fig.tight_layout()
+    return fig
+
+
+def _table_latest(df: pd.DataFrame, month_col: str, value_col: str, group_col: str, k: int = 8) -> pd.DataFrame:
+    """Top-k table for the latest month."""
+    if df is None or df.empty or month_col is None:
+        return pd.DataFrame()
+    latest = df[month_col].max()
+    tmp = df[df[month_col] == latest].copy()
+    if value_col not in tmp.columns or group_col not in tmp.columns:
+        return pd.DataFrame()
+    out = (tmp.groupby(group_col, as_index=False)[value_col]
+           .mean()
+           .sort_values(value_col, ascending=False)
+           .head(k))
     return out
+# ----------------------------------------------------------------------------- 
 
-def _top_phrases(texts, k: int = 6):
-    from collections import Counter
-    uni = Counter(); bi = Counter()
-    for t in texts:
-        toks = _clean_tokens(t)
-        uni.update(toks)
-        bi.update([" ".join(pair) for pair in zip(toks, toks[1:]) if pair[0] != pair[1]])
-    top_bi = [w for w,_ in bi.most_common(k)]
-    if len(top_bi) < k:
-        need = k - len(top_bi)
-        top_uni = [w for w,_ in uni.most_common(need)]
-        return [*top_bi, *top_uni]
-    return top_bi[:k]
-
-def _pearson(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
-    if x not in df or y not in df: return np.nan
-    d = df[[x,y]].dropna()
-    if len(d) < 3: return np.nan
-    r = d[x].corr(d[y])
-    return float(r) if pd.notna(r) else np.nan
-
-def _slope(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
-    if x not in df or y not in df: return np.nan
-    d = df[[x,y]].dropna()
-    if len(d) < 3: return np.nan
-    try:
-        b1, _ = np.polyfit(d[x].astype(float), d[y].astype(float), 1)  # y = b1*x + b0
-        return float(b1)
-    except Exception:
-        return np.nan
 
 # ----------------- palette & styling -----------------
 _DARK_BLUE = "#0b3d91"   # titles
@@ -1094,3 +1099,113 @@ def build_snapshot(store, params):
         tables.append(("Info", pd.DataFrame({"note":["No NPS snapshot content available."]})))
 
     return {"title": title, "subtitle": subtitle, "figs": figs, "tables": tables}
+
+def get_snapshot_content(state, include_small_tables: bool = True):
+    """
+    Build the one-page snapshot payload for the app's PPT generator.
+    Returns a dict with keys: title, charts=[(caption, fig)], tables=[(caption, df)], notes=[str].
+    This MUST NOT raise; if anything goes wrong we return a small 'notes' panel so slides aren't blank.
+    """
+    try:
+        # ---- 1) Get your working NPS dataframe --------------------------------
+        # Prefer an already-filtered dataframe from state if you have one,
+        # else call your existing loader/transform (keep your current logic here).
+        # Examples that commonly exist in your codebase:
+        #   df = state.nps_df.copy()
+        #   df = load_nps_for_selection(state.filters)  # etc.
+        df = None
+        for cand in ('nps_df', 'nps_data', 'df_nps', 'df'):
+            if hasattr(state, cand):
+                maybe = getattr(state, cand)
+                if isinstance(maybe, pd.DataFrame) and len(maybe):
+                    df = maybe.copy()
+                    break
+        if df is None or df.empty:
+            return {
+                "title": "Halo Quality — NPS Snapshot",
+                "charts": [],
+                "tables": [],
+                "notes": ["No snapshot content found for 'nps_by_portfolio'."]
+            }
+
+        # ---- 2) Normalise month safely ------------------------------------------
+        df, month_col = _normalise_month_column(df)
+        if month_col is None:
+            return {
+                "title": "Halo Quality — NPS Snapshot",
+                "charts": [],
+                "tables": [],
+                "notes": ["No usable month column found for NPS snapshot."]
+            }
+
+        # ---- 3) Ensure we have an NPS numeric column ----------------------------
+        # your code sometimes names it 'NPS', 'nps', or 'nps_score'
+        nps_col = None
+        for c in ('NPS', 'nps', 'nps_score', 'nps_pp'):
+            if c in df.columns:
+                nps_col = c
+                break
+        if nps_col is None:
+            return {
+                "title": "Halo Quality — NPS Snapshot",
+                "charts": [],
+                "tables": [],
+                "notes": ["No NPS column found in dataframe."]
+            }
+        df[nps_col] = pd.to_numeric(df[nps_col], errors='coerce')
+
+        # ---- 4) Overall MoM series ---------------------------------------------
+        mom = (df.groupby(month_col)[nps_col]
+                 .mean()
+                 .sort_index()
+                 .pipe(lambda s: s.rename('NPS')))
+        # express as percentage points if your NPS is already in -100..100,
+        # otherwise convert to % if needed; here we show absolute pp
+        fig_mom = _fig_mom(mom, "Overall NPS — Month on Month")
+
+        charts = [("Overall NPS — Month on Month", fig_mom)]
+
+        # ---- 5) Latest month - top portfolios ----------------------------------
+        group_col = None
+        for c in ('portfolio', 'Portfolio', 'site', 'region'):
+            if c in df.columns:
+                group_col = c
+                break
+        tables = []
+        if group_col:
+            tbl = _table_latest(df, month_col, nps_col, group_col, k=8)
+            if not tbl.empty:
+                latest_label = df[month_col].max()
+                # prettify / round
+                tbl[nps_col] = tbl[nps_col].round(1)
+                tbl.columns = [group_col.capitalize(), 'NPS']
+                tables.append((f"Top {group_col.capitalize()} — {latest_label}", tbl))
+
+        # ---- 6) Optional: detractor drivers table if available ------------------
+        # If you have a detractor/suggestions column already aggregated per month, add it here.
+        for det_col in ('neg_suggestions', 'Negative suggestions', 'detractors_pct', 'Detractors%'):
+            if det_col in df.columns:
+                tmp = (df.groupby(det_col, as_index=False)[nps_col]
+                         .mean()
+                         .sort_values(nps_col)
+                         .head(8))
+                if not tmp.empty:
+                    tmp[nps_col] = tmp[nps_col].round(1)
+                    tables.append(("Low-scoring themes (avg NPS)", tmp.rename(columns={det_col: "theme", nps_col: "avg_nps"})))
+                break
+
+        return {
+            "title": "Halo Quality — NPS Snapshot",
+            "charts": charts,
+            "tables": tables if include_small_tables else [],
+            "notes": []
+        }
+
+    except Exception as e:
+        # Hard guard so the slide is never blank
+        return {
+            "title": "Halo Quality — NPS Snapshot",
+            "charts": [],
+            "tables": [],
+            "notes": [f"Snapshot assembly failed: {type(e).__name__}: {e}"]
+        }
