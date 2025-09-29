@@ -866,9 +866,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
 
 # ---------------------------
-# ... keep all your existing imports, caching, tabs, and run() exactly as-is ...
-
-# ---------------------------
 # Snapshot builder for NPS (used by app.py email/snapshot)
 # ---------------------------
 def build_snapshot(store, params):
