@@ -924,6 +924,36 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
 
 # ---------------------------
+# Missing helper for NPS snapshots (safe fallback)
+# ---------------------------
+def _fig_mom(series, title: str = "MoM"):
+    """Simple Month-on-Month line chart for snapshot use.
+       Always returns a matplotlib Figure (never raises)."""
+    import matplotlib.pyplot as plt
+    try:
+        if series is None or len(series) == 0:
+            raise ValueError("Empty series")
+
+        idx = list(range(len(series)))
+        labels = [str(i) for i in series.index]
+
+        fig, ax = plt.subplots(figsize=(8.0, 3.0))
+        ax.plot(idx, series.astype(float).values, linewidth=2.5, marker="o", color="#0b3d91")
+        ax.set_xticks(idx)
+        ax.set_xticklabels(labels, rotation=0, color=_DARK_GREY)
+        _style_axes(ax)
+        ax.get_yaxis().set_visible(False)
+        ax.set_xlabel("")
+        ax.set_title(title, color=_DARK_BLUE, pad=6)
+        return fig
+    except Exception:
+        # Always return a placeholder chart so snapshot never breaks
+        fig, ax = plt.subplots(figsize=(8.0, 3.0))
+        ax.text(0.5, 0.5, "No MoM data available", ha="center", va="center", fontsize=10)
+        ax.axis("off")
+        return fig
+
+# ---------------------------
 # ... keep all your existing imports, caching, tabs, and run() exactly as-is ...
 
 # ---------------------------
