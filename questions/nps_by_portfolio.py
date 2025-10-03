@@ -1,3 +1,4 @@
+# questions/nps_by_portfolio.py
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, Iterable, List, Tuple
@@ -103,7 +104,7 @@ def _slope(df: pd.DataFrame, x: str, y: str) -> float | np.nan:
         return np.nan
 
 
-# --- robust month normaliser & latest-month table builder ---
+# --- add: robust month normaliser & top-k table for snapshots ---
 def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, Optional[str]]:
     if df is None or len(df) == 0:
         return df, None
@@ -150,8 +151,7 @@ def _normalise_month_column(df: pd.DataFrame) -> tuple[pd.DataFrame, Optional[st
         df[month_col] = df[month_col].astype(str)
     return df, month_col
 
-def _table_latest(df: pd.DataFrame, month_col: str, value_col: str, group_col: str, k: Optional[int] = None) -> pd.DataFrame:
-    """Return latest-month table. If k is None -> include all groups."""
+def _table_latest(df: pd.DataFrame, month_col: str, value_col: str, group_col: str, k: int = 8) -> pd.DataFrame:
     if df is None or df.empty or month_col is None:
         return pd.DataFrame()
     latest = df[month_col].max()
@@ -159,11 +159,8 @@ def _table_latest(df: pd.DataFrame, month_col: str, value_col: str, group_col: s
     if value_col not in tmp.columns or group_col not in tmp.columns:
         return pd.DataFrame()
     out = (tmp.groupby(group_col, as_index=False)[value_col]
-           .mean().sort_values(value_col, ascending=False))
-    if isinstance(k, int) and k > 0:
-        out = out.head(k)
+           .mean().sort_values(value_col, ascending=False).head(k))
     return out
-
 # ----------------- palette & styling -----------------
 _DARK_BLUE = "#0b3d91"   # titles
 _DARK_GREY = "#333333"   # all chart fonts
@@ -222,9 +219,13 @@ def _fig_mom_nps_pos(nps_df: pd.DataFrame, sd_df: pd.DataFrame):
     ax.legend(frameon=False, loc="upper right")
     return fig
 
+# ---------------------------
+# Missing helper for NPS snapshots (safe fallback)
+# ---------------------------
 def _fig_mom(series, title: str = "MoM"):
     """Simple Month-on-Month line chart for snapshot use.
        Always returns a matplotlib Figure (never raises)."""
+    import matplotlib.pyplot as plt
     try:
         if series is None or len(series) == 0:
             raise ValueError("Empty series")
@@ -247,7 +248,7 @@ def _fig_mom(series, title: str = "MoM"):
         return fig
 
 # ======================
-# FPA multi-file loader with caching
+# FPA multi-file loader with caching (replicates FPA treatment)
 # ======================
 def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = {c.lower(): c for c in df.columns}
@@ -323,6 +324,7 @@ def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
     """
     Return normalized FPA month rollups across **ALL workbooks**:
     columns -> Portfolio, _month, FPA%
+    Priority: store['fpa'] (already/raw) → cached combine of all workbooks on disk.
     """
     fpa_raw = store.get("fpa", pd.DataFrame()) if isinstance(store, dict) else pd.DataFrame()
     if fpa_raw is not None and not fpa_raw.empty:
@@ -349,8 +351,10 @@ def _load_fpa_from_store_or_disk(store: Dict[str, Any]) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def _fpa_monthly_from_df_cached(fpa_raw: pd.DataFrame) -> pd.DataFrame:
     df = fpa_raw.copy()
+    # If already normalized, just return required columns
     if {"Portfolio","_month","FPA%"} <= set(df.columns):
         return df[["Portfolio","_month","FPA%"]]
+    # Else try to normalize a raw file similar to the disk-normaliser
     if "date" in df.columns and "result" in df.columns:
         out = df.copy()
         out["portfolio"] = out.get("portfolio", out.get("Portfolio", "Unknown"))
@@ -418,8 +422,9 @@ def _sentiments_cached(df: pd.DataFrame) -> pd.DataFrame:
     lab = np.where(score >= 0.05, "positive", np.where(score <= -0.05, "negative", "neutral"))
     sug["sent_score"] = score; sug["sent_label"] = lab
     return sug
+
 # ======================
-# Cases / Complaints — cached rollups
+# Cases / Complaints — cached rollups from provided store DFs
 # ======================
 @st.cache_data(show_spinner=False)
 def _cases_monthly_from_df(cs: pd.DataFrame) -> pd.DataFrame:
@@ -483,7 +488,7 @@ def _complaints_monthly_from_df(comp: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ======================
-# Combined view cache
+# Combined view cache (depends on inputs + filters)
 # ======================
 @st.cache_data(show_spinner=False)
 def _build_combined_cached(
@@ -502,6 +507,7 @@ def _build_combined_cached(
         .merge(comp_monthly,  on=["Portfolio","_month"], how="outer")
         .merge(sent_m,        on=["Portfolio","_month"], how="left"))
 
+    # Robust rate: only compute when denominator > 0
     num = pd.to_numeric(combined.get("Total Complaints"), errors="coerce")
     den = pd.to_numeric(combined.get("Total Cases Complete"), errors="coerce")
     combined["Complaints/1000"] = np.where((den > 0) & pd.notna(num),
@@ -532,6 +538,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
     df_out = pd.DataFrame()
 
     try:
+        # Load surveys (cached)
         surveys = store.get("surveys", pd.DataFrame())
         s = _prep_surveys_cached(surveys)
         if s.empty or s["_month"].isna().all():
@@ -547,6 +554,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             start = st.selectbox("From month", months, index=0) if months else None
             end = st.selectbox("To month", months, index=len(months)-1) if months else None
 
+        # NPS aggregates (cached)
         nps = _aggregate_nps_cached(s)
         if sel_port != "(All)": nps = nps[nps["Portfolio"] == sel_port]
         if start is not None:  nps = nps[nps["_month"] >= start]
@@ -560,9 +568,10 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             overall_nps = np.nan
         st.markdown(f"### Overall NPS (selected range): **{overall_nps:.1f}**")
 
+        # Pre-compute inputs (all cached)
         base = nps[["Portfolio","_month","NPS%","promoter","passive","detractor","unknown","Total"]]\
                   .rename(columns={"NPS%":"NPS"}).copy()
-        fpa_monthly   = _load_fpa_from_store_or_disk(store)
+        fpa_monthly   = _load_fpa_from_store_or_disk(store)           # cached combine like FPA
         cases_monthly = _cases_monthly_from_df(store.get("cases", pd.DataFrame()))
         comp_monthly  = _complaints_monthly_from_df(store.get("complaints", pd.DataFrame()))
         sd_all        = _sentiments_cached(s)
@@ -581,12 +590,14 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         else:
             sent_m = pd.DataFrame(columns=["Portfolio","_month","Pos%","Neg%","NetSent%"])
 
+        # Build the combined view (cached by inputs + filters)
         view = _build_combined_cached(base, fpa_monthly, cases_monthly, comp_monthly, sent_m,
                                       sel_port, start, end)
 
+        # Tabs
         tab0, tab1, tab2, tab3 = st.tabs(["Insights", "Overview", "Sentiments", "NPS Correlation"])
 
-        # -------------------- Tab 0: INSIGHTS --------------------
+        # -------------------- Tab 0: INSIGHTS (heuristic/statistical) --------------------
         with tab0:
             st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:.25rem 0 1rem 0;'>What’s happening and why</h4>",
                         unsafe_allow_html=True)
@@ -701,7 +712,9 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 chips2 = " • ".join([f"`{t}`" for t in neg_story_latest[:4]])
                 st.markdown(f"**Latest month negatives:** {chips2}")
 
-            st.markdown("#### Detractor sentiment & key issues")
+            # -------------------- NEW: Detractor sentiment & issues --------------------
+            # Focus only on detractors' suggestions within current selection and summarise their sentiment + key issues.
+            det_comment = ""
             try:
                 sel = s.copy()
                 if sel_port != "(All)": sel = sel[sel["Portfolio"] == sel_port]
@@ -710,6 +723,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
                 det = sel[(sel["nps_bucket"] == "detractor") & (sel["Suggestions"].notna())].copy()
                 if not det.empty:
+                    # Sentiment for detractors
                     det["sent_score"] = det["Suggestions"].map(_lex_sentiment)
                     det["sent_label"] = np.where(det["sent_score"] >= 0.05, "positive",
                                           np.where(det["sent_score"] <= -0.05, "negative", "neutral"))
@@ -717,6 +731,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     neg_share = (det["sent_label"].eq("negative").mean() * 100.0) if total_det else 0.0
                     pos_share = (det["sent_label"].eq("positive").mean() * 100.0) if total_det else 0.0
 
+                    # Key issues from detractor suggestions
                     det_overall_phr = _top_phrases(det["Suggestions"].tolist(), k=6)
                     latest_m = det["_month"].max()
                     det_latest_phr = []
@@ -728,6 +743,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     det_chips = " • ".join([f"`{t}`" for t in det_overall_phr]) if det_overall_phr else "—"
                     lat_chips = " • ".join([f"`{t}`" for t in det_latest_phr]) if det_latest_phr else "—"
 
+                    st.markdown("#### Detractor sentiment & key issues")
                     st.markdown(
                         f"- **Detractor comments analysed:** {total_det}  "
                         f"- **Negative share:** {neg_share:.1f}%  • **Positive share:** {pos_share:.1f}%"
@@ -736,16 +752,19 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     if pd.notna(latest_m):
                         st.markdown(f"- **Latest month detractor issues ({str(latest_m)}):** {lat_chips}")
                 else:
+                    st.markdown("#### Detractor sentiment & key issues")
                     st.info("No detractor suggestions available in the selected range.")
             except Exception:
+                # Keep insights resilient even if text parsing fails
+                st.markdown("#### Detractor sentiment & key issues")
                 st.info("Could not compute detractor sentiment due to missing or malformed data.")
 
             how_lines = [
                 "**How to read this:**",
-                "- When **Detractors%** or **Negative suggestions%** rise, NPS typically falls.",
-                "- Higher **FPA%** is associated with better NPS.",
-                "- **Complaints/1000** provides context; higher rates align with lower NPS.",
-                "- **Detractor sentiment & issues** highlights where fixes will most move NPS.",
+                "- When **Detractors%** or **Negative suggestions%** rise, NPS typically falls (see effect sizes above).",
+                "- A positive **FPA% → NPS** link means better first-time accuracy shows up as happier customers.",
+                "- **Complaints/1000** provides external context; higher complaint density aligns with lower NPS.",
+                "- **Detractor sentiment & issues** highlights what detractors specifically say; recurring themes indicate where fixes will most move NPS.",
             ]
             st.markdown("\n".join(how_lines))
 
@@ -832,7 +851,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if fig_mom is not None:
                 st.pyplot(fig_mom, use_container_width=True)
 
-        # -------------------- Tab 3: NPS CORRELATION --------------------
+        # -------------------- Tab 3: NPS CORRELATION (with local Month filter) --------------------
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
 
@@ -932,6 +951,9 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
     return ("NPS by Portfolio", "Surveys (Sheet 1) with Sentiments and SLA/Complaints correlation"), df_out
 
+# ---------------------------
+# Snapshot builder for NPS (used by app.py email/snapshot)
+# ---------------------------
 
 # ============================== NPS SNAPSHOT BUILDERS ================================
 def build_snapshot(store, params):
@@ -1008,28 +1030,24 @@ def build_snapshot(store, params):
         month_col = "_month"
         notes.append("Month column could not be fully normalised; using fallback.")
 
-    # ---------- NEW: MoM chart filtered to 2025 ----------
+    # MoM chart
     overall = (bm.groupby(month_col)[["promoter","passive","detractor","unknown"]].sum(min_count=1))
     if not overall.empty:
         overall["Total"] = overall.sum(axis=1)
         overall["NPS%"] = (overall["promoter"]-overall["detractor"]) / overall["Total"] * 100.0
-        # Keep only 2025 months if present
-        _idx = overall.index.astype(str)
-        mask_2025 = _idx.str.startswith("2025-")
-        series_2025 = overall.loc[mask_2025, "NPS%"] if mask_2025.any() else overall["NPS%"]
-        fig = _fig_mom(series_2025, "Overall NPS — Month on Month (2025)")
-        charts.append(("Overall NPS — Month on Month (2025)", fig))
+        fig = _fig_mom(overall["NPS%"], "Overall NPS — Month on Month")
+        charts.append(("Overall NPS — Month on Month", fig))
     else:
         notes.append("No MoM series available.")
 
-    # ---------- UPDATED: Latest month table (all portfolios) ----------
-    latest_tbl = _table_latest(bm, month_col, "NPS%", "Portfolio", k=None)
+    # Latest month table
+    latest_tbl = _table_latest(bm, month_col, "NPS%", "Portfolio", k=8)
     if not latest_tbl.empty:
-        tables.append(("Latest month — NPS by Portfolio", latest_tbl))
+        tables.append(("Latest month — Top portfolios by NPS", latest_tbl))
     else:
         notes.append("Could not build latest-month table (NPS)." )
 
-    # ---------- NEW: Pie chart of detractor reasons (latest month) ----------
+    # detractor key words (simple)
     detractor_tbl = pd.DataFrame()
     if sugcol and df["Suggestions"].notna().any():
         s2 = df[["_month","Suggestions"]].dropna().copy()
@@ -1042,27 +1060,12 @@ def build_snapshot(store, params):
             freq = {}
             for row in toks:
                 for t in row:
-                    if len(t) < 4: 
-                        continue
-                    if t in _STOP:
-                        continue
+                    if len(t) < 4: continue
                     freq[t] = freq.get(t,0)+1
             top = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]
             if top:
                 detractor_tbl = pd.DataFrame(top, columns=["term","count"])
                 tables.append((f"Detractor key terms — {str(latest)}", detractor_tbl))
-
-                # Pie chart
-                try:
-                    fig_pie, axp = plt.subplots(figsize=(4.5, 4.5))
-                    axp.pie(detractor_tbl["count"].values,
-                            labels=detractor_tbl["term"].values,
-                            autopct="%1.0f%%", startangle=90)
-                    axp.axis("equal")
-                    axp.set_title(f"Detractor reasons — {str(latest)}")
-                    charts.append((f"Detractor reasons — {str(latest)} (pie)", fig_pie))
-                except Exception:
-                    notes.append("Could not render detractor reasons pie.")
         else:
             notes.append("No suggestions present for latest month.")
     else:
