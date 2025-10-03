@@ -1,4 +1,5 @@
-# questions/nps_by_portfolio.py
+
+# questions/nps_by_portfolio.py (updated)
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, Iterable, List, Tuple
@@ -161,6 +162,7 @@ def _table_latest(df: pd.DataFrame, month_col: str, value_col: str, group_col: s
     out = (tmp.groupby(group_col, as_index=False)[value_col]
            .mean().sort_values(value_col, ascending=False).head(k))
     return out
+
 # ----------------- palette & styling -----------------
 _DARK_BLUE = "#0b3d91"   # titles
 _DARK_GREY = "#333333"   # all chart fonts
@@ -246,6 +248,18 @@ def _fig_mom(series, title: str = "MoM"):
         ax.text(0.5, 0.5, "No MoM data available", ha="center", va="center", fontsize=10)
         ax.axis("off")
         return fig
+
+def _fig_pie(labels: List[str], sizes: List[float], title: str) -> plt.Figure:
+    """Simple pie chart helper for snapshot payload."""
+    fig, ax = plt.subplots(figsize=(4.6, 4.6))
+    if not sizes or sum(sizes) == 0:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.axis("off")
+        return fig
+    ax.pie(sizes, labels=labels, autopct='%1.0f%%', startangle=90)
+    ax.axis('equal')
+    ax.set_title(title, color=_DARK_BLUE, pad=6)
+    return fig
 
 # ======================
 # FPA multi-file loader with caching (replicates FPA treatment)
@@ -577,7 +591,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         sd_all        = _sentiments_cached(s)
 
         if not sd_all.empty:
-            sent_m = (sd_all.groupby(["Portfolio","_month"])["sent_label"].value_counts()
+            sent_m = (sd_all.groupby(["Portfolio","_month"])['sent_label'].value_counts()
                               .unstack(fill_value=0)
                               .reset_index())
             for c in ["positive","negative","neutral"]:
@@ -597,7 +611,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
         # Tabs
         tab0, tab1, tab2, tab3 = st.tabs(["Insights", "Overview", "Sentiments", "NPS Correlation"])
 
-        # -------------------- Tab 0: INSIGHTS (heuristic/statistical) --------------------
+        # -------------------- Tab 0: INSIGHTS --------------------
         with tab0:
             st.markdown(f"<h4 style='color:{_DARK_BLUE};margin:.25rem 0 1rem 0;'>What’s happening and why</h4>",
                         unsafe_allow_html=True)
@@ -713,8 +727,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                 st.markdown(f"**Latest month negatives:** {chips2}")
 
             # -------------------- NEW: Detractor sentiment & issues --------------------
-            # Focus only on detractors' suggestions within current selection and summarise their sentiment + key issues.
-            det_comment = ""
             try:
                 sel = s.copy()
                 if sel_port != "(All)": sel = sel[sel["Portfolio"] == sel_port]
@@ -723,7 +735,6 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
 
                 det = sel[(sel["nps_bucket"] == "detractor") & (sel["Suggestions"].notna())].copy()
                 if not det.empty:
-                    # Sentiment for detractors
                     det["sent_score"] = det["Suggestions"].map(_lex_sentiment)
                     det["sent_label"] = np.where(det["sent_score"] >= 0.05, "positive",
                                           np.where(det["sent_score"] <= -0.05, "negative", "neutral"))
@@ -755,17 +766,12 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     st.markdown("#### Detractor sentiment & key issues")
                     st.info("No detractor suggestions available in the selected range.")
             except Exception:
-                # Keep insights resilient even if text parsing fails
                 st.markdown("#### Detractor sentiment & key issues")
                 st.info("Could not compute detractor sentiment due to missing or malformed data.")
 
             how_lines = [
                 "**How to read this:**",
-                "- When **Detractors%** or **Negative suggestions%** rise, NPS typically falls (see effect sizes above).",
-                "- A positive **FPA% → NPS** link means better first-time accuracy shows up as happier customers.",
-                "- **Complaints/1000** provides external context; higher complaint density aligns with lower NPS.",
-                "- **Detractor sentiment & issues** highlights what detractors specifically say; recurring themes indicate where fixes will most move NPS.",
-            ]
+                "- When **Detractors%** or **Negative suggestions%** rise, NPS typically falls (see effect sizes above).",                "- A positive **FPA% → NPS** link means better first-time accuracy shows up as happier customers.",                "- **Complaints/1000** provides external context; higher complaint density aligns with lower NPS.",                "- **Detractor sentiment & issues** highlights what detractors specifically say; recurring themes indicate where fixes will most move NPS.",            ]
             st.markdown("\n".join(how_lines))
 
         # -------------------- Tab 1: OVERVIEW --------------------
@@ -851,7 +857,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
             if fig_mom is not None:
                 st.pyplot(fig_mom, use_container_width=True)
 
-        # -------------------- Tab 3: NPS CORRELATION (with local Month filter) --------------------
+        # -------------------- Tab 3: NPS CORRELATION --------------------
         with tab3:
             st.markdown("### Combined KPIs — NPS, FPA%, Complaints/1000")
 
@@ -890,7 +896,7 @@ def run(store: Dict[str, Any], params: Dict[str, Any], user_text: Optional[str] 
                     ttl_month = sel_corr_month if sel_corr_month != "(All)" else ""
                     ax_sc.set_title(f"NPS vs Complaints/1000 {f'({ttl_month})' if ttl_month else ''}", color=_DARK_BLUE, pad=6)
                     st.pyplot(fig_sc, use_container_width=True)
-                    st.caption("Bubble size ∝ FPA% (larger = higher FPA).")
+                    st.caption("Bubble size ∝ FPA% (larger = higher FPA)." )
                 else:
                     st.info("No rows available for the selected month.")
 
@@ -1047,8 +1053,7 @@ def build_snapshot(store, params):
     else:
         notes.append("Could not build latest-month table (NPS)." )
 
-    # detractor key words (simple)
-    detractor_tbl = pd.DataFrame()
+    # detractor key words (simple) + NEW pie chart
     if sugcol and df["Suggestions"].notna().any():
         s2 = df[["_month","Suggestions"]].dropna().copy()
         s2, mcol2 = _normalise_month_column(s2.rename(columns={"_month":"Month"}))
@@ -1060,12 +1065,21 @@ def build_snapshot(store, params):
             freq = {}
             for row in toks:
                 for t in row:
-                    if len(t) < 4: continue
+                    if len(t) < 3: 
+                        continue
+                    # minimal stopword filter
+                    if t in _STOP: 
+                        continue
                     freq[t] = freq.get(t,0)+1
-            top = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]
+            top = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:8]
             if top:
                 detractor_tbl = pd.DataFrame(top, columns=["term","count"])
                 tables.append((f"Detractor key terms — {str(latest)}", detractor_tbl))
+                # --- pie chart of detractor 'reasons' (token counts) ---
+                labels = [t for t,_c in top]
+                sizes  = [c for _t,c in top]
+                pie = _fig_pie(labels, sizes, f"Detractor reasons — {str(latest)}")
+                charts.append((f"Detractor reasons — {str(latest)}", pie))
         else:
             notes.append("No suggestions present for latest month.")
     else:
